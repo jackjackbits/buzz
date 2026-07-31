@@ -280,18 +280,6 @@ pub(crate) async fn fan_out_event_to_local_subscribers(
 /// Fan out one event received from Redis pub/sub to this relay's local subscribers.
 #[tracing::instrument(skip_all)]
 pub async fn fan_out_pubsub_event(state: &Arc<AppState>, channel_event: buzz_pubsub::ChannelEvent) {
-    // Redis can carry an event published just before the deletion fence. Do not
-    // deliver stale post-fence fan-out to a community that is no longer active.
-    if !matches!(
-        state
-            .db
-            .is_community_active(channel_event.community_id)
-            .await,
-        Ok(true)
-    ) {
-        return;
-    }
-
     // The Redis topic carries the tenant-local routing scope explicitly:
     // `Channel(id)` for a per-channel event, `Global` for a channel-less one.
     // Convert back to the `Option<Uuid>` channel id `fan_out()` indexes on —
@@ -679,22 +667,6 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
         return;
     }
 
-    let _serving_write = match buzz_deletion::store(&state.db)
-        .begin_serving_write(conn.tenant.community())
-        .await
-    {
-        Ok(guard) => guard,
-        Err(error) => {
-            reject("restricted");
-            conn.send(RelayMessage::ok(
-                &event_id_hex,
-                false,
-                &format!("restricted: community writes are fenced: {error}"),
-            ));
-            return;
-        }
-    };
-
     if kind_u32 == buzz_core::kind::KIND_AUTH {
         reject("invalid");
         conn.send(RelayMessage::ok(
@@ -733,16 +705,47 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
             ));
             return;
         }
-        handle_ephemeral_event(
-            event,
-            conn_id,
-            &event_id_hex,
-            pubkey_bytes,
-            auth_pubkey,
-            conn,
-            state,
+        let serving_write = match buzz_deletion::acquire_serving_write(
+            &state.db,
+            conn.tenant.community(),
+            "ephemeral_event",
         )
-        .await;
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                reject("restricted");
+                conn.send(RelayMessage::ok(
+                    &event_id_hex,
+                    false,
+                    &format!("restricted: community writes are fenced: {error}"),
+                ));
+                return;
+            }
+        };
+        let handled = serving_write
+            .protect(handle_ephemeral_event(
+                event,
+                conn_id,
+                &event_id_hex,
+                pubkey_bytes,
+                auth_pubkey,
+                Arc::clone(&conn),
+                state,
+            ))
+            .await;
+        if let Err(error) = handled {
+            reject("restricted");
+            conn.send(RelayMessage::ok(
+                &event_id_hex,
+                false,
+                &format!("restricted: community write lease lost: {error}"),
+            ));
+            return;
+        }
+        if let Err(error) = serving_write.finish().await {
+            tracing::warn!(%error, event_id = %event_id_hex, "failed to release ephemeral-event serving lease");
+        }
         return;
     }
 

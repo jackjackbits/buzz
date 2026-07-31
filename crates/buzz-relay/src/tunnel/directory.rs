@@ -180,7 +180,7 @@ pub enum DirectoryError {
     /// Lease TTL cannot be represented in Redis milliseconds.
     #[error("lease ttl must be at least 1ms and fit in i64 milliseconds")]
     InvalidLeaseTtl,
-    /// Durable community deletion fence rejected a serving write.
+    /// Durable community deletion fence rejected a Redis mutation.
     #[error("community write fenced: {0}")]
     CommunityWriteFenced(String),
 }
@@ -191,8 +191,8 @@ impl SessionDirectory {
         Self::with_lease_ttl(pool, DEFAULT_LEASE_TTL)
     }
 
-    /// Create a serving directory whose Redis mutations consult the durable
-    /// community write fence.
+    /// Create a serving directory whose Redis mutations use durable,
+    /// heartbeat-backed community write leases.
     pub fn with_db(pool: deadpool_redis::Pool, db: buzz_db::Db) -> Self {
         Self {
             pool,
@@ -213,10 +213,9 @@ impl SessionDirectory {
     async fn begin_serving_write(
         &self,
         community_id: CommunityId,
-    ) -> Result<Option<buzz_db::deletion::ServingWriteGuard>, DirectoryError> {
+    ) -> Result<Option<buzz_deletion::ServingWriteGuard>, DirectoryError> {
         match &self.db {
-            Some(db) => buzz_deletion::store(db)
-                .begin_serving_write(community_id)
+            Some(db) => buzz_deletion::acquire_serving_write(db, community_id, "session_directory")
                 .await
                 .map(Some)
                 .map_err(|error| DirectoryError::CommunityWriteFenced(error.to_string())),
@@ -236,11 +235,11 @@ impl SessionDirectory {
         owner_runtime_id: RuntimeId,
         profile: Profile,
     ) -> Result<AcquireResult, DirectoryError> {
-        let _serving_write = self.begin_serving_write(community_id).await?;
+        let serving_write = self.begin_serving_write(community_id).await?;
         let keys = SessionKeys::new(community_id, session_id);
         let ttl_ms = ttl_ms(self.lease_ttl)?;
         let mut conn = self.pool.get().await?;
-        let (status, value, _known_generation): (String, String, String) =
+        let mutation = async {
             Script::new(ACQUIRE_SCRIPT)
                 .key(&keys.lease)
                 .key(&keys.generation)
@@ -248,8 +247,22 @@ impl SessionDirectory {
                 .arg(profile.as_wire_str())
                 .arg(ttl_ms)
                 .invoke_async(&mut *conn)
-                .await?;
+                .await
+        };
+        let (status, value, _known_generation): (String, String, String) = match &serving_write {
+            Some(guard) => guard
+                .protect(mutation)
+                .await
+                .map_err(|error| DirectoryError::CommunityWriteFenced(error.to_string()))??,
+            None => mutation.await?,
+        };
         let lease = parse_lease(community_id, session_id, &value)?;
+        if let Some(guard) = serving_write {
+            guard
+                .finish()
+                .await
+                .map_err(|error| DirectoryError::CommunityWriteFenced(error.to_string()))?;
+        }
         match status.as_str() {
             "acquired" => Ok(AcquireResult::Acquired(lease)),
             "exists" => Ok(AcquireResult::Exists(lease)),
@@ -277,19 +290,34 @@ impl SessionDirectory {
     /// Renew a lease only if the current Redis value exactly matches the
     /// caller's owner runtime and generation.
     pub async fn renew(&self, lease: &SessionLease) -> Result<RenewResult, DirectoryError> {
-        let _serving_write = self.begin_serving_write(lease.community_id).await?;
+        let serving_write = self.begin_serving_write(lease.community_id).await?;
         let keys = SessionKeys::new(lease.community_id, lease.session_id);
         let ttl_ms = ttl_ms(self.lease_ttl)?;
         let mut conn = self.pool.get().await?;
-        let (status, value, known_generation): (String, String, String) = Script::new(RENEW_SCRIPT)
-            .key(&keys.lease)
-            .key(&keys.generation)
-            .arg(lease.owner_runtime_id.to_hex())
-            .arg(lease.generation)
-            .arg(ttl_ms)
-            .invoke_async(&mut *conn)
-            .await?;
+        let mutation = async {
+            Script::new(RENEW_SCRIPT)
+                .key(&keys.lease)
+                .key(&keys.generation)
+                .arg(lease.owner_runtime_id.to_hex())
+                .arg(lease.generation)
+                .arg(ttl_ms)
+                .invoke_async(&mut *conn)
+                .await
+        };
+        let (status, value, known_generation): (String, String, String) = match &serving_write {
+            Some(guard) => guard
+                .protect(mutation)
+                .await
+                .map_err(|error| DirectoryError::CommunityWriteFenced(error.to_string()))??,
+            None => mutation.await?,
+        };
         let current = parse_optional_lease(lease.community_id, lease.session_id, &value)?;
+        if let Some(guard) = serving_write {
+            guard
+                .finish()
+                .await
+                .map_err(|error| DirectoryError::CommunityWriteFenced(error.to_string()))?;
+        }
         match status.as_str() {
             "renewed" => Ok(RenewResult::Renewed(
                 current.expect("renewed returns lease"),
@@ -309,17 +337,32 @@ impl SessionDirectory {
     /// Release a lease only if the current Redis value exactly matches the
     /// caller's owner runtime and generation.
     pub async fn release(&self, lease: &SessionLease) -> Result<ReleaseResult, DirectoryError> {
+        let serving_write = self.begin_serving_write(lease.community_id).await?;
         let keys = SessionKeys::new(lease.community_id, lease.session_id);
         let mut conn = self.pool.get().await?;
-        let (status, value, known_generation): (String, String, String) =
+        let mutation = async {
             Script::new(RELEASE_SCRIPT)
                 .key(&keys.lease)
                 .key(&keys.generation)
                 .arg(lease.owner_runtime_id.to_hex())
                 .arg(lease.generation)
                 .invoke_async(&mut *conn)
-                .await?;
+                .await
+        };
+        let (status, value, known_generation): (String, String, String) = match &serving_write {
+            Some(guard) => guard
+                .protect(mutation)
+                .await
+                .map_err(|error| DirectoryError::CommunityWriteFenced(error.to_string()))??,
+            None => mutation.await?,
+        };
         let current = parse_optional_lease(lease.community_id, lease.session_id, &value)?;
+        if let Some(guard) = serving_write {
+            guard
+                .finish()
+                .await
+                .map_err(|error| DirectoryError::CommunityWriteFenced(error.to_string()))?;
+        }
         match status.as_str() {
             "released" => Ok(ReleaseResult::Released(
                 current.expect("released returns lease"),

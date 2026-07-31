@@ -2,7 +2,7 @@
 #![warn(missing_docs)]
 //! Shared durable whole-community deletion engine and store adapters.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,10 +21,178 @@ use uuid::Uuid;
 const DEFAULT_STORAGE_OBJECT_CAP: u64 = 1_000_000;
 const WORKER_IDLE_POLL: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+static TEST_HEARTBEAT_INTERVAL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn heartbeat_interval() -> Duration {
+    #[cfg(test)]
+    {
+        let milliseconds = TEST_HEARTBEAT_INTERVAL_MS.load(Ordering::Relaxed);
+        if milliseconds > 0 {
+            return Duration::from_millis(milliseconds);
+        }
+    }
+    HEARTBEAT_INTERVAL
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+struct ServingWriteLeaseLost {
+    message: String,
+}
 
 /// Return the shared durable deletion store for relay and operator paths.
 pub fn store(db: &Db) -> DeletionStore {
     db.deletion_store()
+}
+
+/// Durable, heartbeated lease for a serving-path external side effect.
+pub struct ServingWriteGuard {
+    store: DeletionStore,
+    lease: buzz_db::deletion::ServingWriteLease,
+    cancel: CancellationToken,
+    lost: CancellationToken,
+    finished: bool,
+}
+
+impl ServingWriteGuard {
+    /// Verify this side-effect lease is still current before an irreversible call.
+    pub async fn verify(&self) -> Result<()> {
+        if self.lost.is_cancelled() {
+            return Err(ServingWriteLeaseLost {
+                message: "serving write lease heartbeat was lost".to_string(),
+            }
+            .into());
+        }
+        self.store
+            .verify_serving_write_lease(&self.lease)
+            .await
+            .map_err(|error| ServingWriteLeaseLost {
+                message: error.to_string(),
+            })?;
+        Ok(())
+    }
+
+    /// Run an external side effect while observing lease-heartbeat loss.
+    ///
+    /// Dropping the operation future on lease loss prevents a stale caller from
+    /// continuing network I/O after its durable exclusion proof disappears.
+    pub async fn protect<F, T>(&self, operation: F) -> Result<T>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        self.verify().await?;
+        let output = tokio::select! {
+            biased;
+            _ = self.lost.cancelled() => {
+                return Err(ServingWriteLeaseLost {
+                    message: "serving write lease heartbeat was lost".to_string(),
+                }
+                .into())
+            }
+            output = operation => output,
+        };
+        self.verify().await?;
+        Ok(output)
+    }
+
+    /// Whether an error represents loss of a durable serving-write lease.
+    pub fn is_lease_lost(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<ServingWriteLeaseLost>().is_some()
+    }
+
+    /// Signal fired if the background lease heartbeat fails.
+    pub fn lost(&self) -> CancellationToken {
+        self.lost.clone()
+    }
+
+    /// Begin finalization after the side effect itself has succeeded.
+    ///
+    /// This stops lease renewal without releasing the durable row. Call
+    /// [`Self::finish`] immediately after the result's database finalization so
+    /// deletion cannot overtake the side effect before its outcome is recorded.
+    pub fn begin_finalize(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Release the lease after the side effect completes.
+    pub async fn finish(mut self) -> Result<()> {
+        self.cancel.cancel();
+        let released = self.store.release_serving_write_lease(&self.lease).await?;
+        self.finished = true;
+        if !released {
+            return Err(ServingWriteLeaseLost {
+                message: "serving write lease was already stale or released".to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ServingWriteGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if self.finished {
+            return;
+        }
+        let store = self.store.clone();
+        let lease = self.lease.clone();
+        tokio::spawn(async move {
+            let _ = store.release_serving_write_lease(&lease).await;
+        });
+    }
+}
+
+/// Acquire a serving-side external-effect lease without holding a pool connection.
+pub async fn acquire_serving_write(
+    db: &Db,
+    community: buzz_core::CommunityId,
+    operation: &str,
+) -> Result<ServingWriteGuard> {
+    let store = store(db);
+    let owner = default_executor_id();
+    let lease = store
+        .acquire_serving_write_lease(community, operation, &owner, DEFAULT_LEASE_DURATION)
+        .await?;
+    let heartbeat_store = store.clone();
+    let mut heartbeat_lease = lease.clone();
+    let cancel = CancellationToken::new();
+    let heartbeat_cancel = cancel.clone();
+    let lost = CancellationToken::new();
+    let heartbeat_lost = lost.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(heartbeat_interval());
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = heartbeat_cancel.cancelled() => return,
+                _ = interval.tick() => {
+                    if heartbeat_store
+                        .renew_serving_write_lease(
+                            &mut heartbeat_lease,
+                            DEFAULT_LEASE_DURATION,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        heartbeat_lost.cancel();
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    Ok(ServingWriteGuard {
+        store,
+        lease,
+        cancel,
+        lost,
+        finished: false,
+    })
 }
 
 /// CLI-only whole-community deletion commands.
@@ -103,10 +271,77 @@ impl LoopMode {
     }
 }
 
+#[derive(Clone)]
 struct Services {
     store: DeletionStore,
     media: Arc<MediaStorage>,
     redis: deadpool_redis::Pool,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum EngineError {
+    #[error("permanent deletion safety failure: {0}")]
+    Permanent(String),
+    #[error("transient deletion dependency failure: {0}")]
+    Transient(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+struct PermanentSource(#[from] anyhow::Error);
+
+fn permanent(message: impl Into<String>) -> anyhow::Error {
+    EngineError::Permanent(message.into()).into()
+}
+
+fn permanent_source(error: impl Into<anyhow::Error>) -> anyhow::Error {
+    PermanentSource(error.into()).into()
+}
+
+fn transient(message: impl Into<String>) -> anyhow::Error {
+    EngineError::Transient(message.into()).into()
+}
+
+fn is_permanent_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<PermanentSource>()
+            || matches!(
+                cause.downcast_ref::<buzz_db::DbError>(),
+                Some(buzz_db::DbError::DeletionSafety(_))
+            )
+            || cause
+                .downcast_ref::<EngineError>()
+                .is_some_and(|error| matches!(error, EngineError::Permanent(_)))
+    })
+}
+
+#[derive(Default)]
+struct WorkerHealth {
+    draining: AtomicBool,
+    dependencies_ready: AtomicBool,
+    last_heartbeat_epoch: AtomicU64,
+}
+
+impl WorkerHealth {
+    fn mark_heartbeat(&self) {
+        self.last_heartbeat_epoch.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn ready(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        !self.draining.load(Ordering::Relaxed)
+            && self.dependencies_ready.load(Ordering::Relaxed)
+            && now.saturating_sub(self.last_heartbeat_epoch.load(Ordering::Relaxed)) <= 30
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -198,8 +433,7 @@ pub async fn run(command: Command) -> Result<i32> {
 }
 
 async fn connect_services() -> Result<Services> {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+    let database_url = required_env("DATABASE_URL")?;
     let db = Db::new(&DbConfig {
         database_url,
         max_connections: env_parse("BUZZ_DB_POOL_SIZE", 20),
@@ -208,16 +442,13 @@ async fn connect_services() -> Result<Services> {
     .await?;
     let store = store(&db);
     let media_config = buzz_media::MediaConfig {
-        s3_endpoint: std::env::var("BUZZ_S3_ENDPOINT")
-            .unwrap_or_else(|_| "http://localhost:9000".to_string()),
-        s3_access_key: std::env::var("BUZZ_S3_ACCESS_KEY")
-            .unwrap_or_else(|_| "buzz_dev".to_string()),
-        s3_secret_key: std::env::var("BUZZ_S3_SECRET_KEY")
-            .unwrap_or_else(|_| "buzz_dev_secret".to_string()),
-        s3_bucket: std::env::var("BUZZ_S3_BUCKET").unwrap_or_else(|_| "buzz-media".to_string()),
+        s3_endpoint: required_env("BUZZ_S3_ENDPOINT")?,
+        s3_access_key: required_env("BUZZ_S3_ACCESS_KEY")?,
+        s3_secret_key: required_env("BUZZ_S3_SECRET_KEY")?,
+        s3_bucket: required_env("BUZZ_S3_BUCKET")?,
         s3_region: std::env::var("BUZZ_S3_REGION")
             .or_else(|_| std::env::var("AWS_REGION"))
-            .unwrap_or_else(|_| "us-east-1".to_string()),
+            .map_err(|_| anyhow::anyhow!("BUZZ_S3_REGION or AWS_REGION is required"))?,
         s3_addressing_style: std::env::var("BUZZ_S3_ADDRESSING_STYLE")
             .unwrap_or_else(|_| "path".to_string())
             .parse()
@@ -232,8 +463,7 @@ async fn connect_services() -> Result<Services> {
         upload_port_header: None,
     };
     let media = Arc::new(MediaStorage::new(&media_config)?);
-    let redis_url =
-        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let redis_url = required_env("REDIS_URL")?;
     let mut redis_config = deadpool_redis::Config::from_url(&redis_url);
     redis_config.pool = Some(deadpool_redis::PoolConfig::new(env_parse(
         "BUZZ_REDIS_POOL_SIZE",
@@ -249,6 +479,14 @@ async fn connect_services() -> Result<Services> {
     })
 }
 
+fn required_env(name: &str) -> Result<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{name} is required for community deletion"))
+}
+
 fn env_parse<T>(name: &str, default: T) -> T
 where
     T: std::str::FromStr,
@@ -257,6 +495,12 @@ where
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+fn storage_taxonomy_matches(approved: &StorageManifest, live: &StorageManifest) -> bool {
+    approved.version == live.version
+        && approved.unknown_keys == live.unknown_keys
+        && approved.unsupported_version_keys == live.unsupported_version_keys
 }
 
 async fn build_inventory(
@@ -315,8 +559,13 @@ async fn run_loop(
     executor_id: String,
 ) -> Result<i32> {
     let shutdown = shutdown_token();
-    let _health = if mode == LoopMode::Worker {
-        Some(spawn_worker_health(shutdown.clone()).await?)
+    let health = Arc::new(WorkerHealth::default());
+    health.mark_heartbeat();
+    health
+        .dependencies_ready
+        .store(dependencies_ready(&services).await, Ordering::Relaxed);
+    let _health_task = if mode == LoopMode::Worker {
+        Some(spawn_worker_health(shutdown.clone(), Arc::clone(&health)).await?)
     } else {
         None
     };
@@ -349,7 +598,14 @@ async fn run_loop(
                 LoopMode::Worker => {
                     tokio::select! {
                         _ = shutdown.cancelled() => continue,
-                        _ = tokio::time::sleep(WORKER_IDLE_POLL) => continue,
+                        _ = tokio::time::sleep(WORKER_IDLE_POLL) => {
+                            health.dependencies_ready.store(
+                                dependencies_ready(&services).await,
+                                Ordering::Relaxed,
+                            );
+                            health.mark_heartbeat();
+                            continue;
+                        },
                     }
                 }
                 LoopMode::Run if !ran => anyhow::bail!(
@@ -359,7 +615,7 @@ async fn run_loop(
             }
         };
         ran = true;
-        let output = execute_claim(&services, mode, claim, &shutdown).await?;
+        let output = execute_claim(&services, mode, claim, &shutdown, Arc::clone(&health)).await?;
         print_json(&output)?;
         if mode == LoopMode::Run || shutdown.is_cancelled() {
             return Ok(i32::from(output.blocked_reason.is_some()));
@@ -372,6 +628,7 @@ async fn execute_claim(
     mode: LoopMode,
     mut claim: ClaimedDeletion,
     shutdown: &CancellationToken,
+    health: Arc<WorkerHealth>,
 ) -> Result<RunOutput> {
     let token = claim.lease.clone();
     loop {
@@ -391,12 +648,15 @@ async fn execute_claim(
             .store
             .heartbeat(&token, mode.as_str(), DEFAULT_LEASE_DURATION, false)
             .await?;
-        let stage_result = execute_stage(services, &claim).await;
+        health.dependencies_ready.store(true, Ordering::Relaxed);
+        health.mark_heartbeat();
+        let stage_result =
+            run_stage_with_heartbeat(services, mode, &claim, shutdown, Arc::clone(&health)).await;
         match stage_result {
             Ok(()) => {}
             Err(error) => {
                 let message = format!("{error:#}");
-                if is_permanent_failure(&message) {
+                if is_permanent_error(&error) {
                     services
                         .store
                         .block(&token, claim.request.stage, "stage", &message)
@@ -420,59 +680,198 @@ async fn execute_claim(
     }
 }
 
+async fn dependencies_ready(services: &Services) -> bool {
+    if !services.store.ping().await {
+        return false;
+    }
+    let redis_ok = match services.redis.get().await {
+        Ok(mut connection) => tokio::time::timeout(
+            Duration::from_secs(5),
+            redis::cmd("PING").query_async::<String>(&mut *connection),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok()),
+        Err(_) => false,
+    };
+    let storage_ok = tokio::time::timeout(Duration::from_secs(5), services.media.ping())
+        .await
+        .is_ok_and(|result| result.is_ok());
+    redis_ok && storage_ok
+}
+
+async fn run_stage_with_heartbeat(
+    services: &Services,
+    mode: LoopMode,
+    claim: &ClaimedDeletion,
+    shutdown: &CancellationToken,
+    health: Arc<WorkerHealth>,
+) -> Result<()> {
+    let heartbeat_services = services.clone();
+    let heartbeat_token = claim.lease.clone();
+    let heartbeat_mode = mode.as_str();
+    let heartbeat_shutdown = CancellationToken::new();
+    let heartbeat_cancel = heartbeat_shutdown.clone();
+    let heartbeat_health = Arc::clone(&health);
+    let heartbeat_error = CancellationToken::new();
+    let heartbeat_error_signal = heartbeat_error.clone();
+    let heartbeat = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(heartbeat_interval());
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = heartbeat_cancel.cancelled() => return,
+                _ = interval.tick() => {
+                    if heartbeat_services
+                        .store
+                        .heartbeat(
+                            &heartbeat_token,
+                            heartbeat_mode,
+                            DEFAULT_LEASE_DURATION,
+                            false,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        heartbeat_error_signal.cancel();
+                        return;
+                    }
+                    heartbeat_health.mark_heartbeat();
+                }
+            }
+        }
+    });
+
+    let stage = tokio::select! {
+        _ = shutdown.cancelled() => Err(anyhow::anyhow!("executor shutdown requested")),
+        _ = heartbeat_error.cancelled() => Err(anyhow::anyhow!("deletion lease heartbeat failed")),
+        result = execute_stage(services, claim) => result,
+    };
+    heartbeat_shutdown.cancel();
+    match heartbeat.await {
+        Ok(()) => stage,
+        Err(error) => Err(anyhow::anyhow!("deletion heartbeat task failed: {error}")),
+    }
+}
+
+async fn guarded_external_step<F, Fut>(
+    services: &Services,
+    token: &LeaseToken,
+    stage: DeletionStage,
+    operation: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    services.store.verify_execution_token(token, stage).await?;
+    operation().await?;
+    services.store.verify_execution_token(token, stage).await?;
+    Ok(())
+}
+
 async fn execute_stage(services: &Services, claim: &ClaimedDeletion) -> Result<()> {
     let request = &claim.request;
     let token = token_with_current_fence(&claim.lease, request);
     match request.stage {
         DeletionStage::Approved => {
-            // Rebuild inventory immediately before the first destructive stage
-            // and require byte-equivalence with the approved frozen inventory.
-            let live = build_inventory(services, request).await?;
+            // Approval binds immutable catalog + key taxonomy. Live row counts
+            // and tenant binding keys are deliberately not equality-bound until
+            // the durable fence closes all writers.
+            let live_schema = services
+                .store
+                .inventory_schema(request.community_id)
+                .await?;
             let frozen: FrozenInventory = serde_json::from_value(
                 request
                     .inventory_manifest
                     .clone()
-                    .context("approved request has no frozen inventory")?,
-            )?;
-            if live != frozen {
-                anyhow::bail!("approved inventory drifted before fencing");
+                    .ok_or_else(|| permanent("approved request has no frozen inventory"))?,
+            )
+            .map_err(permanent_source)?;
+            if live_schema != frozen.schema {
+                return Err(permanent(
+                    "approved structural catalog drifted before fencing",
+                ));
+            }
+            let live_storage = build_storage_manifest(services, request).await?;
+            if !storage_taxonomy_matches(&frozen.storage, &live_storage) {
+                return Err(permanent(
+                    "approved storage taxonomy drifted before fencing",
+                ));
             }
             services.store.fence(&token).await?;
         }
         DeletionStage::Fenced => {
             publish_disconnect_community(&services.redis, request.community_id).await?;
-            services.store.mark_drained(&token).await?;
+            let destructive = match request.destructive_storage_manifest.clone() {
+                Some(value) => serde_json::from_value(value)?,
+                None => {
+                    let manifest = build_storage_manifest(services, request).await?;
+                    services
+                        .store
+                        .freeze_destructive_storage_manifest(&token, &manifest)
+                        .await?;
+                    manifest
+                }
+            };
+            buzz_db::deletion::validate_storage_manifest(&destructive)?;
+            if services
+                .store
+                .serving_writes_drained(request.community_id)
+                .await?
+            {
+                services.store.mark_drained(&token).await?;
+            } else {
+                return Err(transient("serving writes have not drained"));
+            }
         }
         DeletionStage::Drained => {
             let storage: StorageManifest = serde_json::from_value(
                 request
-                    .storage_manifest
+                    .destructive_storage_manifest
                     .clone()
-                    .context("request has no frozen storage manifest")?,
+                    .context("request has no post-fence destructive storage manifest")?,
             )?;
             buzz_db::deletion::validate_storage_manifest(&storage)?;
-            // Re-run the exhaustive bucket taxonomy after fencing. Any key that
-            // appeared after approval is drift and blocks before a delete.
             let live_storage = build_storage_manifest(services, request).await?;
             if live_storage != storage {
-                anyhow::bail!("approved storage inventory drifted before binding removal");
+                return Err(permanent(
+                    "post-fence storage inventory drifted before binding removal",
+                ));
             }
             for key in &storage.tenant_keys {
                 match services.media.inspect_current_version(key).await? {
                     CurrentObjectVersion::Present { version_id: None } => {}
                     CurrentObjectVersion::Present {
                         version_id: Some(_),
-                    } => anyhow::bail!("unsupported object version appeared after approval: {key}"),
+                    } => {
+                        return Err(permanent(format!(
+                            "unsupported object version after fence: {key}"
+                        )))
+                    }
                     CurrentObjectVersion::Missing => {
-                        anyhow::bail!("approved object binding disappeared before deletion: {key}")
+                        return Err(permanent(format!(
+                            "fenced object binding disappeared before deletion: {key}"
+                        )))
                     }
                 }
             }
-            services.media.delete_bindings(&storage.tenant_keys).await?;
             for key in &storage.tenant_keys {
-                if services.media.head(key).await? {
-                    anyhow::bail!("object binding still exists after delete: {key}");
-                }
+                guarded_external_step(services, &token, DeletionStage::Drained, || async {
+                    services.media.delete(key).await?;
+                    Ok(())
+                })
+                .await?;
+                guarded_external_step(services, &token, DeletionStage::Drained, || async {
+                    if services.media.head(key).await? {
+                        return Err(transient(format!(
+                            "object binding still exists after delete: {key}"
+                        )));
+                    }
+                    Ok(())
+                })
+                .await?;
             }
             services
                 .store
@@ -486,7 +885,15 @@ async fn execute_stage(services: &Services, claim: &ClaimedDeletion) -> Result<(
             services.store.purge_postgres(&token).await?;
         }
         DeletionStage::PostgresPurged => {
+            services
+                .store
+                .verify_execution_token(&token, DeletionStage::PostgresPurged)
+                .await?;
             let deleted = purge_redis_namespace(&services.redis, request.community_id).await?;
+            services
+                .store
+                .verify_execution_token(&token, DeletionStage::PostgresPurged)
+                .await?;
             services
                 .store
                 .mark_cache_purged(&token, serde_json::json!({"deleted_keys": deleted}))
@@ -543,13 +950,15 @@ fn token_with_current_fence(token: &LeaseToken, request: &DeletionRequest) -> Le
 async fn verify_storage_absence(services: &Services, request: &DeletionRequest) -> Result<()> {
     let storage: StorageManifest = serde_json::from_value(
         request
-            .storage_manifest
+            .destructive_storage_manifest
             .clone()
-            .context("request has no frozen storage manifest")?,
+            .context("request has no post-fence destructive storage manifest")?,
     )?;
     for key in &storage.tenant_keys {
         if services.media.head(key).await? {
-            anyhow::bail!("logical verification found object binding: {key}");
+            return Err(transient(format!(
+                "logical verification found object binding: {key}"
+            )));
         }
     }
     Ok(())
@@ -601,24 +1010,50 @@ async fn purge_redis_namespace(
     Ok(deleted)
 }
 
+fn scan_proves_absence(pages: &[(u64, Vec<String>)]) -> bool {
+    pages.last().is_some_and(|(cursor, _)| *cursor == 0)
+        && pages.iter().all(|(_, keys)| keys.is_empty())
+}
+
+async fn scan_redis_namespace(
+    connection: &mut deadpool_redis::Connection,
+    pattern: &str,
+) -> Result<Vec<(u64, Vec<String>)>> {
+    let mut cursor = 0u64;
+    let mut pages = Vec::new();
+    loop {
+        let page: (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(1000)
+            .query_async(&mut **connection)
+            .await?;
+        cursor = page.0;
+        pages.push(page);
+        if cursor == 0 {
+            return Ok(pages);
+        }
+    }
+}
+
 async fn verify_redis_absence(
     pool: &deadpool_redis::Pool,
     community: buzz_core::CommunityId,
 ) -> Result<()> {
     let mut connection = pool.get().await?;
     let pattern = format!("buzz:{community}:*");
-    let (_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-        .arg(0)
-        .arg("MATCH")
-        .arg(pattern)
-        .arg("COUNT")
-        .arg(1)
-        .query_async(&mut *connection)
-        .await?;
-    if keys.is_empty() {
+    // SCAN is weakly consistent. Two complete empty passes ensure a cursor
+    // rollover or concurrent expiry cannot make one sparse pass look absent.
+    let first = scan_redis_namespace(&mut connection, &pattern).await?;
+    let second = scan_redis_namespace(&mut connection, &pattern).await?;
+    if scan_proves_absence(&first) && scan_proves_absence(&second) {
         Ok(())
     } else {
-        anyhow::bail!("logical verification found Redis key: {}", keys[0])
+        Err(transient(
+            "logical verification found a Redis namespace key",
+        ))
     }
 }
 
@@ -635,32 +1070,33 @@ fn default_executor_id() -> String {
     format!("{hostname}:{}", std::process::id())
 }
 
-async fn spawn_worker_health(shutdown: CancellationToken) -> Result<tokio::task::JoinHandle<()>> {
+async fn spawn_worker_health(
+    shutdown: CancellationToken,
+    health: Arc<WorkerHealth>,
+) -> Result<tokio::task::JoinHandle<()>> {
     let address =
         std::env::var("BUZZ_DELETION_HEALTH_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&address)
         .await
         .with_context(|| format!("bind deletion worker health endpoint {address}"))?;
-    let draining = Arc::new(AtomicBool::new(false));
-    let signal = Arc::clone(&draining);
+    let signal = Arc::clone(&health);
     let cancel = shutdown.clone();
     tokio::spawn(async move {
         cancel.cancelled().await;
-        signal.store(true, Ordering::Relaxed);
+        signal.draining.store(true, Ordering::Relaxed);
     });
     let router = axum::Router::new()
         .route("/_liveness", axum::routing::get(|| async { "ok" }))
         .route(
             "/_readiness",
             axum::routing::get({
-                let draining = Arc::clone(&draining);
                 move || {
-                    let draining = Arc::clone(&draining);
+                    let health = Arc::clone(&health);
                     async move {
-                        if draining.load(Ordering::Relaxed) {
-                            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "draining")
-                        } else {
+                        if health.ready() {
                             (axum::http::StatusCode::OK, "ready")
+                        } else {
+                            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not_ready")
                         }
                     }
                 }
@@ -701,20 +1137,6 @@ fn shutdown_token() -> CancellationToken {
     token
 }
 
-fn is_permanent_failure(message: &str) -> bool {
-    [
-        "drift",
-        "unknown object-store keys",
-        "unsupported object",
-        "catalog",
-        "write-fence",
-        "approved inventory",
-        "tombstone/fence",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
-}
-
 fn run_output(request: DeletionRequest) -> RunOutput {
     RunOutput {
         request_id: request.id,
@@ -733,10 +1155,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn permanent_failures_are_narrow_and_fail_closed() {
-        assert!(is_permanent_failure("community deletion catalog drift"));
-        assert!(is_permanent_failure("unknown object-store keys"));
-        assert!(!is_permanent_failure("temporary Redis connection reset"));
+    fn permanent_failures_are_typed_not_string_classified() {
+        let permanent_error = permanent("catalog drift");
+        let transient_error = transient("temporary catalog service reset");
+        let nested = permanent_source(anyhow::anyhow!("schema mismatch")).context("outer");
+        let db_permanent = anyhow::Error::from(buzz_db::DbError::DeletionSafety(
+            "typed catalog drift".to_string(),
+        ));
+        let db_transient = anyhow::Error::from(buzz_db::DbError::Sqlx(sqlx::Error::PoolTimedOut));
+        assert!(is_permanent_error(&permanent_error));
+        assert!(is_permanent_error(&nested));
+        assert!(is_permanent_error(&db_permanent));
+        assert!(!is_permanent_error(&transient_error));
+        assert!(!is_permanent_error(&db_transient));
+    }
+
+    #[test]
+    fn redis_absence_requires_terminal_cursor_and_all_pages_empty() {
+        assert!(!scan_proves_absence(&[(9, Vec::new())]));
+        assert!(!scan_proves_absence(&[
+            (9, Vec::new()),
+            (0, vec!["buzz:tenant:late".to_string()]),
+        ]));
+        assert!(scan_proves_absence(&[(9, Vec::new()), (0, Vec::new())]));
+    }
+
+    #[tokio::test]
+    async fn serving_guard_cancels_protected_operation_when_heartbeat_is_lost() {
+        let database_url = match std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+        {
+            Ok(url) => url,
+            Err(_) => return,
+        };
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect serving guard test DB");
+        let db = Db::from_pool(pool.clone());
+        db.migrate().await.expect("migrate serving guard test DB");
+        let community = db
+            .ensure_configured_community(&format!(
+                "serving-guard-{}.example",
+                Uuid::new_v4().simple()
+            ))
+            .await
+            .expect("create test community")
+            .id;
+        TEST_HEARTBEAT_INTERVAL_MS.store(10, Ordering::Relaxed);
+        let guard = acquire_serving_write(&db, community, "test_cancel")
+            .await
+            .expect("serving guard");
+        sqlx::query("DELETE FROM community_serving_write_leases WHERE community_id = $1")
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("force heartbeat failure");
+        let completed = Arc::new(AtomicBool::new(false));
+        let operation_completed = Arc::clone(&completed);
+        let result = guard
+            .protect(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                operation_completed.store(true, Ordering::Relaxed);
+            })
+            .await;
+        TEST_HEARTBEAT_INTERVAL_MS.store(0, Ordering::Relaxed);
+        assert!(result.is_err(), "lease loss must reject the operation");
+        assert!(
+            !completed.load(Ordering::Relaxed),
+            "lease loss must cancel the protected operation future"
+        );
     }
 
     #[tokio::test]

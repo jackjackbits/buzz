@@ -72,13 +72,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.deletionWorker.existingSecret }}
                   key: BUZZ_S3_ACCESS_KEY
-                  optional: true
             - name: BUZZ_S3_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.deletionWorker.existingSecret }}
                   key: BUZZ_S3_SECRET_KEY
-                  optional: true
             {{- with .Values.deletionWorker.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

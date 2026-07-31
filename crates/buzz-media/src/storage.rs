@@ -299,6 +299,11 @@ impl MediaStorage {
             .map(|m| m.mime_type)
     }
 
+    /// Probe object-store connectivity and bucket access.
+    pub async fn ping(&self) -> Result<(), MediaError> {
+        self.list_page(None, 1).await.map(|_| ())
+    }
+
     /// One page of a full-bucket listing, for the storage sweep. Wraps
     /// rust-s3's manual `list_page` (NOT the auto-paginating `list`, which
     /// has no cap) and converts the result into the storage-agnostic

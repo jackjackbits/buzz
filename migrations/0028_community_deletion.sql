@@ -23,6 +23,8 @@ CREATE TABLE community_deletion_requests (
     reason TEXT,
     schema_manifest JSONB,
     storage_manifest JSONB,
+    destructive_storage_manifest JSONB,
+    destructive_storage_frozen_at TIMESTAMPTZ,
     inventory_manifest JSONB,
     inventory_digest BYTEA CHECK (inventory_digest IS NULL OR length(inventory_digest) = 32),
     inventory_frozen_at TIMESTAMPTZ,
@@ -88,6 +90,22 @@ CREATE TABLE community_deletion_retention_exceptions (
     PRIMARY KEY (request_id, exception_key)
 );
 
+CREATE TABLE community_serving_write_leases (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    community_id UUID NOT NULL REFERENCES communities(id),
+    operation TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    generation BIGINT NOT NULL DEFAULT 1 CHECK (generation > 0),
+    -- Community fence generation observed when this lease was acquired.
+    fence_generation BIGINT NOT NULL CHECK (fence_generation >= 0),
+    lease_until TIMESTAMPTZ NOT NULL,
+    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (community_id, id)
+);
+CREATE INDEX community_serving_write_leases_active
+    ON community_serving_write_leases (community_id, lease_until);
+
 CREATE TABLE community_deletion_executor_heartbeats (
     executor_id TEXT PRIMARY KEY,
     mode TEXT NOT NULL CHECK (mode IN ('run', 'drain', 'worker')),
@@ -103,6 +121,7 @@ INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('community_deletion_approvals', 'deployment operator destructive approvals'),
     ('community_deletion_checkpoints', 'deployment deletion executor checkpoints and failures'),
     ('community_deletion_retention_exceptions', 'deployment retention holds and expiry exceptions'),
+    ('community_serving_write_leases', 'deployment serving side-effect leases drained by deletion'),
     ('community_deletion_executor_heartbeats', 'deployment deletion worker liveness');
 
 -- Shared lock key used by both the trigger and the deletion engine. Every
@@ -171,8 +190,11 @@ DECLARE
     expected_generation BIGINT;
 BEGIN
     IF TG_OP = 'DELETE' THEN
-        RAISE EXCEPTION 'community tombstones are permanent'
-            USING ERRCODE = 'object_not_in_prerequisite_state';
+        IF OLD.deletion_state <> 'active' OR OLD.deleted_at IS NOT NULL THEN
+            RAISE EXCEPTION 'community tombstones are permanent'
+                USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
+        RETURN OLD;
     END IF;
 
     expected_generation := CASE
@@ -225,6 +247,7 @@ BEGIN
                'community_deletion_approvals',
                'community_deletion_checkpoints',
                'community_deletion_retention_exceptions',
+               'community_serving_write_leases',
                'community_deletion_executor_heartbeats'
            )
     LOOP

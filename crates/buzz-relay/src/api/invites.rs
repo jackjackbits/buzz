@@ -305,7 +305,9 @@ pub async fn mint_invite(
         .mint_relay_invite(tenant.community(), &sender_hex, ttl, max_uses)
         .await
         .map_err(|error| match error {
-            buzz_db::DbError::InvalidData(message) => api_error(StatusCode::BAD_REQUEST, &message),
+            buzz_db::DbError::InvalidData(message) | buzz_db::DbError::DeletionSafety(message) => {
+                api_error(StatusCode::BAD_REQUEST, &message)
+            }
             error => internal_error(&format!("invite mint: {error}")),
         })?;
 

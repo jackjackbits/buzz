@@ -1826,9 +1826,12 @@ async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
     // An already-running receive-pack may cross the durable fence after
     // request admission. Revalidate immediately before object-store CAS; DB
     // trigger fencing alone cannot roll back an S3 pointer mutation.
-    let _serving_write = match buzz_deletion::store(&state.db)
-        .begin_serving_write(ctx.tenant.community())
-        .await
+    let serving_write = match buzz_deletion::acquire_serving_write(
+        &state.db,
+        ctx.tenant.community(),
+        "git_publish",
+    )
+    .await
     {
         Ok(guard) => guard,
         Err(error) => {
@@ -1841,10 +1844,20 @@ async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
         }
     };
 
+    if let Err(error) = serving_write.verify().await {
+        warn!(owner = %ctx.owner, repo = %ctx.repo, %error, "push lost community serving lease");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "community write lease lost",
+        )
+            .into_response();
+    }
+
     // Step 7 (CAS). The PushContext binds `parent_state` (observed at
     // hydrate) to the CAS predicate here — no re-reading of the pointer
-    // between hydrate and CAS.
-    let success = match cas_publish(
+    // between hydrate and CAS. Observe serving-lease loss throughout the
+    // potentially long upload/CAS operation, not only at its boundaries.
+    let publish = cas_publish(
         &state.git_store,
         &ctx.tenant,
         ctx.repo_handle.path(),
@@ -1856,71 +1869,84 @@ async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
             max_pack_bytes: state.config.git_max_pack_bytes,
             max_repo_bytes: state.config.git_max_repo_bytes,
         },
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(CasError::Conflict {
-            winner_manifest_key,
-            ..
-        }) => {
-            warn!(
-                owner = %ctx.owner,
-                repo = %ctx.repo,
-                winner = %winner_manifest_key,
-                "push lost CAS race; tempdir dropped, returning 409"
-            );
+    );
+    let success = match serving_write.protect(publish).await {
+        Ok(result) => match result {
+            Ok(s) => s,
+            Err(CasError::Conflict {
+                winner_manifest_key,
+                ..
+            }) => {
+                warn!(
+                    owner = %ctx.owner,
+                    repo = %ctx.repo,
+                    winner = %winner_manifest_key,
+                    "push lost CAS race; tempdir dropped, returning 409"
+                );
+                return (
+                    StatusCode::CONFLICT,
+                    "push superseded by a concurrent writer; pull and retry",
+                )
+                    .into_response();
+            }
+            Err(CasError::ManifestInvalid(e)) => {
+                // 4xx-class: the workspace produced refs/HEAD/oids the
+                // manifest validator rejects (unsafe refname, malformed oid,
+                // empty head, malformed parent). Pre-CAS — no pointer was
+                // written.
+                warn!(
+                    owner = %ctx.owner,
+                    repo = %ctx.repo,
+                    error = %e,
+                    "push rejected: manifest validation failed"
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "push produced invalid manifest state",
+                )
+                    .into_response();
+            }
+            Err(CasError::ResourceLimit(e)) => {
+                warn!(
+                    owner = %ctx.owner,
+                    repo = %ctx.repo,
+                    error = %e,
+                    "push rejected: repo exceeds relay resource limits"
+                );
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "repository exceeds relay resource limits",
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                // 5xx-class: ManifestReadFailed (parent corruption),
+                // Backend, PackCapture. The tempdir drops on scope exit; no
+                // pointer was written (or, on rare ManifestReadFailed during
+                // winner-fetch, the winner is already installed and the
+                // loser's data is unrelated).
+                error!(
+                    owner = %ctx.owner,
+                    repo = %ctx.repo,
+                    error = %e,
+                    "push failed pre-response"
+                );
+                return (StatusCode::INTERNAL_SERVER_ERROR, "git backend error").into_response();
+            }
+        },
+        Err(error) => {
+            warn!(owner = %ctx.owner, repo = %ctx.repo, %error, "push lost community serving lease during CAS publish");
             return (
-                StatusCode::CONFLICT,
-                "push superseded by a concurrent writer; pull and retry",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "community write lease lost",
             )
                 .into_response();
-        }
-        Err(CasError::ManifestInvalid(e)) => {
-            // 4xx-class: the workspace produced refs/HEAD/oids the
-            // manifest validator rejects (unsafe refname, malformed oid,
-            // empty head, malformed parent). Pre-CAS — no pointer was
-            // written.
-            warn!(
-                owner = %ctx.owner,
-                repo = %ctx.repo,
-                error = %e,
-                "push rejected: manifest validation failed"
-            );
-            return (
-                StatusCode::BAD_REQUEST,
-                "push produced invalid manifest state",
-            )
-                .into_response();
-        }
-        Err(CasError::ResourceLimit(e)) => {
-            warn!(
-                owner = %ctx.owner,
-                repo = %ctx.repo,
-                error = %e,
-                "push rejected: repo exceeds relay resource limits"
-            );
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "repository exceeds relay resource limits",
-            )
-                .into_response();
-        }
-        Err(e) => {
-            // 5xx-class: ManifestReadFailed (parent corruption),
-            // Backend, PackCapture. The tempdir drops on scope exit; no
-            // pointer was written (or, on rare ManifestReadFailed during
-            // winner-fetch, the winner is already installed and the
-            // loser's data is unrelated).
-            error!(
-                owner = %ctx.owner,
-                repo = %ctx.repo,
-                error = %e,
-                "push failed pre-response"
-            );
-            return (StatusCode::INTERNAL_SERVER_ERROR, "git backend error").into_response();
         }
     };
+
+    if let Err(error) = serving_write.finish().await {
+        warn!(owner = %ctx.owner, repo = %ctx.repo, %error, "failed to release community serving lease after push");
+    }
 
     // Derived after CAS: kind:30618 ref-state event over the *committed*
     // manifest's refs/head. Spec §Implementation Correspondence:

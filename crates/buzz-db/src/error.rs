@@ -45,6 +45,11 @@ pub enum DbError {
     #[error("invalid data: {0}")]
     InvalidData(String),
 
+    /// A deletion safety invariant is structurally violated and requires
+    /// operator/code remediation rather than blind retry.
+    #[error("deletion safety error: {0}")]
+    DeletionSafety(String),
+
     /// A stored timestamp value could not be interpreted.
     #[error("invalid timestamp: {0}")]
     InvalidTimestamp(i64),

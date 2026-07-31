@@ -9,6 +9,7 @@ description = "Durable whole-community deletion engine for Buzz"
 
 [dependencies]
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 axum = { workspace = true }
 buzz-core = { workspace = true }
 buzz-db = { workspace = true }
@@ -21,3 +22,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+sqlx = { workspace = true }

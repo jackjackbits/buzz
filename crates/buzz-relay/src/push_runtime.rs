@@ -418,9 +418,12 @@ async fn deliver_one(
             return;
         }
     };
-    let _serving_write = match buzz_deletion::store(&state.db)
-        .begin_serving_write(outcome.community)
-        .await
+    let serving_write = match buzz_deletion::acquire_serving_write(
+        &state.db,
+        outcome.community,
+        "push_delivery",
+    )
+    .await
     {
         Ok(guard) => guard,
         Err(error) => {
@@ -443,7 +446,21 @@ async fn deliver_one(
             return;
         }
     };
-    let response = send_gateway_request(http, url, body, auth).await;
+    if let Err(error) = serving_write.verify().await {
+        warn!(wake=%outcome.id, %error, "push serving lease lost before delivery");
+        return;
+    }
+    let response = match serving_write
+        .protect(send_gateway_request(http, url, body, auth))
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(wake=%outcome.id, %error, "push serving lease lost during delivery");
+            return;
+        }
+    };
+    serving_write.begin_finalize();
     match response {
         Ok(r) if r.status().is_success() => match r.json::<DeliveryResponse>().await {
             Ok(DeliveryResponse::Accepted) => {
@@ -515,6 +532,9 @@ async fn deliver_one(
                 .fail_push_wake(outcome.community, outcome.id, outcome.claim_id)
                 .await;
         }
+    }
+    if let Err(error) = serving_write.finish().await {
+        warn!(wake=%outcome.id, %error, "failed to release community serving lease after push delivery");
     }
 }
 

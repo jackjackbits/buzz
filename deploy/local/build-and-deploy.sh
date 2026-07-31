@@ -103,17 +103,14 @@ if [ "$helm_rc" != 0 ]; then
 fi
 
 # ── 4. verify 3/3 Ready ───────────────────────────────────────────────────────
-# Find the relay Deployment: everything under this release named "buzz" except
-# the bundled "*-minio" Deployment. (The chart fullname collapses
-# "<release>-<chart>" to "<release>" when the release name already contains the
-# chart name, so the name isn't always "<release>-buzz".)
-DEPLOY=""
-for d in $(kubectl -n "$NS" get deploy -l "app.kubernetes.io/instance=$RELEASE" \
-             -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
-  case "$d" in *-minio) continue;; esac
-  DEPLOY="$d"; break
-done
-[ -n "$DEPLOY" ] || die "could not locate the relay Deployment"
+# Select the relay by its explicit component label. Optional worker/sidecar
+# Deployments share the release instance and must never become the rollout target.
+DEPLOYMENTS=$(kubectl -n "$NS" get deploy \
+  -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=relay" \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+[ "$(printf '%s\n' "$DEPLOYMENTS" | sed '/^$/d' | wc -l | tr -d ' ')" = "1" ] || \
+  die "expected exactly one relay Deployment, got: ${DEPLOYMENTS:-<none>}"
+DEPLOY=$(printf '%s\n' "$DEPLOYMENTS" | sed '/^$/d')
 log "waiting for $REPLICAS relay pods Ready (deployment: $DEPLOY)"
 kubectl -n "$NS" rollout status deployment/"$DEPLOY" --timeout=4m | tee "$EVID/rollout.txt"
 kubectl -n "$NS" get pods -o wide | tee "$EVID/pods.txt"
@@ -129,9 +126,8 @@ log "probing /_readiness on each relay pod individually"
 : > "$EVID/readiness.txt"
 FAIL=0
 RELAY_PODS=$(kubectl -n "$NS" get pods \
-  -l "app.kubernetes.io/name=buzz,app.kubernetes.io/instance=$RELEASE" \
-  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.labels.app\.kubernetes\.io/component}{"\n"}{end}' \
-  | awk '$2 != "minio" && $2 != "minio-init" {print $1}')
+  -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=relay" \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
 for pod in $RELAY_PODS; do
   body=$(kubectl -n "$NS" exec "$pod" -- \
     sh -c 'curl -sS --max-time 5 http://127.0.0.1:8080/_readiness' 2>/dev/null || echo '<curl-failed>')

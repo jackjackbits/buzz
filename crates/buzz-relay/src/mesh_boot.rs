@@ -536,18 +536,15 @@ mod tests {
             .create_pool(Some(deadpool_redis::Runtime::Tokio1))
             .unwrap();
         let keys = nostr::Keys::generate();
-        let db_pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://buzz:buzz_dev@localhost:5432/buzz")
-            .unwrap();
-        let handle = boot_mesh(
-            &config,
-            pool,
-            buzz_db::Db::from_pool(db_pool),
-            &keys,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await
-        .expect("off path is never an error");
+        let db = buzz_db::Db::from_pool(
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+                .expect("lazy database pool"),
+        );
+        let handle = boot_mesh(&config, pool, db, &keys, Arc::new(AtomicBool::new(false)))
+            .await
+            .expect("off path is never an error");
         assert!(handle.is_none());
     }
 
