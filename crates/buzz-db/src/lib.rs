@@ -17,6 +17,8 @@ pub mod api_token;
 pub mod archived_identities;
 /// Channel and membership persistence.
 pub mod channel;
+/// Durable whole-community deletion lifecycle and PostgreSQL adapter.
+pub mod deletion;
 /// Direct message channel persistence.
 pub mod dm;
 /// Database error types.
@@ -1180,6 +1182,11 @@ impl Db {
         usage::community_hosts(&self.pool).await
     }
 
+    /// Return the shared durable whole-community deletion adapter.
+    pub fn deletion_store(&self) -> deletion::DeletionStore {
+        deletion::DeletionStore::new(self.pool.clone())
+    }
+
     /// Begin a database transaction for atomic multi-statement operations.
     ///
     /// Returns a `'static` transaction because `PgPool` is `Arc`-backed internally.
@@ -1202,6 +1209,8 @@ impl Db {
             FROM communities
             WHERE lower(host) = lower($1)
               AND archived_at IS NULL
+              AND deleted_at IS NULL
+              AND deletion_state = 'active'
             "#,
         )
         .bind(normalized_host)
@@ -1223,7 +1232,7 @@ impl Db {
     /// Returns whether a community id still exists in the active lifecycle state.
     pub async fn is_community_active(&self, community_id: CommunityId) -> Result<bool> {
         let active = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM communities WHERE id = $1 AND archived_at IS NULL)",
+            "SELECT EXISTS(SELECT 1 FROM communities WHERE id = $1 AND archived_at IS NULL AND deleted_at IS NULL AND deletion_state = 'active')",
         )
         .bind(community_id.as_uuid())
         .fetch_one(&self.pool)
@@ -1305,6 +1314,8 @@ impl Db {
             FROM communities
             WHERE id = $1
               AND archived_at IS NULL
+              AND deleted_at IS NULL
+              AND deletion_state = 'active'
             "#,
         )
         .bind(community_id.as_uuid())

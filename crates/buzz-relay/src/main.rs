@@ -469,6 +469,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = buzz_relay::mesh_boot::boot_mesh(
         &state.config,
         state.redis_pool.clone(),
+        state.db.clone(),
         &state.relay_keypair,
         Arc::clone(&state.shutting_down),
     )

@@ -87,6 +87,7 @@ return {current, known_generation}
 pub struct SessionDirectory {
     pool: deadpool_redis::Pool,
     lease_ttl: Duration,
+    db: Option<buzz_db::Db>,
 }
 
 /// Active session ownership lease read from Redis.
@@ -179,6 +180,9 @@ pub enum DirectoryError {
     /// Lease TTL cannot be represented in Redis milliseconds.
     #[error("lease ttl must be at least 1ms and fit in i64 milliseconds")]
     InvalidLeaseTtl,
+    /// Durable community deletion fence rejected a serving write.
+    #[error("community write fenced: {0}")]
+    CommunityWriteFenced(String),
 }
 
 impl SessionDirectory {
@@ -187,9 +191,37 @@ impl SessionDirectory {
         Self::with_lease_ttl(pool, DEFAULT_LEASE_TTL)
     }
 
+    /// Create a serving directory whose Redis mutations consult the durable
+    /// community write fence.
+    pub fn with_db(pool: deadpool_redis::Pool, db: buzz_db::Db) -> Self {
+        Self {
+            pool,
+            lease_ttl: DEFAULT_LEASE_TTL,
+            db: Some(db),
+        }
+    }
+
     /// Create a directory backed by `pool` with an explicit lease TTL.
     pub fn with_lease_ttl(pool: deadpool_redis::Pool, lease_ttl: Duration) -> Self {
-        Self { pool, lease_ttl }
+        Self {
+            pool,
+            lease_ttl,
+            db: None,
+        }
+    }
+
+    async fn begin_serving_write(
+        &self,
+        community_id: CommunityId,
+    ) -> Result<Option<buzz_db::deletion::ServingWriteGuard>, DirectoryError> {
+        match &self.db {
+            Some(db) => buzz_deletion::store(db)
+                .begin_serving_write(community_id)
+                .await
+                .map(Some)
+                .map_err(|error| DirectoryError::CommunityWriteFenced(error.to_string())),
+            None => Ok(None),
+        }
     }
 
     /// Attempt to create/take over the session lease.
@@ -204,6 +236,7 @@ impl SessionDirectory {
         owner_runtime_id: RuntimeId,
         profile: Profile,
     ) -> Result<AcquireResult, DirectoryError> {
+        let _serving_write = self.begin_serving_write(community_id).await?;
         let keys = SessionKeys::new(community_id, session_id);
         let ttl_ms = ttl_ms(self.lease_ttl)?;
         let mut conn = self.pool.get().await?;
@@ -244,6 +277,7 @@ impl SessionDirectory {
     /// Renew a lease only if the current Redis value exactly matches the
     /// caller's owner runtime and generation.
     pub async fn renew(&self, lease: &SessionLease) -> Result<RenewResult, DirectoryError> {
+        let _serving_write = self.begin_serving_write(lease.community_id).await?;
         let keys = SessionKeys::new(lease.community_id, lease.session_id);
         let ttl_ms = ttl_ms(self.lease_ttl)?;
         let mut conn = self.pool.get().await?;

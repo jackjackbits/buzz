@@ -1823,6 +1823,24 @@ async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
         return response;
     }
 
+    // An already-running receive-pack may cross the durable fence after
+    // request admission. Revalidate immediately before object-store CAS; DB
+    // trigger fencing alone cannot roll back an S3 pointer mutation.
+    let _serving_write = match buzz_deletion::store(&state.db)
+        .begin_serving_write(ctx.tenant.community())
+        .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            warn!(owner = %ctx.owner, repo = %ctx.repo, %error, "push rejected by community deletion fence");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "community writes are fenced",
+            )
+                .into_response();
+        }
+    };
+
     // Step 7 (CAS). The PushContext binds `parent_state` (observed at
     // hydrate) to the CAS predicate here — no re-reading of the pointer
     // between hydrate and CAS.

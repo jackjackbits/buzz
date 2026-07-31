@@ -753,3 +753,150 @@ mod tests {
         );
     }
 }
+
+/// Classify a full bucket listing for whole-community deletion.
+///
+/// Unknown keys are reported globally rather than ignored: deleting a tenant
+/// while the bucket contains a writer shape this binary does not understand is
+/// unsafe. Tenant-owned sidecars/upload records are returned separately from
+/// shared immutable blob/thumb and Git CAS data.
+pub fn deletion_inventory(
+    community: Uuid,
+    objects: impl IntoIterator<Item = (String, u64)>,
+) -> DeletionBucketInventory {
+    let mut inventory = DeletionBucketInventory::default();
+    let repo_prefix = format!("repos/{community}/");
+    for (key, _size) in objects {
+        match classify_key(&key) {
+            KeyClass::Sidecar {
+                community: owner, ..
+            } if owner == community => inventory.media_sidecar_keys.push(key),
+            KeyClass::Auxiliary {
+                community: owner, ..
+            } if owner == community => inventory.media_upload_keys.push(key),
+            KeyClass::Sidecar { .. }
+            | KeyClass::Auxiliary { .. }
+            | KeyClass::Blob { .. }
+            | KeyClass::Thumb { .. } => {}
+            KeyClass::Unknown => {
+                if let Some(owner) = git_pointer_community(&key) {
+                    if owner == community && key.starts_with(&repo_prefix) {
+                        inventory.git_pointer_keys.push(key);
+                    }
+                } else if is_known_git_shared_key(&key) || key.starts_with("probe/") {
+                    // Known shared immutable CAS/probe data is deliberately
+                    // outside the per-community frozen manifest. V1 removes
+                    // only tenant-owned bindings; fleet-wide physical GC is a
+                    // separate retention phase.
+                } else {
+                    inventory.unknown_keys.push(key);
+                }
+            }
+        }
+    }
+    inventory.media_sidecar_keys.sort();
+    inventory.media_upload_keys.sort();
+    inventory.git_pointer_keys.sort();
+    inventory.retained_shared_cas_keys.sort();
+    inventory.unknown_keys.sort();
+    inventory
+}
+
+fn git_pointer_community(key: &str) -> Option<Uuid> {
+    let mut parts = key.split('/');
+    if parts.next()? != "repos" {
+        return None;
+    }
+    let community = parse_canonical_uuid(parts.next()?)?;
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    let pointer = parts.next()?;
+    if parts.next().is_some()
+        || owner.len() != 64
+        || !owner.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || repo.is_empty()
+        || repo.len() > 64
+        || repo.starts_with('.')
+        || repo.contains("..")
+        || !repo
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || pointer != "pointer"
+    {
+        return None;
+    }
+    Some(community)
+}
+
+fn is_known_git_shared_key(key: &str) -> bool {
+    ["packs/", "idx/", "manifests/"].iter().any(|prefix| {
+        key.strip_prefix(prefix).is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    })
+}
+
+/// Object-store inventory relevant to one community deletion.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeletionBucketInventory {
+    /// Community media serve-gate sidecars.
+    pub media_sidecar_keys: Vec<String>,
+    /// Community upload/moderation records.
+    pub media_upload_keys: Vec<String>,
+    /// Community Git repository pointers.
+    pub git_pointer_keys: Vec<String>,
+    /// Shared immutable media/Git CAS data retained in V1.
+    pub retained_shared_cas_keys: Vec<String>,
+    /// Bucket keys outside the exact writer taxonomy.
+    pub unknown_keys: Vec<String>,
+}
+
+impl DeletionBucketInventory {
+    /// Sorted union of all tenant-owned binding keys.
+    pub fn tenant_keys(&self) -> Vec<String> {
+        let mut keys = self.media_sidecar_keys.clone();
+        keys.extend(self.media_upload_keys.iter().cloned());
+        keys.extend(self.git_pointer_keys.iter().cloned());
+        keys.sort();
+        keys
+    }
+}
+
+#[cfg(test)]
+mod deletion_inventory_tests {
+    use super::*;
+
+    #[test]
+    fn inventories_target_bindings_and_ignores_shared_cas() {
+        let target = Uuid::from_u128(1);
+        let other = Uuid::from_u128(2);
+        let sha = "a".repeat(64);
+        let objects = vec![
+            (format!("_meta/{target}/{sha}.json"), 1),
+            (format!("_meta/{other}/{sha}.json"), 1),
+            (
+                format!("_uploads/{target}/{sha}/01ARZ3NDEKTSV4RRFFQ69G5FAV.json"),
+                1,
+            ),
+            (format!("repos/{target}/{}/repo/pointer", "b".repeat(64)), 1),
+            (format!("packs/{sha}"), 1),
+            (format!("{sha}.png"), 1),
+        ];
+        let inventory = deletion_inventory(target, objects);
+        assert_eq!(inventory.media_sidecar_keys.len(), 1);
+        assert_eq!(inventory.media_upload_keys.len(), 1);
+        assert_eq!(inventory.git_pointer_keys.len(), 1);
+        assert!(inventory.retained_shared_cas_keys.is_empty());
+        assert!(inventory.unknown_keys.is_empty());
+        assert_eq!(inventory.tenant_keys().len(), 3);
+    }
+
+    #[test]
+    fn unknown_writer_shape_is_not_silently_skipped() {
+        let inventory = deletion_inventory(
+            Uuid::from_u128(1),
+            vec![("future-format/community/data".to_string(), 1)],
+        );
+        assert_eq!(inventory.unknown_keys, vec!["future-format/community/data"]);
+    }
+}

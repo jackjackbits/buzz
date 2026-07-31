@@ -1,0 +1,1910 @@
+//! Durable whole-community deletion lifecycle and PostgreSQL adapter.
+//!
+//! This module owns request inventory, approval, claims, fencing, checkpoints,
+//! retries, tombstoning, and logical verification. CLI claim-loop policy and
+//! external storage adapters live above it; they never implement state changes.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::str::FromStr;
+use std::time::Duration;
+
+use buzz_core::CommunityId;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, Row, Transaction};
+use uuid::Uuid;
+
+use crate::error::{DbError, Result};
+
+/// Exact desired catalog revision understood by this deletion engine.
+pub const CATALOG_REVISION: i32 = 1;
+/// Highest SQL migration version whose tenant catalog this engine understands.
+pub const EXPECTED_MIGRATION_VERSION: i64 = 27;
+/// Default PostgreSQL lease duration for one claimed deletion request.
+pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(60);
+/// Durable name of the schema manifest's PostgreSQL component.
+pub const POSTGRES_STORE_NAME: &str = "postgres";
+/// Durable name of the object-store manifest component.
+pub const OBJECT_STORE_NAME: &str = "object_store";
+/// Durable name of the Redis/cache manifest component.
+pub const REDIS_STORE_NAME: &str = "redis";
+
+/// Control-plane tables that survive the community data purge.
+pub const CONTROL_PLANE_TABLES: &[&str] = &[
+    "community_deletion_approvals",
+    "community_deletion_checkpoints",
+    "community_deletion_executor_heartbeats",
+    "community_deletion_requests",
+    "community_deletion_retention_exceptions",
+];
+
+/// Expected community-scoped tables purged by V1.
+///
+/// Catalog inventory compares the live database against this exact set before
+/// approval and again before PostgreSQL purge. A new tenant table therefore
+/// blocks deletion until this manifest is intentionally updated.
+pub const EXPECTED_SCOPED_TABLES: &[&str] = &[
+    "api_tokens",
+    "archived_identities",
+    "audit_log",
+    "channel_members",
+    "channels",
+    "community_bans",
+    "delivery_log",
+    "event_mentions",
+    "events",
+    "git_repo_names",
+    "join_policy_acceptances",
+    "moderation_actions",
+    "moderation_reports",
+    "parameterized_event_watermarks",
+    "product_feedback",
+    "rate_limit_violations",
+    "pubkey_allowlist",
+    "push_leases",
+    "push_match_queue",
+    "push_wake_outbox",
+    "reactions",
+    "relay_invites",
+    "relay_members",
+    "scheduled_workflow_fires",
+    "subscriptions",
+    "thread_metadata",
+    "users",
+    "workflow_approvals",
+    "workflow_runs",
+    "workflows",
+];
+
+/// Foreign-key-safe child-before-parent order for the PostgreSQL purge.
+pub const PURGE_SCOPED_TABLES: &[&str] = &[
+    "workflow_approvals",
+    "scheduled_workflow_fires",
+    "workflow_runs",
+    "push_wake_outbox",
+    "join_policy_acceptances",
+    "moderation_reports",
+    "subscriptions",
+    "api_tokens",
+    "channel_members",
+    "thread_metadata",
+    "moderation_actions",
+    "workflows",
+    "event_mentions",
+    "reactions",
+    "push_match_queue",
+    "push_leases",
+    "relay_invites",
+    "product_feedback",
+    "rate_limit_violations",
+    "delivery_log",
+    "events",
+    "parameterized_event_watermarks",
+    "git_repo_names",
+    "archived_identities",
+    "audit_log",
+    "community_bans",
+    "pubkey_allowlist",
+    "relay_members",
+    "users",
+    "channels",
+];
+
+/// Fixed lifecycle order. There are no backwards or skipping transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionStage {
+    /// Request exists but has not frozen its inventory.
+    Submitted,
+    /// PostgreSQL and storage inventory has been frozen.
+    Inventoried,
+    /// An operator explicitly approved the frozen inventory digest.
+    Approved,
+    /// Universal serving-path write fence is active.
+    Fenced,
+    /// In-flight serving writes have drained behind the durable fence.
+    Drained,
+    /// Tenant-owned S3/media and Git pointer bindings were removed.
+    BindingsRemoved,
+    /// Tenant-scoped PostgreSQL rows were purged.
+    PostgresPurged,
+    /// Redis/community process-cache namespace was purged.
+    CachePurged,
+    /// Cross-store logical absence was verified.
+    LogicallyVerified,
+    /// Logical deletion complete; shared CAS physical expiry is deferred.
+    RetentionPending,
+}
+
+impl DeletionStage {
+    /// Next legal stage, if this is not terminal.
+    pub const fn next(self) -> Option<Self> {
+        match self {
+            Self::Submitted => Some(Self::Inventoried),
+            Self::Inventoried => Some(Self::Approved),
+            Self::Approved => Some(Self::Fenced),
+            Self::Fenced => Some(Self::Drained),
+            Self::Drained => Some(Self::BindingsRemoved),
+            Self::BindingsRemoved => Some(Self::PostgresPurged),
+            Self::PostgresPurged => Some(Self::CachePurged),
+            Self::CachePurged => Some(Self::LogicallyVerified),
+            Self::LogicallyVerified => Some(Self::RetentionPending),
+            Self::RetentionPending => None,
+        }
+    }
+
+    /// Whether execution may claim this stage.
+    pub const fn runnable(self) -> bool {
+        matches!(
+            self,
+            Self::Approved
+                | Self::Fenced
+                | Self::Drained
+                | Self::BindingsRemoved
+                | Self::PostgresPurged
+                | Self::CachePurged
+                | Self::LogicallyVerified
+        )
+    }
+}
+
+impl fmt::Display for DeletionStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Submitted => "submitted",
+            Self::Inventoried => "inventoried",
+            Self::Approved => "approved",
+            Self::Fenced => "fenced",
+            Self::Drained => "drained",
+            Self::BindingsRemoved => "bindings_removed",
+            Self::PostgresPurged => "postgres_purged",
+            Self::CachePurged => "cache_purged",
+            Self::LogicallyVerified => "logically_verified",
+            Self::RetentionPending => "retention_pending",
+        };
+        f.write_str(value)
+    }
+}
+
+impl FromStr for DeletionStage {
+    type Err = DbError;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "submitted" => Ok(Self::Submitted),
+            "inventoried" => Ok(Self::Inventoried),
+            "approved" => Ok(Self::Approved),
+            "fenced" => Ok(Self::Fenced),
+            "drained" => Ok(Self::Drained),
+            "bindings_removed" => Ok(Self::BindingsRemoved),
+            "postgres_purged" => Ok(Self::PostgresPurged),
+            "cache_purged" => Ok(Self::CachePurged),
+            "logically_verified" => Ok(Self::LogicallyVerified),
+            "retention_pending" => Ok(Self::RetentionPending),
+            other => Err(DbError::InvalidData(format!(
+                "unknown community deletion stage: {other}"
+            ))),
+        }
+    }
+}
+
+/// Durable community deletion request.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletionRequest {
+    /// Request identifier.
+    pub id: Uuid,
+    /// Target community.
+    #[serde(serialize_with = "serialize_community_id")]
+    pub community_id: CommunityId,
+    /// Permanently reserved canonical host.
+    pub community_host: String,
+    /// Current lifecycle stage.
+    pub stage: DeletionStage,
+    /// Operator identity that submitted the request.
+    pub requested_by: String,
+    /// Optional request reason.
+    pub reason: Option<String>,
+    /// Frozen catalog manifest.
+    pub schema_manifest: Option<serde_json::Value>,
+    /// Frozen storage manifest.
+    pub storage_manifest: Option<serde_json::Value>,
+    /// Frozen inventory aggregate.
+    pub inventory_manifest: Option<serde_json::Value>,
+    /// Hex SHA-256 of the frozen inventory.
+    pub inventory_digest: Option<String>,
+    /// Durable community fence generation.
+    pub fence_generation: Option<i64>,
+    /// Current claim owner.
+    pub lease_owner: Option<String>,
+    /// Monotonic claim generation.
+    pub lease_generation: i64,
+    /// Claim expiry.
+    pub lease_until: Option<DateTime<Utc>>,
+    /// Number of claims.
+    pub attempts: i32,
+    /// Number of failed execution units.
+    pub retry_count: i32,
+    /// Last bounded error.
+    pub last_error: Option<String>,
+    /// Permanent fail-closed block reason.
+    pub blocked_reason: Option<String>,
+    /// Submission time.
+    pub created_at: DateTime<Utc>,
+    /// Last lifecycle update.
+    pub updated_at: DateTime<Utc>,
+    /// Terminal logical-deletion time.
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Frozen PostgreSQL catalog inventory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchemaManifest {
+    /// Engine catalog revision.
+    pub revision: i32,
+    /// Live SQLx migration version.
+    pub migration_version: i64,
+    /// Sorted community-scoped table names.
+    pub scoped_tables: Vec<String>,
+    /// Per-table row counts for the target.
+    pub row_counts: BTreeMap<String, i64>,
+    /// Sorted tables with the universal write-fence trigger.
+    pub fenced_tables: Vec<String>,
+}
+
+/// Frozen storage inventory supplied by the object-store adapter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageManifest {
+    /// Adapter schema version.
+    pub version: i32,
+    /// Every tenant-owned key that will be removed, sorted.
+    pub tenant_keys: Vec<String>,
+    /// Git pointer keys among tenant keys.
+    pub git_pointer_keys: Vec<String>,
+    /// Media sidecar keys among tenant keys.
+    pub media_sidecar_keys: Vec<String>,
+    /// Media upload-record keys among tenant keys.
+    pub media_upload_keys: Vec<String>,
+    /// Reserved for future retention exceptions. Empty in V1: shared CAS is
+    /// fleet-wide and intentionally outside per-community inventory.
+    pub retained_shared_cas_keys: Vec<String>,
+    /// Fleet keys unknown to the current taxonomy. Non-empty fails inventory.
+    pub unknown_keys: Vec<String>,
+    /// Keys whose current object version cannot be safely removed. Non-empty fails.
+    pub unsupported_version_keys: Vec<String>,
+}
+
+/// Full frozen inventory approved at the destructive boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrozenInventory {
+    /// PostgreSQL catalog state.
+    pub schema: SchemaManifest,
+    /// Object-store state.
+    pub storage: StorageManifest,
+}
+
+impl FrozenInventory {
+    /// Canonical JSON bytes and SHA-256 digest used to bind approval.
+    pub fn digest(&self) -> Result<Vec<u8>> {
+        Ok(Sha256::digest(serde_json::to_vec(self)?).to_vec())
+    }
+}
+
+/// One durable unit checkpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletionCheckpoint {
+    /// Stage containing the unit.
+    pub stage: String,
+    /// Stable unit key.
+    pub unit_key: String,
+    /// `started`, `completed`, or `failed`.
+    pub status: String,
+    /// Claim generation that last touched it.
+    pub lease_generation: i64,
+    /// Attempt count for this unit.
+    pub attempts: i32,
+    /// Structured bounded details.
+    pub detail: serde_json::Value,
+    /// Last failure.
+    pub error: Option<String>,
+    /// Start time.
+    pub started_at: DateTime<Utc>,
+    /// Completion time.
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Full inspect response.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletionInspection {
+    /// Durable request.
+    pub request: DeletionRequest,
+    /// Explicit approval evidence, if present.
+    pub approval: Option<DeletionApproval>,
+    /// Unit checkpoints.
+    pub checkpoints: Vec<DeletionCheckpoint>,
+    /// Retention exceptions/holds.
+    pub retention_exceptions: Vec<RetentionException>,
+}
+
+/// Explicit approval evidence.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletionApproval {
+    /// Hex frozen inventory digest.
+    pub inventory_digest: String,
+    /// Approving operator identity.
+    pub approved_by: String,
+    /// Optional approval note.
+    pub note: Option<String>,
+    /// Approval timestamp.
+    pub approved_at: DateTime<Utc>,
+}
+
+/// Physical-expiry retention exception.
+#[derive(Debug, Clone, Serialize)]
+pub struct RetentionException {
+    /// Stable hold/exception key.
+    pub exception_key: String,
+    /// Reason it survives logical deletion.
+    pub reason: String,
+    /// Optional expiry.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Creating operator.
+    pub created_by: String,
+    /// Creation timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Monotonic lease token required by every execution mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseToken {
+    /// Request id.
+    pub request_id: Uuid,
+    /// Executor identity.
+    pub owner: String,
+    /// Monotonic lease generation.
+    pub generation: i64,
+    /// Target community.
+    pub community_id: CommunityId,
+    /// Community fence generation, once fenced.
+    pub fence_generation: Option<i64>,
+}
+
+/// A claimed request with its durable token.
+#[derive(Debug, Clone)]
+pub struct ClaimedDeletion {
+    /// Request snapshot.
+    pub request: DeletionRequest,
+    /// Required token.
+    pub lease: LeaseToken,
+}
+
+/// Held shared advisory lock proving a serving write began before fencing.
+///
+/// Dropping the guard rolls back its read-only transaction and releases the
+/// lock. The destructive fence takes the matching exclusive lock, so it cannot
+/// advance while an S3/Redis/webhook side effect still holds this guard.
+pub struct ServingWriteGuard {
+    _tx: Transaction<'static, Postgres>,
+}
+
+/// PostgreSQL deletion adapter. Clone is cheap.
+#[derive(Clone)]
+pub struct DeletionStore {
+    pool: PgPool,
+}
+
+impl DeletionStore {
+    /// Construct from the writer pool used by [`crate::Db`].
+    pub(crate) fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Persist a request. Only active non-tombstone communities may be submitted.
+    pub async fn submit(
+        &self,
+        community_host: &str,
+        requested_by: &str,
+        reason: Option<&str>,
+    ) -> Result<DeletionRequest> {
+        let row = sqlx::query(
+            r#"
+            WITH target AS (
+                SELECT id, host
+                FROM communities
+                WHERE lower(host) = lower($1)
+                  AND deletion_state = 'active'
+                  AND deleted_at IS NULL
+            ), inserted AS (
+                INSERT INTO community_deletion_requests
+                    (community_id, community_host, requested_by, reason)
+                SELECT id, host, $2, $3 FROM target
+                ON CONFLICT (community_id) DO NOTHING
+                RETURNING *
+            )
+            SELECT * FROM inserted
+            UNION ALL
+            SELECT request.*
+            FROM community_deletion_requests request
+            JOIN target ON target.id = request.community_id
+            WHERE request.stage = 'submitted'
+              AND request.requested_by = $2
+              AND NOT EXISTS (SELECT 1 FROM inserted)
+            LIMIT 1
+            "#,
+        )
+        .bind(community_host)
+        .bind(requested_by)
+        .bind(reason)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => row_to_request(row),
+            None => Err(DbError::InvalidData(format!(
+                "community {community_host:?} is missing, already requested, fenced, or tombstoned"
+            ))),
+        }
+    }
+
+    /// List requests newest first with a hard bound.
+    pub async fn list(&self, limit: i64) -> Result<Vec<DeletionRequest>> {
+        let rows = sqlx::query(
+            "SELECT * FROM community_deletion_requests ORDER BY created_at DESC LIMIT $1",
+        )
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_request).collect()
+    }
+
+    /// Read one request.
+    pub async fn get(&self, request_id: Uuid) -> Result<DeletionRequest> {
+        let row = sqlx::query("SELECT * FROM community_deletion_requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("community deletion {request_id}")))?;
+        row_to_request(row)
+    }
+
+    /// Inspect request, approval, checkpoints, and retention holds.
+    pub async fn inspect(&self, request_id: Uuid) -> Result<DeletionInspection> {
+        let request = self.get(request_id).await?;
+        let approval_row = sqlx::query(
+            "SELECT inventory_digest, approved_by, note, approved_at \
+             FROM community_deletion_approvals WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let approval = approval_row
+            .map(|row| {
+                Ok::<DeletionApproval, DbError>(DeletionApproval {
+                    inventory_digest: hex::encode(row.try_get::<Vec<u8>, _>("inventory_digest")?),
+                    approved_by: row.try_get("approved_by")?,
+                    note: row.try_get("note")?,
+                    approved_at: row.try_get("approved_at")?,
+                })
+            })
+            .transpose()?;
+        let checkpoints = sqlx::query(
+            "SELECT stage, unit_key, status, lease_generation, attempts, detail, error, \
+                    started_at, completed_at \
+             FROM community_deletion_checkpoints WHERE request_id = $1 ORDER BY sequence",
+        )
+        .bind(request_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(DeletionCheckpoint {
+                stage: row.try_get("stage")?,
+                unit_key: row.try_get("unit_key")?,
+                status: row.try_get("status")?,
+                lease_generation: row.try_get("lease_generation")?,
+                attempts: row.try_get("attempts")?,
+                detail: row.try_get("detail")?,
+                error: row.try_get("error")?,
+                started_at: row.try_get("started_at")?,
+                completed_at: row.try_get("completed_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+        let retention_exceptions = sqlx::query(
+            "SELECT exception_key, reason, expires_at, created_by, created_at \
+             FROM community_deletion_retention_exceptions WHERE request_id = $1 \
+             ORDER BY exception_key",
+        )
+        .bind(request_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(RetentionException {
+                exception_key: row.try_get("exception_key")?,
+                reason: row.try_get("reason")?,
+                expires_at: row.try_get("expires_at")?,
+                created_by: row.try_get("created_by")?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+        Ok(DeletionInspection {
+            request,
+            approval,
+            checkpoints,
+            retention_exceptions,
+        })
+    }
+
+    /// Build and validate a live PostgreSQL schema inventory.
+    pub async fn inventory_schema(&self, community: CommunityId) -> Result<SchemaManifest> {
+        let migration_version: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(max(version), 0) FROM _sqlx_migrations WHERE success",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if migration_version != EXPECTED_MIGRATION_VERSION {
+            return Err(DbError::InvalidData(format!(
+                "community deletion schema migration drift: expected {EXPECTED_MIGRATION_VERSION}, got {migration_version}"
+            )));
+        }
+
+        let live_tables = self.live_scoped_tables().await?;
+        let expected = EXPECTED_SCOPED_TABLES
+            .iter()
+            .copied()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        if live_tables != expected {
+            let missing = expected
+                .difference(&live_tables)
+                .cloned()
+                .collect::<Vec<_>>();
+            let unknown = live_tables
+                .difference(&expected)
+                .cloned()
+                .collect::<Vec<_>>();
+            return Err(DbError::InvalidData(format!(
+                "community deletion catalog drift (missing={}, unknown={})",
+                missing.join(","),
+                unknown.join(",")
+            )));
+        }
+
+        let fenced_tables = self.live_fenced_tables().await?;
+        if fenced_tables != expected {
+            let missing = expected
+                .difference(&fenced_tables)
+                .cloned()
+                .collect::<Vec<_>>();
+            return Err(DbError::InvalidData(format!(
+                "community deletion write-fence drift (missing={})",
+                missing.join(",")
+            )));
+        }
+
+        let mut row_counts = BTreeMap::new();
+        for table in &live_tables {
+            let sql = format!("SELECT count(*) FROM {table} WHERE community_id = $1");
+            let count: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
+                .bind(community.as_uuid())
+                .fetch_one(&self.pool)
+                .await?;
+            row_counts.insert(table.clone(), count);
+        }
+        Ok(SchemaManifest {
+            revision: CATALOG_REVISION,
+            migration_version,
+            scoped_tables: live_tables.into_iter().collect(),
+            row_counts,
+            fenced_tables: fenced_tables.into_iter().collect(),
+        })
+    }
+
+    /// Freeze inventory and move submitted → inventoried atomically.
+    pub async fn freeze_inventory(
+        &self,
+        request_id: Uuid,
+        inventory: &FrozenInventory,
+    ) -> Result<DeletionRequest> {
+        validate_storage_manifest(&inventory.storage)?;
+        let digest = inventory.digest()?;
+        let schema = serde_json::to_value(&inventory.schema)?;
+        let storage = serde_json::to_value(&inventory.storage)?;
+        let frozen = serde_json::to_value(inventory)?;
+        let row = sqlx::query(
+            r#"
+            UPDATE community_deletion_requests
+            SET stage = 'inventoried', schema_manifest = $2, storage_manifest = $3,
+                inventory_manifest = $4, inventory_digest = $5,
+                inventory_frozen_at = now(), updated_at = now(),
+                last_error = NULL, last_error_at = NULL
+            WHERE id = $1 AND stage = 'submitted' AND blocked_at IS NULL
+            RETURNING *
+            "#,
+        )
+        .bind(request_id)
+        .bind(schema)
+        .bind(storage)
+        .bind(frozen)
+        .bind(digest)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| {
+            DbError::InvalidData(format!(
+                "deletion {request_id} is not an unblocked submitted request"
+            ))
+        })?;
+        row_to_request(row)
+    }
+
+    /// Approve the exact frozen inventory and move inventoried → approved.
+    pub async fn approve(
+        &self,
+        request_id: Uuid,
+        approved_by: &str,
+        note: Option<&str>,
+    ) -> Result<DeletionRequest> {
+        let mut tx = self.pool.begin().await?;
+        let digest: Vec<u8> = sqlx::query_scalar(
+            "SELECT inventory_digest FROM community_deletion_requests \
+             WHERE id = $1 AND stage = 'inventoried' AND blocked_at IS NULL FOR UPDATE",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            DbError::InvalidData(format!(
+                "deletion {request_id} is not an unblocked inventoried request"
+            ))
+        })?;
+        sqlx::query(
+            "INSERT INTO community_deletion_approvals \
+             (request_id, inventory_digest, approved_by, note) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(request_id)
+        .bind(&digest)
+        .bind(approved_by)
+        .bind(note)
+        .execute(&mut *tx)
+        .await?;
+        let row = sqlx::query(
+            "UPDATE community_deletion_requests \
+             SET stage = 'approved', updated_at = now(), next_attempt_at = now() \
+             WHERE id = $1 RETURNING *",
+        )
+        .bind(request_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row_to_request(row)
+    }
+
+    /// Claim a specific runnable request. Expired claims may be reclaimed.
+    pub async fn claim_specific(
+        &self,
+        request_id: Uuid,
+        owner: &str,
+        lease_duration: Duration,
+    ) -> Result<Option<ClaimedDeletion>> {
+        self.claim(Some(request_id), owner, lease_duration).await
+    }
+
+    /// Claim the oldest runnable request. Expired claims may be reclaimed.
+    pub async fn claim_next(
+        &self,
+        owner: &str,
+        lease_duration: Duration,
+    ) -> Result<Option<ClaimedDeletion>> {
+        self.claim(None, owner, lease_duration).await
+    }
+
+    async fn claim(
+        &self,
+        request_id: Option<Uuid>,
+        owner: &str,
+        lease_duration: Duration,
+    ) -> Result<Option<ClaimedDeletion>> {
+        let lease_seconds = i64::try_from(lease_duration.as_secs()).unwrap_or(i64::MAX);
+        let row = sqlx::query(
+            r#"
+            WITH candidate AS (
+                SELECT id
+                FROM community_deletion_requests
+                WHERE ($1::uuid IS NULL OR id = $1)
+                  AND stage IN ('approved', 'fenced', 'drained', 'bindings_removed',
+                                'postgres_purged', 'cache_purged', 'logically_verified')
+                  AND blocked_at IS NULL
+                  AND next_attempt_at <= now()
+                  AND (lease_until IS NULL OR lease_until < now())
+                ORDER BY created_at, id
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            UPDATE community_deletion_requests request
+            SET lease_owner = $2,
+                lease_generation = request.lease_generation + 1,
+                lease_until = now() + make_interval(secs => $3),
+                attempts = request.attempts + 1,
+                updated_at = now()
+            FROM candidate
+            WHERE request.id = candidate.id
+            RETURNING request.*
+            "#,
+        )
+        .bind(request_id)
+        .bind(owner)
+        .bind(lease_seconds)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let request = row_to_request(row)?;
+            let lease = LeaseToken {
+                request_id: request.id,
+                owner: owner.to_owned(),
+                generation: request.lease_generation,
+                community_id: request.community_id,
+                fence_generation: request.fence_generation,
+            };
+            Ok(ClaimedDeletion { request, lease })
+        })
+        .transpose()
+    }
+
+    /// Renew an owned claim and persist executor liveness.
+    pub async fn heartbeat(
+        &self,
+        token: &LeaseToken,
+        executor_mode: &str,
+        lease_duration: Duration,
+        draining: bool,
+    ) -> Result<()> {
+        let lease_seconds = i64::try_from(lease_duration.as_secs()).unwrap_or(i64::MAX);
+        let mut tx = self.pool.begin().await?;
+        let affected = sqlx::query(
+            "UPDATE community_deletion_requests \
+             SET lease_until = now() + make_interval(secs => $4), updated_at = now() \
+             WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3 \
+               AND lease_until >= now()",
+        )
+        .bind(token.request_id)
+        .bind(&token.owner)
+        .bind(token.generation)
+        .bind(lease_seconds)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if affected != 1 {
+            return Err(stale_lease_error(token));
+        }
+        sqlx::query(
+            "INSERT INTO community_deletion_executor_heartbeats \
+             (executor_id, mode, request_id, draining) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (executor_id) DO UPDATE SET mode = EXCLUDED.mode, \
+                 request_id = EXCLUDED.request_id, heartbeat_at = now(), \
+                 draining = EXCLUDED.draining, stopped_at = NULL",
+        )
+        .bind(&token.owner)
+        .bind(executor_mode)
+        .bind(token.request_id)
+        .bind(draining)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Mark an executor stopped and release its current claim if still owned.
+    pub async fn stop_executor(&self, token: Option<&LeaseToken>, executor_id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(token) = token {
+            sqlx::query(
+                "UPDATE community_deletion_requests \
+                 SET lease_owner = NULL, lease_until = NULL, updated_at = now() \
+                 WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3",
+            )
+            .bind(token.request_id)
+            .bind(&token.owner)
+            .bind(token.generation)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE community_deletion_executor_heartbeats \
+             SET request_id = NULL, draining = true, heartbeat_at = now(), stopped_at = now() \
+             WHERE executor_id = $1",
+        )
+        .bind(executor_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Acquire the universal durable fence and move approved → fenced.
+    pub async fn fence(&self, token: &LeaseToken) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        verify_lease(&mut tx, token, DeletionStage::Approved).await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(community_deletion_lock_key($1))")
+            .bind(token.community_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+        let current_generation: i64 = sqlx::query_scalar(
+            "SELECT deletion_fence_generation FROM communities WHERE id = $1 FOR UPDATE",
+        )
+        .bind(token.community_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        let generation = current_generation.checked_add(1).ok_or_else(|| {
+            DbError::InvalidData("community deletion fence generation overflow".to_string())
+        })?;
+        set_executor_gucs(&mut tx, token.community_id, generation).await?;
+        sqlx::query(
+            "UPDATE communities SET deletion_state = 'fenced', \
+                    deletion_fence_generation = $2, archived_at = COALESCE(archived_at, now()) \
+             WHERE id = $1 AND deletion_state = 'active'",
+        )
+        .bind(token.community_id.as_uuid())
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+        advance_request_tx(
+            &mut tx,
+            token,
+            DeletionStage::Approved,
+            DeletionStage::Fenced,
+            Some(generation),
+        )
+        .await?;
+        checkpoint_completed_tx(
+            &mut tx,
+            token,
+            DeletionStage::Approved,
+            "activate_fence",
+            serde_json::json!({"fence_generation": generation}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(generation)
+    }
+
+    /// Verify fence ownership and record that serving writes drained.
+    pub async fn mark_drained(&self, token: &LeaseToken) -> Result<()> {
+        let generation = require_fence_generation(token)?;
+        let mut tx = self.pool.begin().await?;
+        verify_lease_and_fence(&mut tx, token, DeletionStage::Fenced, generation).await?;
+        advance_request_tx(
+            &mut tx,
+            token,
+            DeletionStage::Fenced,
+            DeletionStage::Drained,
+            Some(generation),
+        )
+        .await?;
+        checkpoint_completed_tx(
+            &mut tx,
+            token,
+            DeletionStage::Fenced,
+            "serving_writes_drained",
+            serde_json::json!({"fence_generation": generation}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Mark storage binding removal after adapter verification.
+    pub async fn mark_bindings_removed(
+        &self,
+        token: &LeaseToken,
+        detail: serde_json::Value,
+    ) -> Result<()> {
+        self.advance_with_checkpoint(
+            token,
+            DeletionStage::Drained,
+            DeletionStage::BindingsRemoved,
+            "remove_storage_bindings",
+            detail,
+        )
+        .await
+    }
+
+    /// Purge every scoped PostgreSQL table, preserve the community tombstone, and
+    /// move bindings_removed → postgres_purged in one transaction.
+    pub async fn purge_postgres(&self, token: &LeaseToken) -> Result<BTreeMap<String, u64>> {
+        let generation = require_fence_generation(token)?;
+        // Re-inventory before opening the purge transaction. Any drift blocks;
+        // the transaction then locks the control and tombstone rows and all
+        // tenant writes are already fenced.
+        self.inventory_schema(token.community_id).await?;
+
+        let mut tx = self.pool.begin().await?;
+        verify_lease_and_fence(&mut tx, token, DeletionStage::BindingsRemoved, generation).await?;
+        set_executor_gucs(&mut tx, token.community_id, generation).await?;
+
+        let mut deleted = BTreeMap::new();
+        // Deleting channels cascades some child tables. Alphabetical execution
+        // plus per-table WHERE is safe and idempotent; later units simply see 0.
+        for table in PURGE_SCOPED_TABLES {
+            let sql = format!("DELETE FROM {table} WHERE community_id = $1");
+            let affected = sqlx::query(AssertSqlSafe(sql))
+                .bind(token.community_id.as_uuid())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            deleted.insert((*table).to_owned(), affected);
+            checkpoint_completed_tx(
+                &mut tx,
+                token,
+                DeletionStage::BindingsRemoved,
+                &format!("purge:{table}"),
+                serde_json::json!({"rows": affected}),
+            )
+            .await?;
+        }
+
+        sqlx::query(
+            "UPDATE communities SET deletion_state = 'tombstone', \
+                    deleted_at = COALESCE(deleted_at, now()), \
+                    archived_at = COALESCE(archived_at, now()), \
+                    signing_key = NULL, icon = NULL \
+             WHERE id = $1 AND deletion_state = 'fenced' \
+               AND deletion_fence_generation = $2",
+        )
+        .bind(token.community_id.as_uuid())
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+        advance_request_tx(
+            &mut tx,
+            token,
+            DeletionStage::BindingsRemoved,
+            DeletionStage::PostgresPurged,
+            Some(generation),
+        )
+        .await?;
+        checkpoint_completed_tx(
+            &mut tx,
+            token,
+            DeletionStage::BindingsRemoved,
+            "postgres_tombstone_committed",
+            serde_json::to_value(&deleted)?,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
+    /// Mark cache purge after Redis adapter verification.
+    pub async fn mark_cache_purged(
+        &self,
+        token: &LeaseToken,
+        detail: serde_json::Value,
+    ) -> Result<()> {
+        self.advance_with_checkpoint(
+            token,
+            DeletionStage::PostgresPurged,
+            DeletionStage::CachePurged,
+            "purge_cache_namespace",
+            detail,
+        )
+        .await
+    }
+
+    /// Verify PostgreSQL logical absence without advancing the cross-store stage.
+    ///
+    /// The caller must verify object storage and Redis too, then call
+    /// [`Self::mark_logically_verified`]. Keeping the transition separate makes
+    /// a crash after any partial verification safely repeat the whole proof.
+    pub async fn verify_postgres_logically_deleted(&self, token: &LeaseToken) -> Result<()> {
+        let generation = require_fence_generation(token)?;
+        let mut tx = self.pool.begin().await?;
+        verify_lease_and_fence(&mut tx, token, DeletionStage::CachePurged, generation).await?;
+        let tombstone: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM communities WHERE id = $1 \
+             AND deletion_state = 'tombstone' AND deleted_at IS NOT NULL \
+             AND deletion_fence_generation = $2)",
+        )
+        .bind(token.community_id.as_uuid())
+        .bind(generation)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !tombstone {
+            return Err(DbError::InvalidData(format!(
+                "community {} tombstone/fence verification failed",
+                token.community_id
+            )));
+        }
+        for table in EXPECTED_SCOPED_TABLES {
+            let sql =
+                format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE community_id = $1 LIMIT 1)");
+            let remains: bool = sqlx::query_scalar(AssertSqlSafe(sql))
+                .bind(token.community_id.as_uuid())
+                .fetch_one(&mut *tx)
+                .await?;
+            if remains {
+                return Err(DbError::InvalidData(format!(
+                    "logical verification found tenant rows in {table}"
+                )));
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Commit the cross-store logical verification checkpoint.
+    pub async fn mark_logically_verified(
+        &self,
+        token: &LeaseToken,
+        detail: serde_json::Value,
+    ) -> Result<()> {
+        self.advance_with_checkpoint(
+            token,
+            DeletionStage::CachePurged,
+            DeletionStage::LogicallyVerified,
+            "verify_cross_store_absence",
+            detail,
+        )
+        .await
+    }
+
+    /// Finish logical deletion and enter the physical-expiry pending state.
+    pub async fn mark_retention_pending(
+        &self,
+        token: &LeaseToken,
+        detail: serde_json::Value,
+    ) -> Result<()> {
+        let generation = require_fence_generation(token)?;
+        let mut tx = self.pool.begin().await?;
+        verify_lease_and_fence(&mut tx, token, DeletionStage::LogicallyVerified, generation)
+            .await?;
+        checkpoint_completed_tx(
+            &mut tx,
+            token,
+            DeletionStage::LogicallyVerified,
+            "retention_physical_expiry_pending",
+            detail,
+        )
+        .await?;
+        let affected = sqlx::query(
+            "UPDATE community_deletion_requests \
+             SET stage = 'retention_pending', completed_at = now(), updated_at = now(), \
+                 lease_owner = NULL, lease_until = NULL, last_error = NULL, last_error_at = NULL \
+             WHERE id = $1 AND stage = 'logically_verified' \
+               AND lease_owner = $2 AND lease_generation = $3 AND lease_until >= now() \
+               AND fence_generation = $4",
+        )
+        .bind(token.request_id)
+        .bind(&token.owner)
+        .bind(token.generation)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if affected != 1 {
+            return Err(stale_lease_error(token));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Persist a retryable unit failure and release the claim.
+    pub async fn record_retry(
+        &self,
+        token: &LeaseToken,
+        stage: DeletionStage,
+        unit_key: &str,
+        error: &str,
+        retry_after: Duration,
+    ) -> Result<()> {
+        let bounded = bound_text(error, 4096);
+        let retry_seconds = i64::try_from(retry_after.as_secs()).unwrap_or(i64::MAX);
+        let mut tx = self.pool.begin().await?;
+        verify_lease(&mut tx, token, stage).await?;
+        checkpoint_failed_tx(&mut tx, token, stage, unit_key, &bounded).await?;
+        sqlx::query(
+            "UPDATE community_deletion_requests \
+             SET retry_count = retry_count + 1, last_error = $4, last_error_at = now(), \
+                 next_attempt_at = now() + make_interval(secs => $5), \
+                 lease_owner = NULL, lease_until = NULL, updated_at = now() \
+             WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3",
+        )
+        .bind(token.request_id)
+        .bind(&token.owner)
+        .bind(token.generation)
+        .bind(&bounded)
+        .bind(retry_seconds)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Persist a fail-closed permanent block and release the claim.
+    pub async fn block(
+        &self,
+        token: &LeaseToken,
+        stage: DeletionStage,
+        unit_key: &str,
+        error: &str,
+    ) -> Result<()> {
+        let bounded = bound_text(error, 4096);
+        let mut tx = self.pool.begin().await?;
+        verify_lease(&mut tx, token, stage).await?;
+        checkpoint_failed_tx(&mut tx, token, stage, unit_key, &bounded).await?;
+        sqlx::query(
+            "UPDATE community_deletion_requests \
+             SET blocked_at = now(), blocked_reason = $4, last_error = $4, \
+                 last_error_at = now(), lease_owner = NULL, lease_until = NULL, updated_at = now() \
+             WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3",
+        )
+        .bind(token.request_id)
+        .bind(&token.owner)
+        .bind(token.generation)
+        .bind(&bounded)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Take the shared community deletion lock inside an existing transaction.
+    pub async fn guard_transaction(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        community: CommunityId,
+    ) -> Result<()> {
+        sqlx::query("SELECT pg_advisory_xact_lock_shared(community_deletion_lock_key($1))")
+            .bind(community.as_uuid())
+            .execute(&mut **tx)
+            .await?;
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT deletion_state FROM communities WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .fetch_optional(&mut **tx)
+        .await?;
+        match state.as_deref() {
+            Some("active") => Ok(()),
+            Some(other) => Err(DbError::AccessDenied(format!(
+                "community {community} is write-fenced ({other})"
+            ))),
+            None => Err(DbError::AccessDenied(format!(
+                "community {community} is missing or tombstoned"
+            ))),
+        }
+    }
+
+    /// Begin a serving write and hold the community's shared deletion lock.
+    pub async fn begin_serving_write(&self, community: CommunityId) -> Result<ServingWriteGuard> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock_shared(community_deletion_lock_key($1))")
+            .bind(community.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT deletion_state FROM communities WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        match state.as_deref() {
+            Some("active") => Ok(ServingWriteGuard { _tx: tx }),
+            Some(other) => Err(DbError::AccessDenied(format!(
+                "community {community} is write-fenced ({other})"
+            ))),
+            None => Err(DbError::AccessDenied(format!(
+                "community {community} is missing or tombstoned"
+            ))),
+        }
+    }
+
+    /// Ensure the durable community write fence allows serving writes.
+    pub async fn assert_serving_write_allowed(&self, community: CommunityId) -> Result<()> {
+        let guard = self.begin_serving_write(community).await?;
+        drop(guard);
+        Ok(())
+    }
+
+    /// Whether a community remains active and serving-write eligible.
+    pub async fn is_serving_active(&self, community: CommunityId) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM communities WHERE id = $1 \
+             AND archived_at IS NULL AND deleted_at IS NULL AND deletion_state = 'active')",
+        )
+        .bind(community.as_uuid())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn advance_with_checkpoint(
+        &self,
+        token: &LeaseToken,
+        from: DeletionStage,
+        to: DeletionStage,
+        unit_key: &str,
+        detail: serde_json::Value,
+    ) -> Result<()> {
+        let generation = require_fence_generation(token)?;
+        let mut tx = self.pool.begin().await?;
+        verify_lease_and_fence(&mut tx, token, from, generation).await?;
+        advance_request_tx(&mut tx, token, from, to, Some(generation)).await?;
+        checkpoint_completed_tx(&mut tx, token, from, unit_key, detail).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn live_scoped_tables(&self) -> Result<BTreeSet<String>> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT c.relname
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_attribute a ON a.attrelid = c.oid
+            WHERE n.nspname = 'public'
+              AND c.relkind IN ('r', 'p')
+              AND NOT c.relispartition
+              AND a.attname = 'community_id'
+              AND NOT a.attisdropped
+              AND c.relname NOT IN (
+                  'community_deletion_requests',
+                  'community_deletion_approvals',
+                  'community_deletion_checkpoints',
+                  'community_deletion_retention_exceptions',
+                  'community_deletion_executor_heartbeats'
+              )
+            ORDER BY c.relname
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    async fn live_fenced_tables(&self) -> Result<BTreeSet<String>> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT c.relname
+            FROM pg_trigger trigger
+            JOIN pg_class c ON c.oid = trigger.tgrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_proc procedure ON procedure.oid = trigger.tgfoid
+            WHERE n.nspname = 'public'
+              AND NOT trigger.tgisinternal
+              AND NOT c.relispartition
+              AND procedure.proname = 'enforce_community_write_fence'
+            ORDER BY c.relname
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+}
+
+/// Fail closed when storage inventory reports unknown or unsupported data.
+pub fn validate_storage_manifest(manifest: &StorageManifest) -> Result<()> {
+    if manifest.version != 1 {
+        return Err(DbError::InvalidData(format!(
+            "unsupported storage manifest version {}",
+            manifest.version
+        )));
+    }
+    if !manifest.unknown_keys.is_empty() {
+        return Err(DbError::InvalidData(format!(
+            "unknown object-store keys block deletion: {}",
+            manifest.unknown_keys.join(",")
+        )));
+    }
+    if !manifest.unsupported_version_keys.is_empty() {
+        return Err(DbError::InvalidData(format!(
+            "unsupported object versions block deletion: {}",
+            manifest.unsupported_version_keys.join(",")
+        )));
+    }
+    Ok(())
+}
+
+async fn verify_lease(
+    tx: &mut Transaction<'_, Postgres>,
+    token: &LeaseToken,
+    stage: DeletionStage,
+) -> Result<()> {
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM community_deletion_requests \
+         WHERE id = $1 AND stage = $2 AND lease_owner = $3 \
+           AND lease_generation = $4 AND lease_until >= now() AND blocked_at IS NULL)",
+    )
+    .bind(token.request_id)
+    .bind(stage.to_string())
+    .bind(&token.owner)
+    .bind(token.generation)
+    .fetch_one(&mut **tx)
+    .await?;
+    if valid {
+        Ok(())
+    } else {
+        Err(stale_lease_error(token))
+    }
+}
+
+async fn verify_lease_and_fence(
+    tx: &mut Transaction<'_, Postgres>,
+    token: &LeaseToken,
+    stage: DeletionStage,
+    fence_generation: i64,
+) -> Result<()> {
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM community_deletion_requests request \
+         JOIN communities community ON community.id = request.community_id \
+         WHERE request.id = $1 AND request.stage = $2 AND request.lease_owner = $3 \
+           AND request.lease_generation = $4 AND request.lease_until >= now() \
+           AND request.blocked_at IS NULL AND request.fence_generation = $5 \
+           AND community.deletion_state IN ('fenced', 'tombstone') \
+           AND community.deletion_fence_generation = $5)",
+    )
+    .bind(token.request_id)
+    .bind(stage.to_string())
+    .bind(&token.owner)
+    .bind(token.generation)
+    .bind(fence_generation)
+    .fetch_one(&mut **tx)
+    .await?;
+    if valid {
+        Ok(())
+    } else {
+        Err(DbError::AccessDenied(format!(
+            "stale lease or fencing generation for deletion {}",
+            token.request_id
+        )))
+    }
+}
+
+async fn set_executor_gucs(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+    generation: i64,
+) -> Result<()> {
+    sqlx::query(
+        "SELECT set_config('buzz.deletion_executor_community', $1, true), \
+                set_config('buzz.deletion_fence_generation', $2, true)",
+    )
+    .bind(community.to_string())
+    .bind(generation.to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn advance_request_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    token: &LeaseToken,
+    from: DeletionStage,
+    to: DeletionStage,
+    fence_generation: Option<i64>,
+) -> Result<()> {
+    if from.next() != Some(to) {
+        return Err(DbError::InvalidData(format!(
+            "illegal deletion transition {from} -> {to}"
+        )));
+    }
+    let affected = sqlx::query(
+        "UPDATE community_deletion_requests \
+         SET stage = $5, fence_generation = COALESCE($6, fence_generation), \
+             updated_at = now(), last_error = NULL, last_error_at = NULL \
+         WHERE id = $1 AND stage = $4 AND lease_owner = $2 \
+           AND lease_generation = $3 AND lease_until >= now() AND blocked_at IS NULL",
+    )
+    .bind(token.request_id)
+    .bind(&token.owner)
+    .bind(token.generation)
+    .bind(from.to_string())
+    .bind(to.to_string())
+    .bind(fence_generation)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if affected == 1 {
+        Ok(())
+    } else {
+        Err(stale_lease_error(token))
+    }
+}
+
+async fn checkpoint_completed_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    token: &LeaseToken,
+    stage: DeletionStage,
+    unit_key: &str,
+    detail: serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO community_deletion_checkpoints
+            (request_id, stage, unit_key, status, lease_generation, detail, completed_at)
+        VALUES ($1, $2, $3, 'completed', $4, $5, now())
+        ON CONFLICT (request_id, stage, unit_key) DO UPDATE
+        SET status = 'completed', lease_generation = EXCLUDED.lease_generation,
+            attempts = community_deletion_checkpoints.attempts + 1,
+            detail = EXCLUDED.detail, error = NULL, completed_at = now()
+        "#,
+    )
+    .bind(token.request_id)
+    .bind(stage.to_string())
+    .bind(unit_key)
+    .bind(token.generation)
+    .bind(detail)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn checkpoint_failed_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    token: &LeaseToken,
+    stage: DeletionStage,
+    unit_key: &str,
+    error: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO community_deletion_checkpoints
+            (request_id, stage, unit_key, status, lease_generation, error)
+        VALUES ($1, $2, $3, 'failed', $4, $5)
+        ON CONFLICT (request_id, stage, unit_key) DO UPDATE
+        SET status = 'failed', lease_generation = EXCLUDED.lease_generation,
+            attempts = community_deletion_checkpoints.attempts + 1,
+            error = EXCLUDED.error, completed_at = NULL
+        "#,
+    )
+    .bind(token.request_id)
+    .bind(stage.to_string())
+    .bind(unit_key)
+    .bind(token.generation)
+    .bind(error)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn serialize_community_id<S>(
+    community: &CommunityId,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&community.to_string())
+}
+
+fn row_to_request(row: sqlx::postgres::PgRow) -> Result<DeletionRequest> {
+    let community_id: Uuid = row.try_get("community_id")?;
+    let digest: Option<Vec<u8>> = row.try_get("inventory_digest")?;
+    Ok(DeletionRequest {
+        id: row.try_get("id")?,
+        community_id: CommunityId::from_uuid(community_id),
+        community_host: row.try_get("community_host")?,
+        stage: row.try_get::<String, _>("stage")?.parse()?,
+        requested_by: row.try_get("requested_by")?,
+        reason: row.try_get("reason")?,
+        schema_manifest: row.try_get("schema_manifest")?,
+        storage_manifest: row.try_get("storage_manifest")?,
+        inventory_manifest: row.try_get("inventory_manifest")?,
+        inventory_digest: digest.map(hex::encode),
+        fence_generation: row.try_get("fence_generation")?,
+        lease_owner: row.try_get("lease_owner")?,
+        lease_generation: row.try_get("lease_generation")?,
+        lease_until: row.try_get("lease_until")?,
+        attempts: row.try_get("attempts")?,
+        retry_count: row.try_get("retry_count")?,
+        last_error: row.try_get("last_error")?,
+        blocked_reason: row.try_get("blocked_reason")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        completed_at: row.try_get("completed_at")?,
+    })
+}
+
+fn stale_lease_error(token: &LeaseToken) -> DbError {
+    DbError::AccessDenied(format!(
+        "stale deletion lease {} owner {:?} generation {}",
+        token.request_id, token.owner, token.generation
+    ))
+}
+
+fn require_fence_generation(token: &LeaseToken) -> Result<i64> {
+    token.fence_generation.ok_or_else(|| {
+        DbError::InvalidData(format!(
+            "deletion {} has no durable fence generation",
+            token.request_id
+        ))
+    })
+}
+
+fn bound_text(input: &str, max: usize) -> String {
+    if input.len() <= max {
+        return input.to_owned();
+    }
+    let mut end = max;
+    while !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    input[..end].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn storage_manifest() -> StorageManifest {
+        StorageManifest {
+            version: 1,
+            tenant_keys: Vec::new(),
+            git_pointer_keys: Vec::new(),
+            media_sidecar_keys: Vec::new(),
+            media_upload_keys: Vec::new(),
+            retained_shared_cas_keys: Vec::new(),
+            unknown_keys: Vec::new(),
+            unsupported_version_keys: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn stage_order_is_exact_and_terminal() {
+        let mut stage = DeletionStage::Submitted;
+        let mut seen = vec![stage];
+        while let Some(next) = stage.next() {
+            stage = next;
+            seen.push(stage);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                DeletionStage::Submitted,
+                DeletionStage::Inventoried,
+                DeletionStage::Approved,
+                DeletionStage::Fenced,
+                DeletionStage::Drained,
+                DeletionStage::BindingsRemoved,
+                DeletionStage::PostgresPurged,
+                DeletionStage::CachePurged,
+                DeletionStage::LogicallyVerified,
+                DeletionStage::RetentionPending,
+            ]
+        );
+        assert!(!DeletionStage::Submitted.runnable());
+        assert!(!DeletionStage::Inventoried.runnable());
+        assert!(DeletionStage::Approved.runnable());
+        assert!(!DeletionStage::RetentionPending.runnable());
+    }
+
+    #[test]
+    fn unknown_storage_data_fails_closed() {
+        let mut manifest = storage_manifest();
+        manifest.unknown_keys.push("mystery/data".to_string());
+        let error = validate_storage_manifest(&manifest).expect_err("unknown key must block");
+        assert!(error.to_string().contains("unknown object-store keys"));
+    }
+
+    #[test]
+    fn unsupported_object_versions_fail_closed() {
+        let mut manifest = storage_manifest();
+        manifest
+            .unsupported_version_keys
+            .push("_meta/community/blob.json".to_string());
+        let error = validate_storage_manifest(&manifest).expect_err("object version must block");
+        assert!(error.to_string().contains("unsupported object versions"));
+    }
+
+    #[test]
+    fn frozen_inventory_digest_is_stable() {
+        let inventory = FrozenInventory {
+            schema: SchemaManifest {
+                revision: 1,
+                migration_version: 27,
+                scoped_tables: vec!["events".to_string()],
+                row_counts: BTreeMap::from([("events".to_string(), 3)]),
+                fenced_tables: vec!["events".to_string()],
+            },
+            storage: storage_manifest(),
+        };
+        assert_eq!(inventory.digest().unwrap(), inventory.digest().unwrap());
+        assert_eq!(inventory.digest().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn errors_are_utf8_bounded() {
+        let input = format!("{}🛸", "x".repeat(4095));
+        let bounded = bound_text(&input, 4096);
+        assert!(bounded.len() <= 4096);
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod postgres_tests {
+    use super::*;
+    use crate::{CreateCommunityWithOwnerResult, Db, DbConfig};
+
+    async fn store() -> (Db, DeletionStore) {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+        let db = Db::new(&DbConfig {
+            database_url,
+            max_connections: 5,
+            min_connections: 0,
+            ..DbConfig::default()
+        })
+        .await
+        .expect("connect deletion test DB");
+        db.migrate().await.expect("migrate deletion test DB");
+        let store = db.deletion_store();
+        (db, store)
+    }
+
+    async fn inventoried_request(
+        db: &Db,
+        store: &DeletionStore,
+    ) -> (DeletionRequest, FrozenInventory) {
+        let host = format!("deletion-{}.example", Uuid::new_v4().simple());
+        let community = db
+            .ensure_configured_community(&host)
+            .await
+            .expect("create community");
+        let submitted = store
+            .submit(&host, "test-operator", Some("test deletion"))
+            .await
+            .expect("submit");
+        assert_eq!(submitted.community_id, community.id);
+        let inventory = FrozenInventory {
+            schema: store
+                .inventory_schema(community.id)
+                .await
+                .expect("schema inventory"),
+            storage: StorageManifest {
+                version: 1,
+                tenant_keys: Vec::new(),
+                git_pointer_keys: Vec::new(),
+                media_sidecar_keys: Vec::new(),
+                media_upload_keys: Vec::new(),
+                retained_shared_cas_keys: Vec::new(),
+                unknown_keys: Vec::new(),
+                unsupported_version_keys: Vec::new(),
+            },
+        };
+        let request = store
+            .freeze_inventory(submitted.id, &inventory)
+            .await
+            .expect("freeze inventory");
+        (request, inventory)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn approval_boundary_blocks_claim_until_exact_inventory_is_approved() {
+        let (db, store) = store().await;
+        let (request, inventory) = inventoried_request(&db, &store).await;
+        assert_eq!(request.stage, DeletionStage::Inventoried);
+        assert!(store
+            .claim_specific(request.id, "executor-a", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim before approval")
+            .is_none());
+
+        let approved = store
+            .approve(request.id, "approver-a", Some("reviewed"))
+            .await
+            .expect("approve");
+        assert_eq!(approved.stage, DeletionStage::Approved);
+        assert_eq!(
+            approved.inventory_digest,
+            Some(hex::encode(inventory.digest().unwrap()))
+        );
+        assert!(store
+            .claim_specific(request.id, "executor-a", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim approved")
+            .is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn stale_claim_and_fence_generation_fail_closed() {
+        let (db, store) = store().await;
+        let (request, _) = inventoried_request(&db, &store).await;
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let claim = store
+            .claim_specific(request.id, "executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim")
+            .expect("won claim");
+        let mut stale = claim.lease.clone();
+        stale.generation -= 1;
+        assert!(
+            store.fence(&stale).await.is_err(),
+            "stale lease must reject"
+        );
+
+        let generation = store.fence(&claim.lease).await.expect("fence");
+        let mut wrong_fence = claim.lease.clone();
+        wrong_fence.fence_generation = Some(generation + 1);
+        assert!(
+            store.mark_drained(&wrong_fence).await.is_err(),
+            "wrong fence generation must reject"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn fence_waits_for_open_write_and_rejects_it_after_transition() {
+        let (db, store) = store().await;
+        let (request, _) = inventoried_request(&db, &store).await;
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let claim = store
+            .claim_specific(request.id, "executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim")
+            .expect("won claim");
+
+        let mut open_write = db
+            .begin_transaction()
+            .await
+            .expect("open write transaction");
+        sqlx::query("INSERT INTO pubkey_allowlist (community_id, pubkey) VALUES ($1, $2)")
+            .bind(request.community_id.as_uuid())
+            .bind(vec![7_u8; 32])
+            .execute(&mut *open_write)
+            .await
+            .expect("write acquires shared deletion lock");
+
+        let store_for_fence = store.clone();
+        let lease = claim.lease.clone();
+        let fencing = tokio::spawn(async move { store_for_fence.fence(&lease).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !fencing.is_finished(),
+            "exclusive fence must wait for open writer"
+        );
+        open_write
+            .commit()
+            .await
+            .expect("pre-fence writer commits first");
+        fencing.await.expect("fence task").expect("fence completes");
+
+        assert!(
+            db.add_to_allowlist(request.community_id, &[8_u8; 32], &[9_u8; 32], None)
+                .await
+                .is_err(),
+            "post-fence serving write must fail"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn serving_guard_blocks_fence_until_external_side_effect_finishes() {
+        let (db, store) = store().await;
+        let (request, _) = inventoried_request(&db, &store).await;
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let claim = store
+            .claim_specific(request.id, "executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim")
+            .expect("won claim");
+        let guard = store
+            .begin_serving_write(request.community_id)
+            .await
+            .expect("serving write guard");
+        let store_for_fence = store.clone();
+        let lease = claim.lease.clone();
+        let fencing = tokio::spawn(async move { store_for_fence.fence(&lease).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !fencing.is_finished(),
+            "fence must wait for external side effect guard"
+        );
+        drop(guard);
+        fencing.await.expect("fence task").expect("fence completes");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn checkpointed_resume_is_idempotent_and_tombstone_blocks_name_reuse() {
+        let (db, store) = store().await;
+        let (request, _) = inventoried_request(&db, &store).await;
+        let host = request.community_host.clone();
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let claim = store
+            .claim_specific(request.id, "executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim")
+            .expect("won claim");
+        let generation = store.fence(&claim.lease).await.expect("fence");
+        let token = LeaseToken {
+            fence_generation: Some(generation),
+            ..claim.lease
+        };
+        store.mark_drained(&token).await.expect("drain");
+        store
+            .mark_bindings_removed(&token, serde_json::json!({"keys": 0}))
+            .await
+            .expect("bindings");
+        let first = store.purge_postgres(&token).await.expect("purge postgres");
+        assert_eq!(first.len(), EXPECTED_SCOPED_TABLES.len());
+        assert!(
+            store.purge_postgres(&token).await.is_err(),
+            "completed stage cannot be replayed under stale checkpoint state"
+        );
+        store
+            .mark_cache_purged(&token, serde_json::json!({"keys": 0}))
+            .await
+            .expect("cache");
+        store
+            .verify_postgres_logically_deleted(&token)
+            .await
+            .expect("logical postgres verify");
+        store
+            .mark_logically_verified(&token, serde_json::json!({"all": true}))
+            .await
+            .expect("mark verified");
+        store
+            .mark_retention_pending(&token, serde_json::json!({"shared_cas": "retained"}))
+            .await
+            .expect("terminal");
+
+        let terminal = store.get(request.id).await.expect("terminal request");
+        assert_eq!(terminal.stage, DeletionStage::RetentionPending);
+        let recreated = db
+            .create_community_with_owner(
+                &host,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .await
+            .expect("recreate attempt");
+        assert_eq!(recreated, CreateCommunityWithOwnerResult::HostExists);
+        assert!(db
+            .lookup_community_by_host_for_management(&host)
+            .await
+            .expect("tombstone lookup")
+            .is_some());
+        assert!(db
+            .lookup_community_by_host(&host)
+            .await
+            .expect("serving lookup")
+            .is_none());
+    }
+}

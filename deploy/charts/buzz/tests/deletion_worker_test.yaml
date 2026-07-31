@@ -1,0 +1,45 @@
+suite: deletion worker render
+templates:
+  - templates/deletion-worker-deployment.yaml
+tests:
+  - it: remains completely inert by default
+    set:
+      relayUrl: wss://buzz.example.com
+      ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
+      externalPostgresql.url: postgres://u:p@h:5432/d
+      externalRedis.url: redis://h:6379
+      s3.endpoint: http://minio:9000
+      s3.accessKey: a
+      s3.secretKey: s
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders a dedicated no-ingress worker identity only when enabled
+    set:
+      relayUrl: wss://buzz.example.com
+      ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
+      externalPostgresql.url: postgres://u:p@h:5432/d
+      externalRedis.url: redis://h:6379
+      s3.endpoint: http://minio:9000
+      s3.accessKey: a
+      s3.secretKey: s
+      deletionWorker.enabled: true
+      deletionWorker.serviceAccountName: buzz-deletion-worker
+      deletionWorker.existingSecret: buzz-deletion-worker-credentials
+    asserts:
+      - equal:
+          path: kind
+          value: Deployment
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: buzz-deletion-worker
+      - equal:
+          path: spec.template.spec.containers[0].command[0]
+          value: /usr/local/bin/buzz-admin
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value: [deletions, worker]
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /_readiness

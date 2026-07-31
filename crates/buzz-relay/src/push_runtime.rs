@@ -418,6 +418,20 @@ async fn deliver_one(
             return;
         }
     };
+    let _serving_write = match buzz_deletion::store(&state.db)
+        .begin_serving_write(outcome.community)
+        .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            warn!(wake=%outcome.id, %error, "push delivery suppressed by community deletion fence");
+            let _ = state
+                .db
+                .fail_push_wake(outcome.community, outcome.id, outcome.claim_id)
+                .await;
+            return;
+        }
+    };
     let Some(url) = state.config.push_gateway_delivery_url.as_ref() else {
         return;
     };

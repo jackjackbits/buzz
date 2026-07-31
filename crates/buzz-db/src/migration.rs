@@ -348,6 +348,11 @@ mod tests {
             "push_gateway_delivery_request_replays",
             "product_feedback",
             "replica_heartbeat",
+            "community_deletion_requests",
+            "community_deletion_approvals",
+            "community_deletion_checkpoints",
+            "community_deletion_retention_exceptions",
+            "community_deletion_executor_heartbeats",
         ] {
             if normalized[insert_pos..].contains(&format!("'{value}'")) {
                 globals.insert(value.to_owned());
@@ -561,7 +566,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 28);
+        assert_eq!(migrations.len(), 29);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -919,6 +924,53 @@ mod tests {
         assert!(heartbeat.contains("epoch"));
         assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
         assert!(heartbeat.contains("_operator_global_tables"));
+
+
+        // Channel-id lookup index (0027): serves the tenant-independent
+        // `channels` lookups that carry no community_id predicate, which no
+        // community_id-leading index can satisfy. Covering + partial so the
+        // planner can go index-only; asserted NOT UNIQUE because `id` alone is
+        // not unique across communities.
+        let channel_id_index = migrations
+            .iter()
+            .find(|migration| migration.sql.as_str().contains("idx_channels_id_live"))
+            .expect("channel-id lookup migration");
+        assert_eq!(channel_id_index.version, 27);
+        assert!(channel_id_index.sql.as_str().contains("INCLUDE (community_id)"));
+        assert!(channel_id_index.sql.as_str().contains("WHERE deleted_at IS NULL"));
+        assert!(!channel_id_index.sql.as_str().contains("CREATE UNIQUE INDEX"));
+        assert!(desired_schema.contains("idx_channels_id_live"));
+
+        // Main already owns migration 0028 for long reaction payloads.
+        let long_reactions = migrations
+            .iter()
+            .find(|migration| {
+                migration
+                    .sql
+                    .as_str()
+                    .contains("ALTER TABLE reactions ALTER COLUMN emoji TYPE VARCHAR(66)")
+            })
+            .expect("long-reaction migration");
+        assert_eq!(long_reactions.version, 28);
+        assert!(desired_schema.contains("emoji               VARCHAR(66) NOT NULL"));
+
+        // Durable whole-community deletion control plane. Its final migration
+        // number is reconciled after the branch is replayed onto current main.
+        let deletion = migrations
+            .iter()
+            .find(|migration| {
+                migration
+                    .sql
+                    .as_str()
+                    .contains("CREATE TABLE community_deletion_requests")
+            })
+            .expect("community-deletion migration");
+        assert!(deletion.sql.as_str().contains("CREATE TABLE community_deletion_approvals"));
+        assert!(deletion.sql.as_str().contains("CREATE TABLE community_deletion_checkpoints"));
+        assert!(deletion.sql.as_str().contains("CREATE FUNCTION enforce_community_write_fence"));
+        assert!(deletion.sql.as_str().contains("CREATE FUNCTION enforce_community_tombstone"));
+        assert!(deletion.sql.as_str().contains("community tombstones are permanent"));
+
         // Channel-id lookup index (0027): serves the tenant-independent
         // `channels` lookups that carry no community_id predicate, which no
         // community_id-leading index can satisfy. Covering + partial so the
@@ -939,6 +991,7 @@ mod tests {
             desired_schema.contains("idx_channels_id_live"),
             "desired-state schema must carry the channel-id lookup index",
         );
+<<<<<<< HEAD
 
         assert_eq!(migrations[27].version, 28);
         let long_reactions = migrations[27].sql.as_str();
@@ -946,6 +999,26 @@ mod tests {
             long_reactions.contains("ALTER TABLE reactions ALTER COLUMN emoji TYPE VARCHAR(66)")
         );
         assert!(desired_schema.contains("emoji               VARCHAR(66) NOT NULL"));
+||||||| parent of 037fcbdab (feat: add durable community deletion worker)
+=======
+||||||| parent of d04e4b503 (feat: add durable community deletion worker)
+=======
+
+        // Durable whole-community deletion control plane and universal DB fence.
+        assert_eq!(migrations[26].version, 27);
+        let deletion = migrations[26].sql.as_str();
+        assert!(deletion.contains("CREATE TABLE community_deletion_requests"));
+        assert!(deletion.contains("CREATE TABLE community_deletion_approvals"));
+        assert!(deletion.contains("CREATE TABLE community_deletion_checkpoints"));
+        assert!(deletion.contains("CREATE TABLE community_deletion_retention_exceptions"));
+        assert!(deletion.contains("CREATE TABLE community_deletion_executor_heartbeats"));
+        assert!(deletion.contains("CREATE FUNCTION enforce_community_write_fence"));
+        assert!(deletion.contains("CREATE FUNCTION enforce_community_tombstone"));
+        assert!(deletion.contains("community tombstones are permanent"));
+        assert!(deletion.contains("_operator_global_tables"));
+        assert!(deletion.contains("'submitted', 'inventoried', 'approved', 'fenced', 'drained'"));
+>>>>>>> d04e4b503 (feat: add durable community deletion worker)
+>>>>>>> 037fcbdab (feat: add durable community deletion worker)
     }
 
     #[test]

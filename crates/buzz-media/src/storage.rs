@@ -177,6 +177,71 @@ impl MediaStorage {
         }
     }
 
+    /// Exhaustively list bucket objects for deletion inventory.
+    ///
+    /// Fails rather than returning a partial listing when pagination is
+    /// malformed or the explicit object cap is exceeded.
+    pub async fn list_all_for_deletion(
+        &self,
+        max_objects: u64,
+    ) -> Result<Vec<DeletionObject>, MediaError> {
+        let mut objects = Vec::new();
+        let mut continuation = None;
+        loop {
+            let (result, _status) = self
+                .bucket
+                .list_page(String::new(), None, continuation.take(), None, Some(1000))
+                .await?;
+            let next_len = objects.len().saturating_add(result.contents.len());
+            if u64::try_from(next_len).unwrap_or(u64::MAX) > max_objects {
+                return Err(MediaError::StorageError(format!(
+                    "deletion inventory exceeds object cap {max_objects}"
+                )));
+            }
+            objects.extend(result.contents.into_iter().map(|object| DeletionObject {
+                key: object.key,
+                size: object.size,
+                last_modified: object.last_modified,
+            }));
+            if !result.is_truncated {
+                break;
+            }
+            continuation = result.next_continuation_token;
+            if continuation.is_none() {
+                return Err(MediaError::StorageError(
+                    "truncated deletion inventory page has no continuation token".to_string(),
+                ));
+            }
+        }
+        Ok(objects)
+    }
+
+    /// Return the current object version id, if the backend reports one.
+    ///
+    /// V1 refuses to delete versioned tenant bindings because rust-s3 cannot
+    /// exhaustively enumerate non-current versions; a plain delete marker would
+    /// not prove logical absence from storage.
+    pub async fn inspect_current_version(
+        &self,
+        key: &str,
+    ) -> Result<CurrentObjectVersion, MediaError> {
+        match self.bucket.head_object(key).await {
+            Ok((result, _)) => Ok(CurrentObjectVersion::Present {
+                version_id: result.version_id,
+            }),
+            Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Ok(CurrentObjectVersion::Missing),
+            Err(error) => Err(MediaError::StorageError(error.to_string())),
+        }
+    }
+
+    /// Delete tenant binding keys one at a time and fail on any backend error.
+    pub async fn delete_bindings(&self, keys: &[String]) -> Result<(), MediaError> {
+        for key in keys {
+            self.delete(key).await?;
+        }
+        Ok(())
+    }
+
     /// Build the community-scoped sidecar key for a given sha256 (bare hash).
     ///
     /// Raw media bytes remain shared content-addressed CAS (`{sha}.{ext}`), but
@@ -267,6 +332,29 @@ impl MediaStorage {
             is_truncated: result.is_truncated,
         })
     }
+}
+
+/// Current-version observation for a tenant-owned object binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CurrentObjectVersion {
+    /// The key does not exist.
+    Missing,
+    /// The key exists, optionally with a backend version id.
+    Present {
+        /// S3 version id. `Some` is unsupported for V1 deletion.
+        version_id: Option<String>,
+    },
+}
+
+/// One object observed during exhaustive deletion inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionObject {
+    /// Exact bucket key.
+    pub key: String,
+    /// Current object size.
+    pub size: u64,
+    /// Backend-reported last modification timestamp.
+    pub last_modified: String,
 }
 
 #[cfg(test)]

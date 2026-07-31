@@ -310,6 +310,11 @@ pub async fn upload_blob(
 ) -> Result<Json<BlobDescriptor>, MediaError> {
     let attribution = upload_attribution(&state, &auth, &headers).await;
 
+    let _serving_write = buzz_deletion::store(&state.db)
+        .begin_serving_write(auth.tenant.community())
+        .await
+        .map_err(|_| MediaError::RelayMembershipRequired)?;
+
     if auth.route_mode == UploadRouteMode::LegacyMedia {
         metrics::counter!("buzz_media_legacy_upload_route_total").increment(1);
     }

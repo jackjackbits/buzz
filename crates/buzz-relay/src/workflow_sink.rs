@@ -334,6 +334,11 @@ impl ActionSink for RelayActionSink {
                 broadcast: false,
             });
 
+            buzz_deletion::store(&state.db)
+                .assert_serving_write_allowed(tenant.community())
+                .await
+                .map_err(|error| ActionSinkError::Database(error.to_string()))?;
+
             let (stored_event, was_inserted) = state
                 .db
                 .insert_event_with_thread_metadata(

@@ -391,3 +391,26 @@ serviceMonitor:
 
 # ── Free-form extra manifests ────────────────────────────────────────────────
 extraManifests: []
+
+# ── Whole-community deletion worker ──────────────────────────────────────────
+# Strictly inert by default. Hosted operators may enable this dedicated,
+# no-ingress identity; manual OSS operation uses `buzz-admin deletions run|drain`
+# from the existing image instead.
+deletionWorker:
+  enabled: false
+  replicaCount: 1
+  serviceAccountName: ""
+  automountServiceAccountToken: false
+  existingSecret: ""
+  healthPort: 8080
+  terminationGracePeriodSeconds: 90
+  storageMaxObjects: 1000000
+  podAnnotations: {}
+  extraEnv: []
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"

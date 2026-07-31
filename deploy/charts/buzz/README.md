@@ -145,6 +145,37 @@ volumes, and each init container must define an appropriate security context
 and resources. Empty `relay.command` and `relay.args` arrays preserve the image
 defaults; non-empty values override its entrypoint and arguments respectively.
 
+## Whole-community deletion worker
+
+Whole-community logical deletion is CLI-only. The default chart remains inert:
+`deletionWorker.enabled=false` renders no deletion pod, Service, Ingress, or
+route, and the image ENTRYPOINT remains `buzz-relay`.
+
+Manual OSS operators run the durable engine from the existing image context:
+
+```sh
+buzz-admin deletions submit --host community.example --requested-by operator
+buzz-admin deletions approve <request-id> --approved-by operator
+buzz-admin deletions run <request-id>   # one job
+buzz-admin deletions drain              # current runnable queue
+```
+
+Hosted operators can opt into a dedicated no-ingress worker:
+
+```yaml
+deletionWorker:
+  enabled: true
+  serviceAccountName: buzz-deletion-worker
+  existingSecret: buzz-deletion-worker-credentials
+```
+
+The dedicated Secret and service account should grant only the PostgreSQL,
+Redis, and S3 delete/list capabilities needed by the worker. Its command is
+`buzz-admin deletions worker`; the private `/_liveness` and `/_readiness`
+listener exists only for pod probes, and SIGTERM marks readiness draining,
+finishes/releases the current durable unit, then exits inside the configured
+90-second window. Do not route public traffic to this pod.
+
 ## Device pairing relay
 
 The chart can run Buzz's stateless pairing WebSocket relay as an independent

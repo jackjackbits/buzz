@@ -526,6 +526,19 @@ pub async fn dispatch_action(
 ) -> Result<StepResult, WorkflowError> {
     use ActionDef::*;
 
+    // The workflow engine can outlive the serving request that spawned it.
+    // Revalidate the durable community fence immediately before every external
+    // side effect (message publish, webhook, delay/resume). A storage failure is
+    // a denial, never permission to continue.
+    let _serving_write = buzz_deletion::store(&engine.db)
+        .begin_serving_write(community_id)
+        .await
+        .map_err(|error| {
+            WorkflowError::WebhookError(format!(
+                "community write fence rejected workflow side effect: {error}"
+            ))
+        })?;
+
     match action {
         SendMessage { text, channel } => {
             // Look up workflow metadata for destination validation and

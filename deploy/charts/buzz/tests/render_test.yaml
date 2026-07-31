@@ -3,6 +3,7 @@ suite: production render
 # (e.g. checksum/secret include of secret-chart.yaml) resolve at render time.
 templates:
   - templates/deployment.yaml
+  - templates/deletion-worker-deployment.yaml
   - templates/secret-chart.yaml
   - templates/serviceaccount.yaml
   - templates/service.yaml
