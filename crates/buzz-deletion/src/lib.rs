@@ -37,6 +37,14 @@ fn heartbeat_interval() -> Duration {
     HEARTBEAT_INTERVAL
 }
 
+fn worker_health_stale_after() -> u64 {
+    HEARTBEAT_INTERVAL.as_secs().saturating_mul(3)
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("deletion execution lease heartbeat failed")]
+struct DeletionLeaseLost;
+
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{message}")]
 struct ServingWriteLeaseLost {
@@ -86,13 +94,13 @@ impl ServingWriteGuard {
         self.verify().await?;
         let output = tokio::select! {
             biased;
+            output = operation => output,
             _ = self.lost.cancelled() => {
                 return Err(ServingWriteLeaseLost {
                     message: "serving write lease heartbeat was lost".to_string(),
                 }
                 .into())
             }
-            output = operation => output,
         };
         self.verify().await?;
         Ok(output)
@@ -340,7 +348,8 @@ impl WorkerHealth {
             .as_secs();
         !self.draining.load(Ordering::Relaxed)
             && self.dependencies_ready.load(Ordering::Relaxed)
-            && now.saturating_sub(self.last_heartbeat_epoch.load(Ordering::Relaxed)) <= 30
+            && now.saturating_sub(self.last_heartbeat_epoch.load(Ordering::Relaxed))
+                <= worker_health_stale_after()
     }
 }
 
@@ -623,6 +632,24 @@ async fn run_loop(
     }
 }
 
+async fn stop_claim_executor(
+    services: &Services,
+    mode: LoopMode,
+    token: &LeaseToken,
+) -> Result<()> {
+    // A failed draining heartbeat must not prevent the generation-checked release
+    // attempt. `stop_executor` cannot clear a successor's reclaimed lease.
+    let _ = services
+        .store
+        .heartbeat(token, mode.as_str(), DEFAULT_LEASE_DURATION, true)
+        .await;
+    services
+        .store
+        .stop_executor(Some(token), &token.owner)
+        .await?;
+    Ok(())
+}
+
 async fn execute_claim(
     services: &Services,
     mode: LoopMode,
@@ -633,14 +660,7 @@ async fn execute_claim(
     let token = claim.lease.clone();
     loop {
         if shutdown.is_cancelled() {
-            services
-                .store
-                .heartbeat(&token, mode.as_str(), DEFAULT_LEASE_DURATION, true)
-                .await?;
-            services
-                .store
-                .stop_executor(Some(&token), &token.owner)
-                .await?;
+            stop_claim_executor(services, mode, &token).await?;
             let request = services.store.get(token.request_id).await?;
             return Ok(run_output(request));
         }
@@ -653,8 +673,19 @@ async fn execute_claim(
         let stage_result =
             run_stage_with_heartbeat(services, mode, &claim, shutdown, Arc::clone(&health)).await;
         match stage_result {
-            Ok(()) => {}
-            Err(error) => {
+            StageOutcome::Completed => {}
+            StageOutcome::Shutdown => {
+                stop_claim_executor(services, mode, &token).await?;
+                let request = services.store.get(token.request_id).await?;
+                return Ok(run_output(request));
+            }
+            StageOutcome::Failed(error) => {
+                let request = services.store.get(token.request_id).await?;
+                if request.lease_owner.as_deref() != Some(&token.owner)
+                    || request.lease_generation != token.generation
+                {
+                    return Ok(run_output(request));
+                }
                 let message = format!("{error:#}");
                 if is_permanent_error(&error) {
                     services
@@ -699,13 +730,38 @@ async fn dependencies_ready(services: &Services) -> bool {
     redis_ok && storage_ok
 }
 
+enum StageOutcome {
+    Completed,
+    Shutdown,
+    Failed(anyhow::Error),
+}
+
+async fn await_stage<F>(
+    stage: F,
+    shutdown: &CancellationToken,
+    heartbeat_error: &CancellationToken,
+) -> StageOutcome
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => StageOutcome::Shutdown,
+        _ = heartbeat_error.cancelled() => StageOutcome::Failed(DeletionLeaseLost.into()),
+        result = stage => match result {
+            Ok(()) => StageOutcome::Completed,
+            Err(error) => StageOutcome::Failed(error),
+        },
+    }
+}
+
 async fn run_stage_with_heartbeat(
     services: &Services,
     mode: LoopMode,
     claim: &ClaimedDeletion,
     shutdown: &CancellationToken,
     health: Arc<WorkerHealth>,
-) -> Result<()> {
+) -> StageOutcome {
     let heartbeat_services = services.clone();
     let heartbeat_token = claim.lease.clone();
     let heartbeat_mode = mode.as_str();
@@ -742,22 +798,26 @@ async fn run_stage_with_heartbeat(
         }
     });
 
-    let stage = tokio::select! {
-        _ = shutdown.cancelled() => Err(anyhow::anyhow!("executor shutdown requested")),
-        _ = heartbeat_error.cancelled() => Err(anyhow::anyhow!("deletion lease heartbeat failed")),
-        result = execute_stage(services, claim) => result,
-    };
+    let stage = await_stage(
+        execute_stage(services, claim, &heartbeat_error),
+        shutdown,
+        &heartbeat_error,
+    )
+    .await;
     heartbeat_shutdown.cancel();
     match heartbeat.await {
         Ok(()) => stage,
-        Err(error) => Err(anyhow::anyhow!("deletion heartbeat task failed: {error}")),
+        Err(error) => {
+            StageOutcome::Failed(anyhow::anyhow!("deletion heartbeat task failed: {error}"))
+        }
     }
 }
 
-async fn guarded_external_step<F, Fut>(
+async fn run_guarded_external_step<F, Fut>(
     services: &Services,
     token: &LeaseToken,
     stage: DeletionStage,
+    heartbeat_lost: &CancellationToken,
     operation: F,
 ) -> Result<()>
 where
@@ -765,12 +825,23 @@ where
     Fut: std::future::Future<Output = Result<()>>,
 {
     services.store.verify_execution_token(token, stage).await?;
-    operation().await?;
+    let result = tokio::select! {
+        biased;
+        _ = heartbeat_lost.cancelled() => {
+            return Err(DeletionLeaseLost.into());
+        }
+        result = operation() => result,
+    };
+    result?;
     services.store.verify_execution_token(token, stage).await?;
     Ok(())
 }
 
-async fn execute_stage(services: &Services, claim: &ClaimedDeletion) -> Result<()> {
+async fn execute_stage(
+    services: &Services,
+    claim: &ClaimedDeletion,
+    heartbeat_lost: &CancellationToken,
+) -> Result<()> {
     let request = &claim.request;
     let token = token_with_current_fence(&claim.lease, request);
     match request.stage {
@@ -803,7 +874,20 @@ async fn execute_stage(services: &Services, claim: &ClaimedDeletion) -> Result<(
             services.store.fence(&token).await?;
         }
         DeletionStage::Fenced => {
-            publish_disconnect_community(&services.redis, request.community_id).await?;
+            services
+                .store
+                .verify_execution_token(&token, DeletionStage::Fenced)
+                .await?;
+            let disconnect = tokio::select! {
+                biased;
+                _ = heartbeat_lost.cancelled() => Err(DeletionLeaseLost.into()),
+                result = publish_disconnect_community(&services.redis, request.community_id) => result,
+            };
+            disconnect?;
+            services
+                .store
+                .verify_execution_token(&token, DeletionStage::Fenced)
+                .await?;
             let destructive = match request.destructive_storage_manifest.clone() {
                 Some(value) => serde_json::from_value(value)?,
                 None => {
@@ -858,19 +942,31 @@ async fn execute_stage(services: &Services, claim: &ClaimedDeletion) -> Result<(
                 }
             }
             for key in &storage.tenant_keys {
-                guarded_external_step(services, &token, DeletionStage::Drained, || async {
-                    services.media.delete(key).await?;
-                    Ok(())
-                })
+                run_guarded_external_step(
+                    services,
+                    &token,
+                    DeletionStage::Drained,
+                    heartbeat_lost,
+                    || async {
+                        services.media.delete(key).await?;
+                        Ok(())
+                    },
+                )
                 .await?;
-                guarded_external_step(services, &token, DeletionStage::Drained, || async {
-                    if services.media.head(key).await? {
-                        return Err(transient(format!(
-                            "object binding still exists after delete: {key}"
-                        )));
-                    }
-                    Ok(())
-                })
+                run_guarded_external_step(
+                    services,
+                    &token,
+                    DeletionStage::Drained,
+                    heartbeat_lost,
+                    || async {
+                        if services.media.head(key).await? {
+                            return Err(transient(format!(
+                                "object binding still exists after delete: {key}"
+                            )));
+                        }
+                        Ok(())
+                    },
+                )
                 .await?;
             }
             services
@@ -1154,6 +1250,82 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
 
+    async fn claimed_test_deletion(prefix: &str) -> Option<(Services, ClaimedDeletion)> {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()?;
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect deletion engine test DB");
+        let db = Db::from_pool(pool);
+        db.migrate().await.expect("migrate deletion engine test DB");
+        let store = db.deletion_store();
+        let host = format!("{prefix}-{}.example", Uuid::new_v4().simple());
+        let community = db
+            .ensure_configured_community(&host)
+            .await
+            .expect("create deletion engine test community");
+        let request = store
+            .submit(&host, "test", None)
+            .await
+            .expect("submit deletion request");
+        let inventory = FrozenInventory {
+            schema: store
+                .inventory_schema(community.id)
+                .await
+                .expect("inventory schema"),
+            storage: StorageManifest {
+                version: 1,
+                tenant_keys: Vec::new(),
+                git_pointer_keys: Vec::new(),
+                media_sidecar_keys: Vec::new(),
+                media_upload_keys: Vec::new(),
+                retained_shared_cas_keys: Vec::new(),
+                unknown_keys: Vec::new(),
+                unsupported_version_keys: Vec::new(),
+            },
+        };
+        store
+            .freeze_inventory(request.id, &inventory)
+            .await
+            .expect("freeze deletion inventory");
+        store
+            .approve(request.id, "test", None)
+            .await
+            .expect("approve deletion request");
+        let claim = store
+            .claim_specific(request.id, "test-executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim deletion request")
+            .expect("runnable deletion request");
+        let services = Services {
+            store,
+            media: Arc::new(
+                MediaStorage::new(&buzz_media::MediaConfig {
+                    s3_endpoint: "http://127.0.0.1:1".to_string(),
+                    s3_access_key: "unused".to_string(),
+                    s3_secret_key: "unused".to_string(),
+                    s3_bucket: "unused".to_string(),
+                    s3_region: "us-east-1".to_string(),
+                    s3_addressing_style: buzz_media::S3AddressingStyle::Path,
+                    max_image_bytes: 1,
+                    max_gif_bytes: 1,
+                    max_video_bytes: 1,
+                    max_file_bytes: 1,
+                    public_base_url: "http://localhost/media".to_string(),
+                    upload_records_enabled: false,
+                    upload_ip_header: None,
+                    upload_port_header: None,
+                })
+                .expect("construct unused media service"),
+            ),
+            redis: deadpool_redis::Config::from_url("redis://127.0.0.1:1")
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .expect("construct unused Redis pool"),
+        };
+        Some((services, claim))
+    }
+
     #[test]
     fn permanent_failures_are_typed_not_string_classified() {
         let permanent_error = permanent("catalog drift");
@@ -1168,6 +1340,34 @@ mod tests {
         assert!(is_permanent_error(&db_permanent));
         assert!(!is_permanent_error(&transient_error));
         assert!(!is_permanent_error(&db_transient));
+    }
+
+    #[test]
+    fn worker_readiness_requires_dependencies_heartbeat_and_not_draining() {
+        let health = WorkerHealth::default();
+        assert!(!health.ready());
+        health.dependencies_ready.store(true, Ordering::Relaxed);
+        health.mark_heartbeat();
+        assert!(health.ready());
+        health.draining.store(true, Ordering::Relaxed);
+        assert!(!health.ready());
+        health.draining.store(false, Ordering::Relaxed);
+        health.last_heartbeat_epoch.store(1, Ordering::Relaxed);
+        assert!(!health.ready());
+    }
+
+    #[test]
+    fn worker_configuration_requires_every_destructive_dependency() {
+        let variable = format!("BUZZ_DELETION_REQUIRED_TEST_{}", Uuid::new_v4().simple());
+        assert!(required_env(&variable).is_err());
+        std::env::set_var(&variable, "   ");
+        assert!(required_env(&variable).is_err());
+        std::env::set_var(&variable, "configured");
+        assert_eq!(
+            required_env(&variable).expect("configured environment variable"),
+            "configured"
+        );
+        std::env::remove_var(&variable);
     }
 
     #[test]
@@ -1224,6 +1424,111 @@ mod tests {
             !completed.load(Ordering::Relaxed),
             "lease loss must cancel the protected operation future"
         );
+    }
+
+    #[tokio::test]
+    async fn guarded_external_step_rejects_preexisting_heartbeat_loss_without_polling_operation() {
+        let Some((services, claim)) = claimed_test_deletion("deletion-heartbeat").await else {
+            return;
+        };
+        let heartbeat_lost = CancellationToken::new();
+        heartbeat_lost.cancel();
+        let polled = Arc::new(AtomicBool::new(false));
+        let operation_polled = Arc::clone(&polled);
+        let result = run_guarded_external_step(
+            &services,
+            &claim.lease,
+            DeletionStage::Approved,
+            &heartbeat_lost,
+            || async move {
+                operation_polled.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err(), "heartbeat loss must abort the side effect");
+        assert!(
+            result
+                .expect_err("heartbeat loss error")
+                .downcast_ref::<DeletionLeaseLost>()
+                .is_some(),
+            "heartbeat loss must stay typed"
+        );
+        assert!(
+            !polled.load(Ordering::Relaxed),
+            "a pre-cancelled heartbeat must win before polling the operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_stage_releases_claim_without_recording_retry() {
+        let Some((services, claim)) = claimed_test_deletion("deletion-shutdown").await else {
+            return;
+        };
+        let request_id = claim.request.id;
+        let retry_count = claim.request.retry_count;
+        let shutdown = CancellationToken::new();
+        let cancel = shutdown.clone();
+        let services_for_run = services.clone();
+        let executor = tokio::spawn(async move {
+            execute_claim(
+                &services_for_run,
+                LoopMode::Worker,
+                claim,
+                &shutdown,
+                Arc::new(WorkerHealth::default()),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel.cancel();
+        let output = tokio::time::timeout(Duration::from_secs(2), executor)
+            .await
+            .expect("shutdown must cancel the active stage")
+            .expect("deletion executor task")
+            .expect("graceful deletion executor shutdown");
+        let request = services
+            .store
+            .get(request_id)
+            .await
+            .expect("load deletion request after shutdown");
+        assert_eq!(output.stage, DeletionStage::Approved);
+        assert_eq!(request.stage, DeletionStage::Approved);
+        assert_eq!(request.retry_count, retry_count);
+        assert!(request.last_error.is_none());
+        assert!(request.lease_owner.is_none());
+        assert!(request.lease_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn stage_wait_treats_shutdown_as_control_flow() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let heartbeat_lost = CancellationToken::new();
+        let outcome = await_stage(
+            std::future::pending::<Result<()>>(),
+            &shutdown,
+            &heartbeat_lost,
+        )
+        .await;
+        assert!(matches!(outcome, StageOutcome::Shutdown));
+    }
+
+    #[tokio::test]
+    async fn stage_wait_prioritizes_heartbeat_loss_over_a_ready_operation() {
+        let shutdown = CancellationToken::new();
+        let heartbeat_lost = CancellationToken::new();
+        heartbeat_lost.cancel();
+        let outcome = await_stage(async { Ok(()) }, &shutdown, &heartbeat_lost).await;
+        match outcome {
+            StageOutcome::Failed(error) => assert!(
+                error.downcast_ref::<DeletionLeaseLost>().is_some(),
+                "heartbeat loss must stay typed"
+            ),
+            StageOutcome::Completed | StageOutcome::Shutdown => {
+                panic!("preexisting heartbeat loss must win")
+            }
+        }
     }
 
     #[tokio::test]
