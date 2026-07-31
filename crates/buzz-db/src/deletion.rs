@@ -1920,6 +1920,18 @@ mod postgres_tests {
             .expect("claim before approval")
             .is_none());
 
+        // Approval binds structural/storage taxonomy, not live row counts. A
+        // serving write between inventory and approval must not make an active
+        // community undeletable.
+        db.add_to_allowlist(request.community_id, &[7_u8; 32], &[8_u8; 32], None)
+            .await
+            .expect("post-inventory serving write");
+        let current_schema = store
+            .inventory_schema(request.community_id)
+            .await
+            .expect("live schema after row churn");
+        assert_eq!(current_schema, inventory.schema);
+
         let approved = store
             .approve(request.id, "approver-a", Some("reviewed"))
             .await
@@ -2088,6 +2100,20 @@ mod postgres_tests {
             .freeze_destructive_storage_manifest(&token, &inventory.storage)
             .await
             .expect("freeze destructive storage");
+        store
+            .freeze_destructive_storage_manifest(&token, &inventory.storage)
+            .await
+            .expect("identical destructive manifest retry");
+        let mut drifted_storage = inventory.storage.clone();
+        drifted_storage
+            .media_upload_keys
+            .push("media/drifted-after-fence".to_string());
+        assert!(matches!(
+            store
+                .freeze_destructive_storage_manifest(&token, &drifted_storage)
+                .await,
+            Err(DbError::DeletionSafety(_))
+        ));
         store.mark_drained(&token).await.expect("drain");
         store
             .mark_bindings_removed(&token, serde_json::json!({"keys": 0}))
@@ -2136,5 +2162,13 @@ mod postgres_tests {
             .await
             .expect("serving lookup")
             .is_none());
+        let direct_delete = sqlx::query("DELETE FROM communities WHERE id = $1")
+            .bind(request.community_id.as_uuid())
+            .execute(&db.pool)
+            .await
+            .expect_err("tombstone row must be permanent");
+        assert!(direct_delete
+            .to_string()
+            .contains("tombstones are permanent"));
     }
 }
