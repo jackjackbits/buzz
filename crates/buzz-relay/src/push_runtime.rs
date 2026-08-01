@@ -460,7 +460,6 @@ async fn deliver_one(
             return;
         }
     };
-    serving_write.begin_finalize();
     match response {
         Ok(r) if r.status().is_success() => match r.json::<DeliveryResponse>().await {
             Ok(DeliveryResponse::Accepted) => {

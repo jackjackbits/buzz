@@ -1020,6 +1020,11 @@ impl Db {
         sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
     }
 
+    /// Validate the live community-deletion tenant catalog and write fences.
+    pub async fn validate_deletion_catalog(&self) -> Result<()> {
+        self.deletion_store().validate_catalog().await
+    }
+
     /// Returns pool utilisation stats for metrics emission.
     ///
     /// `size`  — total connections (idle + active)
@@ -1646,6 +1651,49 @@ impl Db {
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, bool)> {
         let result = event::insert_event(&self.pool, community_id, event, channel_id).await?;
+        if result.1 {
+            if let Err(e) = insert_mentions(&self.pool, community_id, event, channel_id).await {
+                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
+            }
+        }
+        Ok(result)
+    }
+
+    /// Insert an event while holding the admitted serving-write lease's
+    /// community ordering lock through commit.
+    ///
+    /// External side effects use a durable lease rather than one long-lived DB
+    /// transaction. Their final database mutation must still share the
+    /// acquire/fence advisory-lock order so a fence cannot commit between the
+    /// caller's lease verification and this insert.
+    pub async fn insert_event_with_serving_write_guard(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        channel_id: Option<Uuid>,
+    ) -> Result<(StoredEvent, bool)> {
+        let kind_u16 = event.kind.as_u16();
+        let kind_u32 = u32::from(kind_u16);
+        if kind_u32 == buzz_core::kind::KIND_AUTH {
+            return Err(DbError::AuthEventRejected);
+        }
+        if buzz_core::kind::is_ephemeral(kind_u32) {
+            return Err(DbError::EphemeralEventRejected(kind_u16));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        self.deletion_store()
+            .guard_transaction(&mut tx, community_id)
+            .await?;
+        let result = event::insert_event_with_thread_metadata_tx(
+            &mut tx,
+            community_id,
+            event,
+            channel_id,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
         if result.1 {
             if let Err(e) = insert_mentions(&self.pool, community_id, event, channel_id).await {
                 tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");

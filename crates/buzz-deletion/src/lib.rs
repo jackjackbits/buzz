@@ -116,15 +116,6 @@ impl ServingWriteGuard {
         self.lost.clone()
     }
 
-    /// Begin finalization after the side effect itself has succeeded.
-    ///
-    /// This stops lease renewal without releasing the durable row. Call
-    /// [`Self::finish`] immediately after the result's database finalization so
-    /// deletion cannot overtake the side effect before its outcome is recorded.
-    pub fn begin_finalize(&self) {
-        self.cancel.cancel();
-    }
-
     /// Release the lease after the side effect completes.
     pub async fn finish(mut self) -> Result<()> {
         self.cancel.cancel();
@@ -871,7 +862,19 @@ async fn execute_stage(
                     "approved storage taxonomy drifted before fencing",
                 ));
             }
-            services.store.fence(&token).await?;
+            match services.store.fence(&token).await {
+                Ok(_) => {}
+                Err(buzz_db::DbError::ServingWritesNotDrained {
+                    active_count,
+                    operations,
+                    ..
+                }) => {
+                    return Err(transient(format!(
+                        "serving writes not drained before fence: count={active_count}, operations={operations:?}"
+                    )));
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         DeletionStage::Fenced => {
             services

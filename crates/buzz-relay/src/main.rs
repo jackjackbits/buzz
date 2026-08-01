@@ -201,6 +201,12 @@ async fn main() -> anyhow::Result<()> {
         error!("Failed to ensure partitions: {e}");
     }
 
+    db.validate_deletion_catalog().await.map_err(|e| {
+        error!("Community deletion catalog validation failed: {e}");
+        anyhow::anyhow!("Community deletion catalog is unsafe: {e}")
+    })?;
+    info!("Community deletion catalog and write fences verified");
+
     // Freshness fence probe: cursor pages route to the replica only for
     // history the probe has verified as fully replayed. Deliberately AFTER
     // the migration decision: spawn_fence_probe first verifies the

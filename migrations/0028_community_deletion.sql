@@ -133,24 +133,32 @@ LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE AS $$
     SELECT hashtextextended('buzz-community-deletion:' || target::text, 0)
 $$;
 
-CREATE FUNCTION enforce_community_write_fence() RETURNS TRIGGER
+-- Keep the deletion control plane writable while its target tenant is fenced.
+-- This predicate is the single SQL source of truth used by attachment and live
+-- catalog validation.
+CREATE FUNCTION community_write_fence_excluded_table(target NAME) RETURNS BOOLEAN
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE AS $$
+    SELECT target::TEXT = ANY (ARRAY[
+        'community_deletion_requests',
+        'community_deletion_approvals',
+        'community_deletion_checkpoints',
+        'community_deletion_retention_exceptions',
+        'community_serving_write_leases',
+        'community_deletion_executor_heartbeats'
+    ]::TEXT[])
+$$;
+
+CREATE FUNCTION assert_community_write_allowed(target UUID) RETURNS VOID
 LANGUAGE plpgsql AS $$
 DECLARE
-    target UUID;
     lifecycle TEXT;
     generation BIGINT;
     executor_community TEXT;
     executor_generation TEXT;
 BEGIN
-    IF TG_OP = 'INSERT' THEN
-        target := NEW.community_id;
-    ELSE
-        target := OLD.community_id;
-    END IF;
-
     -- Nullable operator-attribution rows without a tenant are unrelated.
     IF target IS NULL THEN
-        RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+        RETURN;
     END IF;
 
     PERFORM pg_advisory_xact_lock_shared(community_deletion_lock_key(target));
@@ -163,18 +171,43 @@ BEGIN
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
 
+    -- Authorization is evaluated independently for every community checked.
     executor_community := current_setting('buzz.deletion_executor_community', true);
     executor_generation := current_setting('buzz.deletion_fence_generation', true);
-    IF executor_community = target::text
+    IF executor_community = target::TEXT
        AND executor_generation ~ '^[0-9]+$'
        AND executor_generation::BIGINT = generation THEN
-        RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+        RETURN;
     END IF;
 
     IF lifecycle <> 'active' THEN
         RAISE EXCEPTION 'community write fenced: community % generation %', target, generation
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
+END
+$$;
+
+CREATE FUNCTION enforce_community_write_fence() RETURNS TRIGGER
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        PERFORM assert_community_write_allowed(NEW.community_id);
+    ELSIF TG_OP = 'DELETE' THEN
+        PERFORM assert_community_write_allowed(OLD.community_id);
+    ELSIF OLD.community_id IS NOT DISTINCT FROM NEW.community_id THEN
+        PERFORM assert_community_write_allowed(OLD.community_id);
+    ELSIF OLD.community_id IS NULL THEN
+        PERFORM assert_community_write_allowed(NEW.community_id);
+    ELSIF NEW.community_id IS NULL THEN
+        PERFORM assert_community_write_allowed(OLD.community_id);
+    ELSIF OLD.community_id < NEW.community_id THEN
+        PERFORM assert_community_write_allowed(OLD.community_id);
+        PERFORM assert_community_write_allowed(NEW.community_id);
+    ELSE
+        PERFORM assert_community_write_allowed(NEW.community_id);
+        PERFORM assert_community_write_allowed(OLD.community_id);
+    END IF;
+
     RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
 END
 $$;
@@ -224,16 +257,60 @@ CREATE TRIGGER communities_deletion_tombstone
 BEFORE UPDATE OR DELETE ON communities
 FOR EACH ROW EXECUTE FUNCTION enforce_community_tombstone();
 
+-- Attach the universal fence to one community-scoped relation. Future
+-- migrations must invoke this helper explicitly after CREATE/ALTER introduces
+-- community_id; the migration lint enforces that contract.
+CREATE FUNCTION attach_community_write_fence(target REGCLASS) RETURNS VOID
+LANGUAGE plpgsql AS $$
+DECLARE
+    relation_name NAME;
+BEGIN
+    SELECT c.relname
+      INTO relation_name
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.oid = target
+       AND n.nspname = 'public'
+       AND c.relkind IN ('r', 'p')
+       AND NOT c.relispartition;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'community write fence target % is not a public table', target
+            USING ERRCODE = 'wrong_object_type';
+    END IF;
+    IF community_write_fence_excluded_table(relation_name) THEN
+        RETURN;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+         WHERE attrelid = target AND attname = 'community_id' AND NOT attisdropped
+    ) THEN
+        RAISE EXCEPTION 'community write fence target % has no community_id', target
+            USING ERRCODE = 'undefined_column';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+         WHERE tgrelid = target
+           AND tgname = 'community_write_fence_' || relation_name
+           AND NOT tgisinternal
+    ) THEN
+        EXECUTE format(
+            'CREATE TRIGGER %I BEFORE INSERT OR UPDATE OR DELETE ON %s '
+            'FOR EACH ROW EXECUTE FUNCTION enforce_community_write_fence()',
+            'community_write_fence_' || relation_name,
+            target
+        );
+    END IF;
+END
+$$;
+
 -- Attach the universal fence to every existing table carrying community_id,
 -- including deployment-private sidecars whose community_id is provenance.
--- Deletion control-plane tables are excluded: they must remain writable while
--- the target tenant is fenced.
 DO $$
 DECLARE
-    table_name TEXT;
+    target REGCLASS;
 BEGIN
-    FOR table_name IN
-        SELECT c.relname
+    FOR target IN
+        SELECT c.oid::REGCLASS
           FROM pg_class c
           JOIN pg_namespace n ON n.oid = c.relnamespace
           JOIN pg_attribute a ON a.attrelid = c.oid
@@ -242,21 +319,10 @@ BEGIN
            AND NOT c.relispartition
            AND a.attname = 'community_id'
            AND NOT a.attisdropped
-           AND c.relname NOT IN (
-               'community_deletion_requests',
-               'community_deletion_approvals',
-               'community_deletion_checkpoints',
-               'community_deletion_retention_exceptions',
-               'community_serving_write_leases',
-               'community_deletion_executor_heartbeats'
-           )
+           AND NOT community_write_fence_excluded_table(c.relname)
+         ORDER BY c.oid::REGCLASS::TEXT
     LOOP
-        EXECUTE format(
-            'CREATE TRIGGER %I BEFORE INSERT OR UPDATE OR DELETE ON %I '
-            'FOR EACH ROW EXECUTE FUNCTION enforce_community_write_fence()',
-            'community_write_fence_' || table_name,
-            table_name
-        );
+        PERFORM attach_community_write_fence(target);
     END LOOP;
 END
 $$;

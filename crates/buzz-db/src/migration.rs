@@ -495,6 +495,106 @@ mod tests {
             .collect()
     }
 
+    fn migrations_missing_community_write_fence_attachment() -> Vec<String> {
+        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
+        migrations.sort_by_key(|migration| migration.version);
+        migrations
+            .into_iter()
+            .filter(|migration| migration.version > 27)
+            .flat_map(|migration| {
+                let statements = split_sql_statements(migration.sql.as_str());
+                let attachments = statements
+                    .iter()
+                    .filter_map(|statement| {
+                        let normalized = normalize_sql(statement);
+                        if !normalized.contains("attach_community_write_fence(") {
+                            return None;
+                        }
+                        let call = normalized.split_once("attach_community_write_fence(")?.1;
+                        let table = call
+                            .split(')')
+                            .next()?
+                            .trim()
+                            .split("::")
+                            .next()?
+                            .trim_matches(|ch| ch == '\'' || ch == '"')
+                            .rsplit('.')
+                            .next()?
+                            .to_owned();
+                        (!table.is_empty()).then_some(table)
+                    })
+                    .collect::<BTreeSet<_>>();
+                statements.into_iter().filter_map(move |statement| {
+                    let normalized = normalize_sql(&statement);
+                    let table = if normalized.starts_with("create table")
+                        && normalized.contains("community_id")
+                        && !normalized.contains(" partition of ")
+                    {
+                        identifier_after_keyword(&statement, "create table")
+                    } else if normalized.starts_with("alter table")
+                        && normalized.contains("add")
+                        && normalized.contains("community_id")
+                    {
+                        identifier_after_keyword(&statement, "alter table")
+                    } else {
+                        None
+                    }?;
+                    (!attachments.contains(&table)).then(|| {
+                        format!(
+                            "migration {} introduces {table}.community_id without attach_community_write_fence('{table}'::regclass)",
+                            migration.version
+                        )
+                    })
+                })
+            })
+            .collect()
+    }
+
+    fn community_write_fence_attachment_violations(sql: &str) -> Vec<String> {
+        let statements = split_sql_statements(sql);
+        let attachments = statements
+            .iter()
+            .filter_map(|statement| {
+                let normalized = normalize_sql(statement);
+                if !normalized.contains("attach_community_write_fence(") {
+                    return None;
+                }
+                let call = normalized.split_once("attach_community_write_fence(")?.1;
+                let table = call
+                    .split(')')
+                    .next()?
+                    .trim()
+                    .split("::")
+                    .next()?
+                    .trim_matches(|ch| ch == '\'' || ch == '"')
+                    .rsplit('.')
+                    .next()?
+                    .to_owned();
+                (!table.is_empty()).then_some(table)
+            })
+            .collect::<BTreeSet<_>>();
+        statements
+            .into_iter()
+            .filter_map(|statement| {
+                let normalized = normalize_sql(&statement);
+                let table = if normalized.starts_with("create table")
+                    && normalized.contains("community_id")
+                    && !normalized.contains(" partition of ")
+                {
+                    identifier_after_keyword(&statement, "create table")
+                } else if normalized.starts_with("alter table")
+                    && normalized.contains("add")
+                    && normalized.contains("community_id")
+                {
+                    identifier_after_keyword(&statement, "alter table")
+                } else {
+                    None
+                }?;
+                (!attachments.contains(&table)).then_some(table)
+            })
+            .collect()
+    }
+
     fn scoped_constraint_lints(sql: &str, scoped_tables: &BTreeSet<String>) -> Vec<ConstraintLint> {
         let mut constraints = table_constraints(sql, scoped_tables);
         constraints.extend(alter_table_constraints(sql, scoped_tables));
@@ -1014,13 +1114,54 @@ mod tests {
         assert!(deletion.contains("CREATE TABLE community_deletion_retention_exceptions"));
         assert!(deletion.contains("CREATE TABLE community_serving_write_leases"));
         assert!(deletion.contains("CREATE TABLE community_deletion_executor_heartbeats"));
+        assert!(deletion.contains("CREATE FUNCTION assert_community_write_allowed"));
         assert!(deletion.contains("CREATE FUNCTION enforce_community_write_fence"));
+        assert!(deletion.contains("CREATE FUNCTION attach_community_write_fence"));
+        assert!(deletion.contains("community_write_fence_excluded_table"));
         assert!(deletion.contains("CREATE FUNCTION enforce_community_tombstone"));
         assert!(deletion.contains("community tombstones are permanent"));
         assert!(deletion.contains("_operator_global_tables"));
         assert!(deletion.contains("'submitted', 'inventoried', 'approved', 'fenced', 'drained'"));
 >>>>>>> d04e4b503 (feat: add durable community deletion worker)
 >>>>>>> 037fcbdab (feat: add durable community deletion worker)
+    }
+
+    #[test]
+    fn post_deletion_migrations_attach_every_new_community_write_fence() {
+        let violations = migrations_missing_community_write_fence_attachment();
+        assert!(
+            violations.is_empty(),
+            "migrations after 0027 must explicitly attach every new community write fence:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn community_write_fence_attachment_lint_covers_create_and_alter() {
+        let missing = r#"
+            CREATE TABLE created_late (
+                community_id UUID NOT NULL,
+                id UUID NOT NULL
+            );
+            CREATE TABLE altered_late (id UUID NOT NULL);
+            ALTER TABLE altered_late ADD COLUMN community_id UUID NOT NULL;
+        "#;
+        assert_eq!(
+            community_write_fence_attachment_violations(missing),
+            vec!["created_late", "altered_late"]
+        );
+
+        let attached = r#"
+            CREATE TABLE created_late (
+                community_id UUID NOT NULL,
+                id UUID NOT NULL
+            );
+            SELECT attach_community_write_fence('created_late'::regclass);
+            CREATE TABLE altered_late (id UUID NOT NULL);
+            ALTER TABLE altered_late ADD COLUMN community_id UUID NOT NULL;
+            SELECT attach_community_write_fence('altered_late'::regclass);
+        "#;
+        assert!(community_write_fence_attachment_violations(attached).is_empty());
     }
 
     #[test]
@@ -1385,5 +1526,163 @@ mod tests {
             search_expression.contains("ELSE NULL::tsvector"),
             "fresh installs must default non-allowlisted kinds to NULL: {search_expression}"
         );
+
+        let active_a = uuid::Uuid::new_v4();
+        let active_b = uuid::Uuid::new_v4();
+        let to_fence = uuid::Uuid::new_v4();
+        for (community, label) in [
+            (active_a, "active-a"),
+            (active_b, "active-b"),
+            (to_fence, "to-fence"),
+        ] {
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community)
+                .bind(format!("late-fence-{label}-{}.example", community.simple()))
+                .execute(&pool)
+                .await
+                .expect("insert late-table test community");
+        }
+        sqlx::query(
+            "CREATE TABLE late_created_scoped (\
+                 community_id UUID NOT NULL, id BIGINT PRIMARY KEY, value TEXT NOT NULL\
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create late scoped table");
+        sqlx::query("SELECT attach_community_write_fence('late_created_scoped'::regclass)")
+            .execute(&pool)
+            .await
+            .expect("attach late create fence");
+        sqlx::query("CREATE TABLE late_altered_scoped (id BIGINT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .expect("create table before late alter");
+        sqlx::query("ALTER TABLE late_altered_scoped ADD COLUMN community_id UUID NOT NULL")
+            .execute(&pool)
+            .await
+            .expect("add late community id");
+        sqlx::query("SELECT attach_community_write_fence('late_altered_scoped'::regclass)")
+            .execute(&pool)
+            .await
+            .expect("attach late alter fence");
+        let attached: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname FROM pg_trigger trigger \
+             JOIN pg_class c ON c.oid = trigger.tgrelid \
+             JOIN pg_proc procedure ON procedure.oid = trigger.tgfoid \
+             WHERE c.relname IN ('late_created_scoped', 'late_altered_scoped') \
+               AND procedure.proname = 'enforce_community_write_fence' \
+               AND NOT trigger.tgisinternal ORDER BY c.relname",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read late trigger catalog");
+        assert_eq!(attached, vec!["late_altered_scoped", "late_created_scoped"]);
+        let malformed_fence_triggers: i64 = sqlx::query_scalar(
+            "SELECT count(*)::BIGINT FROM pg_trigger trigger \
+             JOIN pg_class c ON c.oid = trigger.tgrelid \
+             JOIN pg_proc procedure ON procedure.oid = trigger.tgfoid \
+             WHERE c.relname IN ('late_created_scoped', 'late_altered_scoped') \
+               AND procedure.proname = 'enforce_community_write_fence' \
+               AND NOT trigger.tgisinternal \
+               AND (trigger.tgenabled <> 'O' OR (trigger.tgtype & 31) <> 31)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("validate late trigger mode and operations");
+        assert_eq!(malformed_fence_triggers, 0);
+
+        sqlx::query(
+            "INSERT INTO late_created_scoped (community_id, id, value) \
+             VALUES ($1, 1, 'same'), ($2, 2, 'source-fenced'), \
+                    ($1, 3, 'destination-fenced'), ($1, 4, 'opposite-a'), \
+                    ($3, 5, 'opposite-b')",
+        )
+        .bind(active_a)
+        .bind(to_fence)
+        .bind(active_b)
+        .execute(&pool)
+        .await
+        .expect("seed late table while communities active");
+        sqlx::query("UPDATE late_created_scoped SET value = 'same-ok' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .expect("same-tenant active update");
+        sqlx::query("UPDATE late_created_scoped SET community_id = $1 WHERE id = 1")
+            .bind(active_b)
+            .execute(&pool)
+            .await
+            .expect("active-to-active update");
+
+        let mut fence_connection = pool.acquire().await.expect("fence connection");
+        sqlx::query("BEGIN")
+            .execute(&mut *fence_connection)
+            .await
+            .expect("begin direct fence");
+        sqlx::query(
+            "SELECT set_config('buzz.deletion_executor_community', $1, true), \
+                    set_config('buzz.deletion_fence_generation', '1', true)",
+        )
+        .bind(to_fence.to_string())
+        .execute(&mut *fence_connection)
+        .await
+        .expect("authorize direct fence");
+        sqlx::query(
+            "UPDATE communities SET deletion_state = 'fenced', \
+                    deletion_fence_generation = 1, archived_at = now() WHERE id = $1",
+        )
+        .bind(to_fence)
+        .execute(&mut *fence_connection)
+        .await
+        .expect("fence test destination");
+        sqlx::query("COMMIT")
+            .execute(&mut *fence_connection)
+            .await
+            .expect("commit direct fence");
+
+        let active_to_fenced =
+            sqlx::query("UPDATE late_created_scoped SET community_id = $1 WHERE id = 3")
+                .bind(to_fence)
+                .execute(&pool)
+                .await
+                .expect_err("active to fenced destination must fail");
+        assert!(active_to_fenced
+            .to_string()
+            .contains("community write fenced"));
+        let fenced_to_active =
+            sqlx::query("UPDATE late_created_scoped SET community_id = $1 WHERE id = 2")
+                .bind(active_a)
+                .execute(&pool)
+                .await
+                .expect_err("fenced source to active destination must fail");
+        assert!(fenced_to_active
+            .to_string()
+            .contains("community write fenced"));
+        let row_locations: Vec<(i64, uuid::Uuid)> = sqlx::query_as(
+            "SELECT id, community_id FROM late_created_scoped WHERE id IN (2, 3) ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("failed moves preserve row location");
+        assert_eq!(row_locations, vec![(2, to_fence), (3, active_a)]);
+
+        let move_a = sqlx::query("UPDATE late_created_scoped SET community_id = $1 WHERE id = 4")
+            .bind(active_b)
+            .execute(&pool);
+        let move_b = sqlx::query("UPDATE late_created_scoped SET community_id = $1 WHERE id = 5")
+            .bind(active_a)
+            .execute(&pool);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (a, b) = tokio::join!(move_a, move_b);
+            a.expect("opposite active move A");
+            b.expect("opposite active move B");
+        })
+        .await
+        .expect("opposite cross-tenant updates must not deadlock");
+
+        sqlx::query("DROP TABLE late_created_scoped, late_altered_scoped")
+            .execute(&pool)
+            .await
+            .expect("drop late-table fixtures");
     }
 }

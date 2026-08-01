@@ -581,8 +581,12 @@ impl DeletionStore {
         })
     }
 
-    /// Build and validate a live PostgreSQL schema inventory.
-    pub async fn inventory_schema(&self, community: CommunityId) -> Result<SchemaManifest> {
+    /// Validate the live scoped-table and write-fence catalog before serving.
+    ///
+    /// This uses the same exact-set checks as deletion inventory but does not
+    /// require a community row. Schema drift therefore fails startup/readiness
+    /// even before an operator submits a deletion request.
+    pub async fn validate_catalog(&self) -> Result<()> {
         let migration_version: i64 = sqlx::query_scalar(
             "SELECT COALESCE(max(version), 0) FROM _sqlx_migrations WHERE success",
         )
@@ -594,12 +598,12 @@ impl DeletionStore {
             )));
         }
 
-        let live_tables = self.live_scoped_tables().await?;
         let expected = EXPECTED_SCOPED_TABLES
             .iter()
             .copied()
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
+        let live_tables = self.live_scoped_tables().await?;
         if live_tables != expected {
             let missing = expected
                 .difference(&live_tables)
@@ -622,16 +626,28 @@ impl DeletionStore {
                 .difference(&fenced_tables)
                 .cloned()
                 .collect::<Vec<_>>();
+            let unknown = fenced_tables
+                .difference(&expected)
+                .cloned()
+                .collect::<Vec<_>>();
             return Err(DbError::DeletionSafety(format!(
-                "community deletion write-fence drift (missing={})",
-                missing.join(",")
+                "community deletion write-fence drift (missing={}, unknown={})",
+                missing.join(","),
+                unknown.join(",")
             )));
         }
+        Ok(())
+    }
 
+    /// Build and validate a live PostgreSQL schema inventory.
+    pub async fn inventory_schema(&self, community: CommunityId) -> Result<SchemaManifest> {
+        self.validate_catalog().await?;
+        let live_tables = self.live_scoped_tables().await?;
+        let fenced_tables = self.live_fenced_tables().await?;
         let _ = community; // counts are intentionally not approval-bound for a live tenant.
         Ok(SchemaManifest {
             revision: CATALOG_REVISION,
-            migration_version,
+            migration_version: EXPECTED_MIGRATION_VERSION,
             scoped_tables: live_tables.into_iter().collect(),
             row_counts: BTreeMap::new(),
             fenced_tables: fenced_tables.into_iter().collect(),
@@ -882,6 +898,23 @@ impl DeletionStore {
             .bind(token.community_id.as_uuid())
             .execute(&mut *tx)
             .await?;
+        let active_serving_writes = sqlx::query(
+            "SELECT count(*)::BIGINT AS active_count, \
+                    COALESCE(array_agg(DISTINCT operation ORDER BY operation), ARRAY[]::TEXT[]) AS operations \
+             FROM community_serving_write_leases \
+             WHERE community_id = $1 AND lease_until >= now()",
+        )
+        .bind(token.community_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        let active_count: i64 = active_serving_writes.try_get("active_count")?;
+        if active_count > 0 {
+            return Err(DbError::ServingWritesNotDrained {
+                community_id: *token.community_id.as_uuid(),
+                active_count,
+                operations: active_serving_writes.try_get("operations")?,
+            });
+        }
         let current_generation: i64 = sqlx::query_scalar(
             "SELECT deletion_fence_generation FROM communities WHERE id = $1 FOR UPDATE",
         )
@@ -1353,6 +1386,11 @@ impl DeletionStore {
         lease_duration: Duration,
     ) -> Result<()> {
         let lease_seconds = i64::try_from(lease_duration.as_secs()).unwrap_or(i64::MAX);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock_shared(community_deletion_lock_key($1))")
+            .bind(lease.community_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
         let lease_until: Option<DateTime<Utc>> = sqlx::query_scalar(
             "UPDATE community_serving_write_leases lease \
              SET lease_until = now() + make_interval(secs => $6), heartbeat_at = now() \
@@ -1361,10 +1399,9 @@ impl DeletionStore {
                AND lease.generation = $4 AND lease.fence_generation = $5 \
                AND lease.lease_until >= now() \
                AND community.id = lease.community_id \
-               AND ((community.deletion_state = 'active' \
-                     AND community.deletion_fence_generation = lease.fence_generation) \
-                    OR (community.deletion_state = 'fenced' \
-                        AND community.deletion_fence_generation = lease.fence_generation + 1)) \
+               AND community.deletion_state = 'active' \
+               AND community.deleted_at IS NULL \
+               AND community.deletion_fence_generation = lease.fence_generation \
              RETURNING lease.lease_until",
         )
         .bind(lease.id)
@@ -1373,11 +1410,13 @@ impl DeletionStore {
         .bind(lease.generation)
         .bind(lease.fence_generation)
         .bind(lease_seconds)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        lease.lease_until = lease_until.ok_or_else(|| {
+        let lease_until = lease_until.ok_or_else(|| {
             DbError::AccessDenied(format!("stale serving write lease {}", lease.id))
         })?;
+        tx.commit().await?;
+        lease.lease_until = lease_until;
         Ok(())
     }
 
@@ -1402,6 +1441,11 @@ impl DeletionStore {
     /// Check that an external side-effect lease and the community's active
     /// lifecycle are still current.
     pub async fn verify_serving_write_lease(&self, lease: &ServingWriteLease) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock_shared(community_deletion_lock_key($1))")
+            .bind(lease.community_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
         let valid: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM community_serving_write_leases lease \
              JOIN communities community ON community.id = lease.community_id \
@@ -1409,19 +1453,18 @@ impl DeletionStore {
                AND lease.generation = $4 AND lease.fence_generation = $5 \
                AND lease.lease_until >= now() \
                AND community.deleted_at IS NULL \
-               AND ((community.deletion_state = 'active' \
-                     AND community.deletion_fence_generation = lease.fence_generation) \
-                    OR (community.deletion_state = 'fenced' \
-                        AND community.deletion_fence_generation = lease.fence_generation + 1)))",
+               AND community.deletion_state = 'active' \
+               AND community.deletion_fence_generation = lease.fence_generation)",
         )
         .bind(lease.id)
         .bind(lease.community_id.as_uuid())
         .bind(&lease.owner)
         .bind(lease.generation)
         .bind(lease.fence_generation)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
         if valid {
+            tx.commit().await?;
             Ok(())
         } else {
             Err(DbError::AccessDenied(format!(
@@ -1472,14 +1515,7 @@ impl DeletionStore {
               AND NOT c.relispartition
               AND a.attname = 'community_id'
               AND NOT a.attisdropped
-              AND c.relname NOT IN (
-                  'community_deletion_requests',
-                  'community_deletion_approvals',
-                  'community_deletion_checkpoints',
-                  'community_deletion_retention_exceptions',
-                  'community_serving_write_leases',
-                  'community_deletion_executor_heartbeats'
-              )
+              AND NOT community_write_fence_excluded_table(c.relname)
             ORDER BY c.relname
             "#,
         )
@@ -1500,6 +1536,12 @@ impl DeletionStore {
               AND NOT trigger.tgisinternal
               AND NOT c.relispartition
               AND procedure.proname = 'enforce_community_write_fence'
+              AND trigger.tgenabled = 'O'
+              AND (trigger.tgtype & 1) = 1
+              AND (trigger.tgtype & 2) = 2
+              AND (trigger.tgtype & 4) = 4
+              AND (trigger.tgtype & 8) = 8
+              AND (trigger.tgtype & 16) = 16
             ORDER BY c.relname
             "#,
         )
@@ -2028,6 +2070,127 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn active_serving_lease_retries_fence_without_lifecycle_change() {
+        let (db, store) = store().await;
+        let (request, _) = inventoried_request(&db, &store).await;
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let claim = store
+            .claim_specific(request.id, "executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim")
+            .expect("won claim");
+        let serving = store
+            .acquire_serving_write_lease(
+                request.community_id,
+                "test_external",
+                "test-owner",
+                DEFAULT_LEASE_DURATION,
+            )
+            .await
+            .expect("serving lease");
+
+        let error = store
+            .fence(&claim.lease)
+            .await
+            .expect_err("active serving lease must make fence retry");
+        assert!(matches!(
+            error,
+            DbError::ServingWritesNotDrained {
+                active_count: 1,
+                ref operations,
+                ..
+            } if operations == &["test_external"]
+        ));
+        let unchanged = store.get(request.id).await.expect("request after retry");
+        assert_eq!(unchanged.stage, DeletionStage::Approved);
+        assert_eq!(unchanged.fence_generation, None);
+        assert!(store
+            .is_serving_active(request.community_id)
+            .await
+            .expect("community remains active"));
+
+        assert!(store
+            .release_serving_write_lease(&serving)
+            .await
+            .expect("release"));
+        let generation = store.fence(&claim.lease).await.expect("retry fence");
+        assert_eq!(generation, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn serving_lease_acquisition_and_fence_have_exactly_one_winner() {
+        let (db, store) = store().await;
+        let (request, _) = inventoried_request(&db, &store).await;
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let claim = store
+            .claim_specific(request.id, "executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim")
+            .expect("won claim");
+
+        let mut lock_holder = db.pool.acquire().await.expect("lock connection");
+        sqlx::query("BEGIN")
+            .execute(&mut *lock_holder)
+            .await
+            .expect("begin lock transaction");
+        sqlx::query("SELECT pg_advisory_xact_lock(community_deletion_lock_key($1))")
+            .bind(request.community_id.as_uuid())
+            .execute(&mut *lock_holder)
+            .await
+            .expect("hold ordering lock");
+
+        let acquire_store = store.clone();
+        let community = request.community_id;
+        let acquire = tokio::spawn(async move {
+            acquire_store
+                .acquire_serving_write_lease(
+                    community,
+                    "race_acquire",
+                    "race-owner",
+                    DEFAULT_LEASE_DURATION,
+                )
+                .await
+        });
+        let fence_store = store.clone();
+        let fence_token = claim.lease.clone();
+        let fence = tokio::spawn(async move { fence_store.fence(&fence_token).await });
+        sqlx::query("COMMIT")
+            .execute(&mut *lock_holder)
+            .await
+            .expect("release ordering lock");
+
+        let lease_result = acquire.await.expect("acquire task");
+        let fence_result = fence.await.expect("fence task");
+        match (lease_result, fence_result) {
+            (Ok(lease), Err(DbError::ServingWritesNotDrained { .. })) => {
+                assert!(store
+                    .is_serving_active(request.community_id)
+                    .await
+                    .expect("active after lease wins"));
+                assert!(store
+                    .release_serving_write_lease(&lease)
+                    .await
+                    .expect("release winner"));
+            }
+            (Err(DbError::AccessDenied(_)), Ok(_)) => {
+                assert!(!store
+                    .is_serving_active(request.community_id)
+                    .await
+                    .expect("fenced after deletion wins"));
+            }
+            other => panic!("invalid acquisition/fence race outcome: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn external_serving_lease_blocks_drain_without_holding_a_pool_connection() {
         let (db, store) = store().await;
         let (request, _) = inventoried_request(&db, &store).await;
@@ -2040,7 +2203,7 @@ mod postgres_tests {
             .await
             .expect("claim")
             .expect("won claim");
-        let mut serving = store
+        let serving = store
             .acquire_serving_write_lease(
                 request.community_id,
                 "test_external",
@@ -2049,31 +2212,26 @@ mod postgres_tests {
             )
             .await
             .expect("serving lease");
-        let generation = store.fence(&claim.lease).await.expect("fence");
-        store
-            .renew_serving_write_lease(&mut serving, DEFAULT_LEASE_DURATION)
-            .await
-            .expect("pre-fence side effect continues heartbeating while fenced");
-        store
-            .verify_serving_write_lease(&serving)
-            .await
-            .expect("pre-fence side effect remains valid while draining");
-        let token = LeaseToken {
-            fence_generation: Some(generation),
-            ..claim.lease
-        };
-        assert!(
-            store.mark_drained(&token).await.is_err(),
-            "fenced deletion must wait for a pre-fence external effect lease"
-        );
+        assert!(matches!(
+            store.fence(&claim.lease).await,
+            Err(DbError::ServingWritesNotDrained { .. })
+        ));
         assert!(store
             .release_serving_write_lease(&serving)
             .await
             .expect("release"));
+        let generation = store
+            .fence(&claim.lease)
+            .await
+            .expect("fence after release");
+        let token = LeaseToken {
+            fence_generation: Some(generation),
+            ..claim.lease
+        };
         store
             .mark_drained(&token)
             .await
-            .expect("drain after release");
+            .expect("drain immediately after successful fence");
     }
 
     #[tokio::test]
