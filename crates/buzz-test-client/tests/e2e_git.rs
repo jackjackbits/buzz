@@ -189,16 +189,62 @@ impl GitS3Probe {
         Self { bucket }
     }
 
-    fn pointer_key(owner: &str, repo: &str) -> String {
+    fn configured_pointer_key(owner: &str, repo: &str) -> Option<String> {
         let repo = repo.strip_suffix(".git").unwrap_or(repo);
-        if let Ok(community) = std::env::var("BUZZ_E2E_GIT_COMMUNITY_ID") {
-            return format!("repos/{community}/{owner}/{repo}/pointer");
+        std::env::var("BUZZ_E2E_GIT_COMMUNITY_ID")
+            .ok()
+            .map(|community| format!("repos/{community}/{owner}/{repo}/pointer"))
+    }
+
+    async fn find_pointer_key(&self, owner: &str, repo: &str) -> Option<String> {
+        if let Some(key) = Self::configured_pointer_key(owner, repo) {
+            return Some(key);
         }
-        format!("repos/{owner}/{repo}/pointer")
+
+        // Git pointers are community-scoped. Discover the exact pointer created
+        // for this random owner/repo rather than probing the obsolete unscoped
+        // `repos/{owner}/{repo}/pointer` layout. The optional env override above
+        // remains useful when a harness already knows the tenant UUID.
+        let repo = repo.strip_suffix(".git").unwrap_or(repo);
+        let suffix = format!("/{owner}/{repo}/pointer");
+        let mut continuation = None;
+        let mut matches = Vec::new();
+        loop {
+            let (page, _) = self
+                .bucket
+                .list_page(
+                    "repos/".to_string(),
+                    None,
+                    continuation.take(),
+                    None,
+                    Some(1000),
+                )
+                .await
+                .expect("list Git pointer namespace");
+            matches.extend(
+                page.contents
+                    .into_iter()
+                    .map(|object| object.key)
+                    .filter(|key| key.ends_with(&suffix)),
+            );
+            if !page.is_truncated {
+                break;
+            }
+            continuation = page.next_continuation_token;
+            assert!(
+                continuation.is_some(),
+                "truncated Git pointer listing must include a continuation token"
+            );
+        }
+        assert!(
+            matches.len() <= 1,
+            "random E2E owner/repo resolved multiple community pointers: {matches:?}"
+        );
+        matches.pop()
     }
 
     async fn pointer(&self, owner: &str, repo: &str) -> Option<PointerSnapshot> {
-        let key = Self::pointer_key(owner, repo);
+        let key = self.find_pointer_key(owner, repo).await?;
         match self.bucket.get_object(&key).await {
             Ok(resp) => {
                 let etag = resp
@@ -225,10 +271,9 @@ impl GitS3Probe {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        panic!(
-            "S3 manifest pointer {} never appeared; git may have fallen back to disk",
-            Self::pointer_key(owner, repo)
-        );
+        let expected = Self::configured_pointer_key(owner, repo)
+            .unwrap_or_else(|| format!("repos/<community>/{owner}/{repo}/pointer"));
+        panic!("S3 manifest pointer {expected} never appeared")
     }
 
     async fn assert_manifest_exists(&self, digest: &str) {

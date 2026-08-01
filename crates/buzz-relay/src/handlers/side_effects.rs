@@ -904,6 +904,27 @@ pub async fn emit_membership_notification(
     actor_pubkey: &[u8],
     notification_kind: u32,
 ) -> anyhow::Result<()> {
+    emit_membership_notification_with_nonce(
+        tenant,
+        state,
+        channel_id,
+        target_pubkey,
+        actor_pubkey,
+        notification_kind,
+        None,
+    )
+    .await
+}
+
+async fn emit_membership_notification_with_nonce(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+    target_pubkey: &[u8],
+    actor_pubkey: &[u8],
+    notification_kind: u32,
+    nonce: Option<&str>,
+) -> anyhow::Result<()> {
     let target_hex = hex::encode(target_pubkey);
     let actor_hex = hex::encode(actor_pubkey);
     let channel_id_str = channel_id.to_string();
@@ -930,8 +951,15 @@ pub async fn emit_membership_notification(
     })
     .to_string();
 
+    let mut tags = vec![p_tag, h_tag];
+    if let Some(nonce) = nonce {
+        tags.push(
+            Tag::parse(["nonce", nonce])
+                .map_err(|e| anyhow::anyhow!("failed to build nonce tag: {e}"))?,
+        );
+    }
     let event = EventBuilder::new(Kind::Custom(notification_kind as u16), content)
-        .tags([p_tag, h_tag])
+        .tags(tags)
         .sign_with_keys(&state.relay_keypair)
         .map_err(|e| anyhow::anyhow!("failed to sign membership notification: {e}"))?;
 
@@ -1604,28 +1632,21 @@ async fn handle_edit_metadata(
                             // Resubscribe connected agents after restore: archiving evicts their
                             // live subscriptions (CLOSED "channel access revoked") and unarchive
                             // otherwise emits no signal that makes a connected agent resubscribe.
-                            // We reuse the member_added notification (44100) purely as a resubscribe
-                            // trigger — no membership actually changed here — because it flows on the
-                            // agent's always-live global membership subscription, the same path
-                            // remove/re-add uses to recover. Humans self-heal via the re-emitted
-                            // kind:39000 discovery, so this is intentionally agent-scoped.
-                            //
-                            // Known limitation: emit_membership_notification builds a created_at=now
-                            // event with no nonce, and insert_event skips fan-out on a duplicate id.
-                            // Four sub-second toggles (archive->unarchive->archive->unarchive) on the
-                            // same channel by the same actor could collide ids and skip a fan-out.
-                            // Not reachable in practice — unarchive has a single human-driven caller;
-                            // the reaper only auto-archives — so we don't engineer around it.
+                            // We reuse member_added (44100) as the existing global resubscribe
+                            // trigger. Each unarchive carries the accepted edit event id as a
+                            // nonce so it cannot collide with the original member-added event (or
+                            // another unarchive) within Nostr's one-second timestamp precision.
                             for member in
                                 state.db.get_members(tenant.community(), channel_id).await?
                             {
-                                if let Err(e) = emit_membership_notification(
+                                if let Err(e) = emit_membership_notification_with_nonce(
                                     tenant,
                                     state,
                                     channel_id,
                                     &member.pubkey,
                                     &actor_bytes,
                                     KIND_MEMBER_ADDED_NOTIFICATION,
+                                    Some(&event.id.to_hex()),
                                 )
                                 .await
                                 {
