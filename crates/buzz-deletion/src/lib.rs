@@ -1456,6 +1456,42 @@ mod tests {
         Some((services, claim))
     }
 
+    fn deletion_test_media_storage() -> Option<Arc<MediaStorage>> {
+        let endpoint = std::env::var("BUZZ_TEST_S3_ENDPOINT")
+            .or_else(|_| std::env::var("BUZZ_S3_ENDPOINT"))
+            .ok()?;
+        let access_key = std::env::var("BUZZ_TEST_S3_ACCESS_KEY")
+            .or_else(|_| std::env::var("BUZZ_S3_ACCESS_KEY"))
+            .ok()?;
+        let secret_key = std::env::var("BUZZ_TEST_S3_SECRET_KEY")
+            .or_else(|_| std::env::var("BUZZ_S3_SECRET_KEY"))
+            .ok()?;
+        let bucket = std::env::var("BUZZ_TEST_S3_BUCKET")
+            .or_else(|_| std::env::var("BUZZ_S3_BUCKET"))
+            .ok()?;
+        Some(Arc::new(
+            MediaStorage::new(&buzz_media::MediaConfig {
+                s3_endpoint: endpoint,
+                s3_access_key: access_key,
+                s3_secret_key: secret_key,
+                s3_bucket: bucket,
+                s3_region: std::env::var("BUZZ_TEST_S3_REGION")
+                    .or_else(|_| std::env::var("BUZZ_S3_REGION"))
+                    .unwrap_or_else(|_| "us-east-1".to_string()),
+                s3_addressing_style: buzz_media::S3AddressingStyle::Path,
+                max_image_bytes: 1,
+                max_gif_bytes: 1,
+                max_video_bytes: 1,
+                max_file_bytes: 1,
+                public_base_url: "http://localhost/media".to_string(),
+                upload_records_enabled: false,
+                upload_ip_header: None,
+                upload_port_header: None,
+            })
+            .expect("construct deletion test media service"),
+        ))
+    }
+
     #[test]
     fn large_storage_work_is_bounded_per_attempt() {
         assert_eq!(STORAGE_DELETE_BATCH_SIZE, 100);
@@ -1464,21 +1500,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_first_object_without_checkpoint_is_checkpointed_and_advanced() {
-        let Some((services, claim)) = claimed_test_deletion("deletion-first-missing").await else {
+    async fn drained_stage_reconciles_first_object_deleted_before_checkpoint() {
+        let Some((mut services, claim)) = claimed_test_deletion("deletion-first-missing").await
+        else {
             return;
         };
-        let object = StorageObject {
-            key: "only-key".to_string(),
-            size: 1,
-            e_tag: Some("etag".to_string()),
+        let Some(media) = deletion_test_media_storage() else {
+            return;
+        };
+        services.media = media;
+
+        let object_key = format!(
+            "_meta/{}/{}.json",
+            claim.request.community_id,
+            "a".repeat(64)
+        );
+        services
+            .media
+            .put(&object_key, b"crash-window", "application/json")
+            .await
+            .expect("seed object");
+        let current = services
+            .media
+            .inspect_current_object(&object_key)
+            .await
+            .expect("inspect seeded object");
+        let CurrentObjectVersion::Present { size, e_tag, .. } = current else {
+            panic!("seeded object must be present");
         };
         let storage = StorageManifest {
             version: 2,
-            tenant_keys: vec![object.key.clone()],
-            tenant_objects: vec![object.clone()],
+            tenant_keys: vec![object_key.clone()],
+            tenant_objects: vec![StorageObject {
+                key: object_key.clone(),
+                size,
+                e_tag,
+            }],
             git_pointer_keys: Vec::new(),
-            media_sidecar_keys: Vec::new(),
+            media_sidecar_keys: vec![object_key.clone()],
             media_upload_keys: Vec::new(),
             retained_shared_cas_keys: Vec::new(),
             unknown_keys: Vec::new(),
@@ -1492,7 +1551,7 @@ mod tests {
         let generation = services.store.fence(&claim.lease).await.expect("fence");
         let token = LeaseToken {
             fence_generation: Some(generation),
-            ..claim.lease
+            ..claim.lease.clone()
         };
         services
             .store
@@ -1500,6 +1559,14 @@ mod tests {
             .await
             .expect("freeze one-object manifest");
         services.store.mark_drained(&token).await.expect("drained");
+
+        // This is the non-atomic boundary under test: S3 committed the delete,
+        // then the worker died before checkpoint_storage_object_removed.
+        services
+            .media
+            .delete(&object_key)
+            .await
+            .expect("simulate committed delete before crash");
         assert!(services
             .store
             .completed_storage_object_keys(&token)
@@ -1507,17 +1574,18 @@ mod tests {
             .expect("initial checkpoints")
             .is_empty());
 
-        assert_eq!(
-            storage_object_action(&object, &CurrentObjectVersion::Missing)
-                .expect("missing delete result reconciles"),
-            StorageObjectAction::AlreadyMissing
-        );
-        let object_key = object.key.clone();
-        services
-            .store
-            .checkpoint_storage_object_removed(&token, &object_key, true)
+        let resumed = ClaimedDeletion {
+            request: services
+                .store
+                .get(token.request_id)
+                .await
+                .expect("reload drained request"),
+            lease: claim.lease,
+        };
+        execute_stage(&services, &resumed, &CancellationToken::new())
             .await
-            .expect("checkpoint missing object");
+            .expect("production Drained stage reconciles missing first object");
+
         assert_eq!(
             services
                 .store
@@ -1526,11 +1594,6 @@ mod tests {
                 .expect("completed checkpoints"),
             std::collections::BTreeSet::from([object_key])
         );
-        services
-            .store
-            .mark_bindings_removed(&token, serde_json::json!({"deleted_keys": 1}))
-            .await
-            .expect("advance after reconciliation");
         assert_eq!(
             services.store.get(token.request_id).await.unwrap().stage,
             DeletionStage::BindingsRemoved
