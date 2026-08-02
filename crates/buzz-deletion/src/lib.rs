@@ -517,16 +517,46 @@ fn storage_taxonomy_matches(approved: &StorageManifest, live: &StorageManifest) 
         && approved.unsupported_version_keys == live.unsupported_version_keys
 }
 
-fn missing_binding_is_resumable(completed_count: usize) -> bool {
-    completed_count > 0
-}
-
 fn storage_object_matches(
     expected: &StorageObject,
     observed_size: u64,
     observed_e_tag: Option<&str>,
 ) -> bool {
     expected.size == observed_size && observed_e_tag == expected.e_tag.as_deref()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageObjectAction {
+    AlreadyMissing,
+    Delete,
+}
+
+fn storage_object_action(
+    expected: &StorageObject,
+    current: &CurrentObjectVersion,
+) -> Result<StorageObjectAction> {
+    match current {
+        CurrentObjectVersion::Missing => Ok(StorageObjectAction::AlreadyMissing),
+        CurrentObjectVersion::Present {
+            version_id: Some(_),
+            ..
+        } => Err(permanent(format!(
+            "unsupported object version after fence: {}",
+            expected.key
+        ))),
+        CurrentObjectVersion::Present {
+            version_id: None,
+            size,
+            e_tag,
+            ..
+        } if storage_object_matches(expected, *size, e_tag.as_deref()) => {
+            Ok(StorageObjectAction::Delete)
+        }
+        CurrentObjectVersion::Present { .. } => Err(permanent(format!(
+            "fenced object binding changed before deletion: {}",
+            expected.key
+        ))),
+    }
 }
 
 async fn build_inventory(
@@ -1003,41 +1033,10 @@ async fn execute_stage(
                 .filter(|object| !completed.contains(&object.key))
                 .take(storage_delete_batch_size())
             {
-                let already_missing = match services
-                    .media
-                    .inspect_current_object(&object.key)
-                    .await?
-                {
-                    CurrentObjectVersion::Missing => {
-                        if !missing_binding_is_resumable(completed.len()) {
-                            return Err(permanent(format!(
-                                    "fenced object binding disappeared before any deletion progress: {}",
-                                    object.key
-                                )));
-                        }
-                        true
-                    }
-                    CurrentObjectVersion::Present {
-                        version_id: Some(_),
-                        ..
-                    } => {
-                        return Err(permanent(format!(
-                            "unsupported object version after fence: {}",
-                            object.key
-                        )))
-                    }
-                    CurrentObjectVersion::Present {
-                        version_id: None,
-                        size,
-                        e_tag,
-                        ..
-                    } => {
-                        if !storage_object_matches(object, size, e_tag.as_deref()) {
-                            return Err(permanent(format!(
-                                "fenced object binding changed before deletion: {}",
-                                object.key
-                            )));
-                        }
+                let current = services.media.inspect_current_object(&object.key).await?;
+                let already_missing = match storage_object_action(object, &current)? {
+                    StorageObjectAction::AlreadyMissing => true,
+                    StorageObjectAction::Delete => {
                         run_guarded_external_step(
                             services,
                             &token,
@@ -1464,30 +1463,78 @@ mod tests {
         assert_eq!(keys, STORAGE_DELETE_BATCH_SIZE);
     }
 
-    #[test]
-    fn storage_delete_batches_resume_from_completed_checkpoints() {
-        let objects = (0..250)
-            .map(|index| StorageObject {
-                key: format!("key-{index:03}"),
-                size: 1,
-                e_tag: Some(format!("etag-{index}")),
-            })
-            .collect::<Vec<_>>();
-        let completed = objects[..100]
-            .iter()
-            .map(|object| object.key.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        let resumed = objects
-            .iter()
-            .filter(|object| !completed.contains(&object.key))
-            .take(STORAGE_DELETE_BATCH_SIZE)
-            .map(|object| object.key.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(resumed.len(), 100);
-        assert_eq!(resumed.first().map(String::as_str), Some("key-100"));
-        assert_eq!(resumed.last().map(String::as_str), Some("key-199"));
-        assert!(missing_binding_is_resumable(completed.len()));
-        assert!(!missing_binding_is_resumable(0));
+    #[tokio::test]
+    async fn missing_first_object_without_checkpoint_is_checkpointed_and_advanced() {
+        let Some((services, claim)) = claimed_test_deletion("deletion-first-missing").await else {
+            return;
+        };
+        let object = StorageObject {
+            key: "only-key".to_string(),
+            size: 1,
+            e_tag: Some("etag".to_string()),
+        };
+        let storage = StorageManifest {
+            version: 2,
+            tenant_keys: vec![object.key.clone()],
+            tenant_objects: vec![object.clone()],
+            git_pointer_keys: Vec::new(),
+            media_sidecar_keys: Vec::new(),
+            media_upload_keys: Vec::new(),
+            retained_shared_cas_keys: Vec::new(),
+            unknown_keys: Vec::new(),
+            unsupported_version_keys: Vec::new(),
+        };
+        services
+            .store
+            .begin_quiescing(&claim.lease)
+            .await
+            .expect("quiesce");
+        let generation = services.store.fence(&claim.lease).await.expect("fence");
+        let token = LeaseToken {
+            fence_generation: Some(generation),
+            ..claim.lease
+        };
+        services
+            .store
+            .freeze_destructive_storage_manifest(&token, &storage)
+            .await
+            .expect("freeze one-object manifest");
+        services.store.mark_drained(&token).await.expect("drained");
+        assert!(services
+            .store
+            .completed_storage_object_keys(&token)
+            .await
+            .expect("initial checkpoints")
+            .is_empty());
+
+        assert_eq!(
+            storage_object_action(&object, &CurrentObjectVersion::Missing)
+                .expect("missing delete result reconciles"),
+            StorageObjectAction::AlreadyMissing
+        );
+        let object_key = object.key.clone();
+        services
+            .store
+            .checkpoint_storage_object_removed(&token, &object_key, true)
+            .await
+            .expect("checkpoint missing object");
+        assert_eq!(
+            services
+                .store
+                .completed_storage_object_keys(&token)
+                .await
+                .expect("completed checkpoints"),
+            std::collections::BTreeSet::from([object_key])
+        );
+        services
+            .store
+            .mark_bindings_removed(&token, serde_json::json!({"deleted_keys": 1}))
+            .await
+            .expect("advance after reconciliation");
+        assert_eq!(
+            services.store.get(token.request_id).await.unwrap().stage,
+            DeletionStage::BindingsRemoved
+        );
     }
 
     #[test]
