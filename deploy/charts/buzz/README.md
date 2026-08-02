@@ -201,9 +201,10 @@ Track application p99 for events/media/Git/workflows alongside the lease gauges;
 investigate rising dead tuples or expired rows before raising worker scale.
 
 Object removal is checkpointed per key and each attempt deletes at most
-`deletionWorker.storageDeleteBatchSize` (default 100). After recorded deletion
-progress, missing keys resume as already-complete; a missing key before any
-checkpoint still blocks as unexplained drift. Changed/versioned keys fail closed.
+`deletionWorker.storageDeleteBatchSize` (default 100). Deletion is resumable
+from durable checkpoints. Missing keys are recorded as `already_missing` and
+processing continues, including the crash window where a DELETE committed
+before its first PostgreSQL checkpoint. Changed/versioned keys fail closed.
 Final verification performs a fresh complete target inventory before advancing.
 
 ## Device pairing relay

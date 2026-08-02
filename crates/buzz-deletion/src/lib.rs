@@ -125,6 +125,11 @@ impl ServingWriteGuard {
         self.lost.clone()
     }
 
+    /// The durable lease token presented to a final database mutation.
+    pub fn lease(&self) -> &buzz_db::deletion::ServingWriteLease {
+        &self.lease
+    }
+
     /// Release the lease after the side effect completes.
     pub async fn finish(mut self) -> Result<()> {
         self.cancel.cancel();
@@ -1379,10 +1384,10 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
 
-    async fn claimed_test_deletion(prefix: &str) -> Option<(Services, ClaimedDeletion)> {
+    async fn claimed_test_deletion(prefix: &str) -> (Services, ClaimedDeletion) {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .ok()?;
+            .expect("BUZZ_TEST_DATABASE_URL or DATABASE_URL is required");
         let pool = sqlx::PgPool::connect(&database_url)
             .await
             .expect("connect deletion engine test DB");
@@ -1453,23 +1458,23 @@ mod tests {
                 .create_pool(Some(deadpool_redis::Runtime::Tokio1))
                 .expect("construct unused Redis pool"),
         };
-        Some((services, claim))
+        (services, claim)
     }
 
-    fn deletion_test_media_storage() -> Option<Arc<MediaStorage>> {
+    fn deletion_test_media_storage() -> Arc<MediaStorage> {
         let endpoint = std::env::var("BUZZ_TEST_S3_ENDPOINT")
             .or_else(|_| std::env::var("BUZZ_S3_ENDPOINT"))
-            .ok()?;
+            .expect("BUZZ_TEST_S3_ENDPOINT or BUZZ_S3_ENDPOINT is required");
         let access_key = std::env::var("BUZZ_TEST_S3_ACCESS_KEY")
             .or_else(|_| std::env::var("BUZZ_S3_ACCESS_KEY"))
-            .ok()?;
+            .expect("BUZZ_TEST_S3_ACCESS_KEY or BUZZ_S3_ACCESS_KEY is required");
         let secret_key = std::env::var("BUZZ_TEST_S3_SECRET_KEY")
             .or_else(|_| std::env::var("BUZZ_S3_SECRET_KEY"))
-            .ok()?;
+            .expect("BUZZ_TEST_S3_SECRET_KEY or BUZZ_S3_SECRET_KEY is required");
         let bucket = std::env::var("BUZZ_TEST_S3_BUCKET")
             .or_else(|_| std::env::var("BUZZ_S3_BUCKET"))
-            .ok()?;
-        Some(Arc::new(
+            .expect("BUZZ_TEST_S3_BUCKET or BUZZ_S3_BUCKET is required");
+        Arc::new(
             MediaStorage::new(&buzz_media::MediaConfig {
                 s3_endpoint: endpoint,
                 s3_access_key: access_key,
@@ -1489,7 +1494,7 @@ mod tests {
                 upload_port_header: None,
             })
             .expect("construct deletion test media service"),
-        ))
+        )
     }
 
     #[test]
@@ -1500,14 +1505,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres and S3-compatible storage"]
     async fn drained_stage_reconciles_first_object_deleted_before_checkpoint() {
-        let Some((mut services, claim)) = claimed_test_deletion("deletion-first-missing").await
-        else {
-            return;
-        };
-        let Some(media) = deletion_test_media_storage() else {
-            return;
-        };
+        let (mut services, claim) = claimed_test_deletion("deletion-first-missing").await;
+        let media = deletion_test_media_storage();
         services.media = media;
 
         let object_key = format!(
@@ -1667,10 +1668,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn final_storage_verification_rejects_late_target_binding() {
-        let Some((services, claim)) = claimed_test_deletion("deletion-late-binding").await else {
-            return;
-        };
+        let (services, claim) = claimed_test_deletion("deletion-late-binding").await;
         let community = claim.request.community_id;
         let late_key = format!("_meta/{community}/{}.json", "a".repeat(64));
         let error = verify_storage_absence_from_objects(
@@ -1689,10 +1689,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn stale_lease_during_failure_recording_is_lost_ownership() {
-        let Some((services, claim)) = claimed_test_deletion("deletion-stale-record").await else {
-            return;
-        };
+        let (services, claim) = claimed_test_deletion("deletion-stale-record").await;
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .expect("test database URL");
@@ -1718,13 +1717,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn serving_guard_cancels_protected_operation_when_heartbeat_is_lost() {
-        let database_url = match std::env::var("BUZZ_TEST_DATABASE_URL")
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-        {
-            Ok(url) => url,
-            Err(_) => return,
-        };
+            .expect("BUZZ_TEST_DATABASE_URL or DATABASE_URL is required");
         let pool = sqlx::PgPool::connect(&database_url)
             .await
             .expect("connect serving guard test DB");
@@ -1764,10 +1761,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn guarded_external_step_rejects_preexisting_heartbeat_loss_without_polling_operation() {
-        let Some((services, claim)) = claimed_test_deletion("deletion-heartbeat").await else {
-            return;
-        };
+        let (services, claim) = claimed_test_deletion("deletion-heartbeat").await;
         let heartbeat_lost = CancellationToken::new();
         heartbeat_lost.cancel();
         let polled = Arc::new(AtomicBool::new(false));
@@ -1798,10 +1794,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn shutdown_during_stage_releases_claim_without_recording_retry() {
-        let Some((services, claim)) = claimed_test_deletion("deletion-shutdown").await else {
-            return;
-        };
+        let (services, claim) = claimed_test_deletion("deletion-shutdown").await;
         let request_id = claim.request.id;
         let retry_count = claim.request.retry_count;
         let shutdown = CancellationToken::new();

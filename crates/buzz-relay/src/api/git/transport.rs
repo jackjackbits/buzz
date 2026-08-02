@@ -2018,13 +2018,13 @@ async fn finalize_push_inner(
                 } else {
                     state
                         .db
-                        .insert_event_with_serving_write_guard(ctx.tenant.community(), &event, None)
+                        .insert_event_with_serving_write_guard(serving_write.lease(), &event, None)
                         .await
                 };
                 #[cfg(not(test))]
                 let insert_result = state
                     .db
-                    .insert_event_with_serving_write_guard(ctx.tenant.community(), &event, None)
+                    .insert_event_with_serving_write_guard(serving_write.lease(), &event, None)
                     .await;
                 match insert_result {
                     Ok((stored, true)) => {

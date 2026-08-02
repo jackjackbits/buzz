@@ -369,6 +369,7 @@ jobs:
           cargo nextest archive \
             --cargo-profile ci \
             -p buzz-db \
+            -p buzz-deletion \
             -p buzz-relay \
             -p buzz-test-client \
             --lib \
@@ -702,6 +703,20 @@ jobs:
           done
           cat /tmp/buzz-relay.log
           exit 1
+      - name: Community deletion production-path regressions
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E '(package(buzz-deletion) and test(/tests::/)) or (package(buzz-relay) and test(/finalize_push_(holds_serving_lease_through_post_cas_publication|db_failure_after_cas_is_not_success_and_releases_lease)/))' \
+            --run-ignored ignored-only
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          BUZZ_TEST_S3_ENDPOINT: http://localhost:9000
+          BUZZ_TEST_S3_ACCESS_KEY: buzz_dev
+          BUZZ_TEST_S3_SECRET_KEY: buzz_dev_secret
+          BUZZ_TEST_S3_BUCKET: buzz-media
+          BUZZ_TEST_S3_REGION: us-east-1
+
       - name: Invite security tests
         run: |
           cargo nextest run \

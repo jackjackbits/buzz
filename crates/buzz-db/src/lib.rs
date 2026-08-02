@@ -1664,19 +1664,19 @@ impl Db {
         Ok(result)
     }
 
-    /// Insert an event while holding the admitted serving-write lease's
-    /// community ordering lock through commit.
+    /// Insert an event while holding and validating an admitted serving-write
+    /// lease under the community ordering lock through commit.
     ///
     /// External side effects use a durable lease rather than one long-lived DB
-    /// transaction. Their final database mutation must still share the
-    /// acquire/fence advisory-lock order so a fence cannot commit between the
-    /// caller's lease verification and this insert.
+    /// transaction. Their final database mutation presents that exact lease so
+    /// it may finish during quiescing without admitting any new serving work.
     pub async fn insert_event_with_serving_write_guard(
         &self,
-        community_id: CommunityId,
+        lease: &deletion::ServingWriteLease,
         event: &nostr::Event,
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, bool)> {
+        let community_id = lease.community_id;
         let kind_u16 = event.kind.as_u16();
         let kind_u32 = u32::from(kind_u16);
         if kind_u32 == buzz_core::kind::KIND_AUTH {
@@ -1688,7 +1688,7 @@ impl Db {
 
         let mut tx = self.pool.begin().await?;
         self.deletion_store()
-            .guard_transaction(&mut tx, community_id)
+            .guard_transaction_with_serving_lease(&mut tx, lease)
             .await?;
         let result = event::insert_event_with_thread_metadata_tx(
             &mut tx,

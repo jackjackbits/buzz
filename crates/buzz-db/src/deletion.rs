@@ -1577,6 +1577,60 @@ impl DeletionStore {
         }
     }
 
+    /// Take the shared community deletion lock inside an existing transaction
+    /// and authorize a final mutation under an already-admitted serving lease.
+    ///
+    /// The lease is checked in the same transaction as the mutation. During
+    /// quiescing, only this exact unexpired lease and fence generation may
+    /// finish; active communities continue to accept the admitted write too.
+    pub async fn guard_transaction_with_serving_lease(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        lease: &ServingWriteLease,
+    ) -> Result<()> {
+        sqlx::query("SELECT pg_advisory_xact_lock_shared(community_deletion_lock_key($1))")
+            .bind(lease.community_id.as_uuid())
+            .execute(&mut **tx)
+            .await?;
+        let valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM community_serving_write_leases lease \
+             JOIN communities community ON community.id = lease.community_id \
+             WHERE lease.id = $1 AND lease.community_id = $2 AND lease.owner = $3 \
+               AND lease.generation = $4 AND lease.fence_generation = $5 \
+               AND lease.lease_until >= now() AND community.deleted_at IS NULL \
+               AND community.deletion_state IN ('active', 'quiescing') \
+               AND community.deletion_fence_generation = lease.fence_generation)",
+        )
+        .bind(lease.id)
+        .bind(lease.community_id.as_uuid())
+        .bind(&lease.owner)
+        .bind(lease.generation)
+        .bind(lease.fence_generation)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !valid {
+            return Err(DbError::AccessDenied(format!(
+                "stale serving write lease {}",
+                lease.id
+            )));
+        }
+        sqlx::query(
+            "SELECT set_config('buzz.serving_write_community', $1, true), \
+                    set_config('buzz.serving_write_lease_id', $2, true), \
+                    set_config('buzz.serving_write_owner', $3, true), \
+                    set_config('buzz.serving_write_generation', $4, true), \
+                    set_config('buzz.serving_write_fence_generation', $5, true)",
+        )
+        .bind(lease.community_id.to_string())
+        .bind(lease.id.to_string())
+        .bind(&lease.owner)
+        .bind(lease.generation.to_string())
+        .bind(lease.fence_generation.to_string())
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     /// Acquire a durable, expiring lease for an external serving side effect.
     ///
     /// The short transaction shares the same advisory lock as the destructive
@@ -1929,13 +1983,14 @@ async fn verify_lease(
 ) -> Result<()> {
     let valid: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM community_deletion_requests \
-         WHERE id = $1 AND stage = $2 AND lease_owner = $3 \
+         WHERE id = $1 AND community_id = $5 AND stage = $2 AND lease_owner = $3 \
            AND lease_generation = $4 AND lease_until >= now() AND blocked_at IS NULL)",
     )
     .bind(token.request_id)
     .bind(stage.to_string())
     .bind(&token.owner)
     .bind(token.generation)
+    .bind(token.community_id.as_uuid())
     .fetch_one(&mut **tx)
     .await?;
     if valid {
@@ -1954,7 +2009,8 @@ async fn verify_lease_and_fence(
     let valid: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM community_deletion_requests request \
          JOIN communities community ON community.id = request.community_id \
-         WHERE request.id = $1 AND request.stage = $2 AND request.lease_owner = $3 \
+         WHERE request.id = $1 AND request.community_id = $6 \
+           AND request.stage = $2 AND request.lease_owner = $3 \
            AND request.lease_generation = $4 AND request.lease_until >= now() \
            AND request.blocked_at IS NULL AND request.fence_generation = $5 \
            AND community.deletion_state IN ('fenced', 'tombstone') \
@@ -1965,6 +2021,7 @@ async fn verify_lease_and_fence(
     .bind(&token.owner)
     .bind(token.generation)
     .bind(fence_generation)
+    .bind(token.community_id.as_uuid())
     .fetch_one(&mut **tx)
     .await?;
     if valid {
@@ -2418,6 +2475,19 @@ mod postgres_tests {
         assert!(
             store.fence(&stale).await.is_err(),
             "stale lease must reject"
+        );
+        let mut wrong_community = claim.lease.clone();
+        wrong_community.community_id = db
+            .ensure_configured_community(&format!(
+                "wrong-lease-community-{}.example",
+                Uuid::new_v4().simple()
+            ))
+            .await
+            .expect("create unrelated community")
+            .id;
+        assert!(
+            store.begin_quiescing(&wrong_community).await.is_err(),
+            "a lease token must remain bound to its durable request community"
         );
 
         store.begin_quiescing(&claim.lease).await.expect("quiesce");
