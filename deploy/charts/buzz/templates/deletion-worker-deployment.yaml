@@ -48,6 +48,7 @@ spec:
             - { name: RELAY_URL, value: {{ .Values.relayUrl | quote }} }
             - { name: BUZZ_DELETION_HEALTH_ADDR, value: {{ printf "0.0.0.0:%v" .Values.deletionWorker.healthPort | quote }} }
             - { name: BUZZ_DELETION_STORAGE_MAX_OBJECTS, value: {{ .Values.deletionWorker.storageMaxObjects | quote }} }
+            - { name: BUZZ_DELETION_STORAGE_DELETE_BATCH_SIZE, value: {{ .Values.deletionWorker.storageDeleteBatchSize | quote }} }
             {{- $s3Endpoint := include "buzz.s3Endpoint" . }}
             {{- if $s3Endpoint }}
             - { name: BUZZ_S3_ENDPOINT, value: {{ $s3Endpoint | quote }} }

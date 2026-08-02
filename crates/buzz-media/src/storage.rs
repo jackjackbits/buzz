@@ -202,6 +202,7 @@ impl MediaStorage {
                 key: object.key,
                 size: object.size,
                 last_modified: object.last_modified,
+                e_tag: object.e_tag,
             }));
             if !result.is_truncated {
                 break;
@@ -216,6 +217,23 @@ impl MediaStorage {
         Ok(objects)
     }
 
+    /// Return the current object identity, including whether it is versioned.
+    pub async fn inspect_current_object(
+        &self,
+        key: &str,
+    ) -> Result<CurrentObjectVersion, MediaError> {
+        match self.bucket.head_object(key).await {
+            Ok((result, _)) => Ok(CurrentObjectVersion::Present {
+                version_id: result.version_id,
+                size: result.content_length.unwrap_or_default().max(0) as u64,
+                last_modified: result.last_modified,
+                e_tag: result.e_tag,
+            }),
+            Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Ok(CurrentObjectVersion::Missing),
+            Err(error) => Err(MediaError::StorageError(error.to_string())),
+        }
+    }
+
     /// Return the current object version id, if the backend reports one.
     ///
     /// V1 refuses to delete versioned tenant bindings because rust-s3 cannot
@@ -225,13 +243,7 @@ impl MediaStorage {
         &self,
         key: &str,
     ) -> Result<CurrentObjectVersion, MediaError> {
-        match self.bucket.head_object(key).await {
-            Ok((result, _)) => Ok(CurrentObjectVersion::Present {
-                version_id: result.version_id,
-            }),
-            Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Ok(CurrentObjectVersion::Missing),
-            Err(error) => Err(MediaError::StorageError(error.to_string())),
-        }
+        self.inspect_current_object(key).await
     }
 
     /// Delete tenant binding keys one at a time and fail on any backend error.
@@ -348,6 +360,12 @@ pub enum CurrentObjectVersion {
     Present {
         /// S3 version id. `Some` is unsupported for V1 deletion.
         version_id: Option<String>,
+        /// Current object size.
+        size: u64,
+        /// Current last-modified timestamp, when supplied.
+        last_modified: Option<String>,
+        /// Current entity tag, when supplied.
+        e_tag: Option<String>,
     },
 }
 
@@ -360,6 +378,8 @@ pub struct DeletionObject {
     pub size: u64,
     /// Backend-reported last modification timestamp.
     pub last_modified: String,
+    /// Backend entity tag, when supplied.
+    pub e_tag: Option<String>,
 }
 
 #[cfg(test)]

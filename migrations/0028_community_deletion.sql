@@ -3,9 +3,15 @@
 -- The community row is never removed: it becomes the permanent name tombstone.
 -- All destructive progress is lease/fence/checkpoint guarded and every existing
 -- community-scoped table receives the same database-enforced write fence.
+-- This migration intentionally remains one atomic catalog change so a failed
+-- deployment cannot expose only a subset of the universal fences. CREATE
+-- TRIGGER takes SHARE ROW EXCLUSIVE on each target; fail quickly rather than
+-- queueing behind long transactions. See the chart deletion rollout runbook.
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE communities
     ADD COLUMN deletion_state TEXT NOT NULL DEFAULT 'active'
-        CHECK (deletion_state IN ('active', 'fenced', 'tombstone')),
+        CHECK (deletion_state IN ('active', 'quiescing', 'fenced', 'tombstone')),
     ADD COLUMN deletion_fence_generation BIGINT NOT NULL DEFAULT 0
         CHECK (deletion_fence_generation >= 0),
     ADD COLUMN deleted_at TIMESTAMPTZ;

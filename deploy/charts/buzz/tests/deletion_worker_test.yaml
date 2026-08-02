@@ -43,7 +43,10 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].readinessProbe.httpGet.path
           value: /_readiness
-      - notExists:
-          path: spec.template.spec.containers[0].env[8].valueFrom.secretKeyRef.optional
+      - equal:
+          path: spec.template.spec.containers[0].env[3].value
+          value: "100"
       - notExists:
           path: spec.template.spec.containers[0].env[9].valueFrom.secretKeyRef.optional
+      - notExists:
+          path: spec.template.spec.containers[0].env[10].valueFrom.secretKeyRef.optional

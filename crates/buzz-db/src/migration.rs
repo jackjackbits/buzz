@@ -1120,6 +1120,8 @@ mod tests {
         assert!(deletion.contains("community_write_fence_excluded_table"));
         assert!(deletion.contains("CREATE FUNCTION enforce_community_tombstone"));
         assert!(deletion.contains("community tombstones are permanent"));
+        assert!(deletion.contains("SET LOCAL lock_timeout = '5s'"));
+        assert!(deletion.contains("'active', 'quiescing', 'fenced', 'tombstone'"));
         assert!(deletion.contains("_operator_global_tables"));
         assert!(deletion.contains("'submitted', 'inventoried', 'approved', 'fenced', 'drained'"));
 >>>>>>> d04e4b503 (feat: add durable community deletion worker)

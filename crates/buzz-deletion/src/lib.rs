@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use buzz_db::deletion::{
     ClaimedDeletion, DeletionRequest, DeletionStage, DeletionStore, FrozenInventory, LeaseToken,
-    StorageManifest, DEFAULT_LEASE_DURATION,
+    StorageManifest, StorageObject, DEFAULT_LEASE_DURATION,
 };
 use buzz_db::{Db, DbConfig};
 use buzz_media::{deletion_inventory, CurrentObjectVersion, MediaStorage};
@@ -22,6 +22,7 @@ const DEFAULT_STORAGE_OBJECT_CAP: u64 = 1_000_000;
 const WORKER_IDLE_POLL: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const STORAGE_DELETE_BATCH_SIZE: usize = 100;
 
 #[cfg(test)]
 static TEST_HEARTBEAT_INTERVAL_MS: AtomicU64 = AtomicU64::new(0);
@@ -111,6 +112,14 @@ impl ServingWriteGuard {
         error.downcast_ref::<ServingWriteLeaseLost>().is_some()
     }
 
+    /// Whether a serving-write acquisition failed because the tenant is fenced.
+    pub fn acquisition_is_fenced(error: &anyhow::Error) -> bool {
+        matches!(
+            error.downcast_ref::<buzz_db::DbError>(),
+            Some(buzz_db::DbError::AccessDenied(_))
+        )
+    }
+
     /// Signal fired if the background lease heartbeat fails.
     pub fn lost(&self) -> CancellationToken {
         self.lost.clone()
@@ -146,6 +155,11 @@ impl Drop for ServingWriteGuard {
 }
 
 /// Acquire a serving-side external-effect lease without holding a pool connection.
+///
+/// A separate short database lease per effect is intentional: it is the only
+/// durable proof that deletion can drain S3/Redis/push work across replicas.
+/// PostgreSQL lease-table churn is reaped and exported by the relay pool-metrics
+/// task; operators should watch the deletion lease gauges documented by Helm.
 pub async fn acquire_serving_write(
     db: &Db,
     community: buzz_core::CommunityId,
@@ -503,6 +517,18 @@ fn storage_taxonomy_matches(approved: &StorageManifest, live: &StorageManifest) 
         && approved.unsupported_version_keys == live.unsupported_version_keys
 }
 
+fn missing_binding_is_resumable(completed_count: usize) -> bool {
+    completed_count > 0
+}
+
+fn storage_object_matches(
+    expected: &StorageObject,
+    observed_size: u64,
+    observed_e_tag: Option<&str>,
+) -> bool {
+    expected.size == observed_size && observed_e_tag == expected.e_tag.as_deref()
+}
+
 async fn build_inventory(
     services: &Services,
     request: &DeletionRequest,
@@ -515,32 +541,52 @@ async fn build_inventory(
     Ok(FrozenInventory { schema, storage })
 }
 
-async fn build_storage_manifest(
+async fn build_storage_manifest_from_objects(
     services: &Services,
     request: &DeletionRequest,
+    objects: Vec<buzz_media::DeletionObject>,
 ) -> Result<StorageManifest> {
-    let max_objects = storage_object_cap();
-    let objects = services.media.list_all_for_deletion(max_objects).await?;
     let bucket = deletion_inventory(
         *request.community_id.as_uuid(),
         objects
             .iter()
             .map(|object| (object.key.clone(), object.size)),
     );
+    let tenant_keys = bucket.tenant_keys();
+    let tenant_key_set = tenant_keys.iter().collect::<std::collections::HashSet<_>>();
+    let tenant_objects = objects
+        .into_iter()
+        .filter(|object| tenant_key_set.contains(&object.key))
+        .map(|object| StorageObject {
+            key: object.key,
+            size: object.size,
+            e_tag: object.e_tag,
+        })
+        .collect::<Vec<_>>();
+    if tenant_objects.iter().any(|object| object.e_tag.is_none()) {
+        return Err(permanent(
+            "object store omitted ETag for a tenant binding; conditional deletion is unavailable",
+        ));
+    }
+    let mut tenant_objects = tenant_objects;
+    tenant_objects.sort();
+
     let mut unsupported_version_keys = Vec::new();
-    for key in bucket.tenant_keys() {
+    for key in &tenant_keys {
         if matches!(
-            services.media.inspect_current_version(&key).await?,
+            services.media.inspect_current_version(key).await?,
             CurrentObjectVersion::Present {
-                version_id: Some(_)
+                version_id: Some(_),
+                ..
             }
         ) {
-            unsupported_version_keys.push(key);
+            unsupported_version_keys.push(key.clone());
         }
     }
     let storage = StorageManifest {
-        version: 1,
-        tenant_keys: bucket.tenant_keys(),
+        version: 2,
+        tenant_keys,
+        tenant_objects,
         git_pointer_keys: bucket.git_pointer_keys,
         media_sidecar_keys: bucket.media_sidecar_keys,
         media_upload_keys: bucket.media_upload_keys,
@@ -550,6 +596,17 @@ async fn build_storage_manifest(
     };
     buzz_db::deletion::validate_storage_manifest(&storage)?;
     Ok(storage)
+}
+
+async fn build_storage_manifest(
+    services: &Services,
+    request: &DeletionRequest,
+) -> Result<StorageManifest> {
+    let objects = services
+        .media
+        .list_all_for_deletion(storage_object_cap())
+        .await?;
+    build_storage_manifest_from_objects(services, request, objects).await
 }
 
 async fn run_loop(
@@ -641,6 +698,28 @@ async fn stop_claim_executor(
     Ok(())
 }
 
+async fn record_stage_failure(
+    services: &Services,
+    token: &LeaseToken,
+    stage: DeletionStage,
+    error: &anyhow::Error,
+) -> Result<bool> {
+    let message = format!("{error:#}");
+    let result = if is_permanent_error(error) {
+        services.store.block(token, stage, "stage", &message).await
+    } else {
+        services
+            .store
+            .record_retry(token, stage, "stage", &message, RETRY_DELAY)
+            .await
+    };
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if buzz_db::deletion::is_stale_deletion_lease(&error) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn execute_claim(
     services: &Services,
     mode: LoopMode,
@@ -677,17 +756,11 @@ async fn execute_claim(
                 {
                     return Ok(run_output(request));
                 }
-                let message = format!("{error:#}");
-                if is_permanent_error(&error) {
-                    services
-                        .store
-                        .block(&token, claim.request.stage, "stage", &message)
-                        .await?;
-                } else {
-                    services
-                        .store
-                        .record_retry(&token, claim.request.stage, "stage", &message, RETRY_DELAY)
-                        .await?;
+                if !record_stage_failure(services, &token, claim.request.stage, &error).await? {
+                    // Ownership expired between the stage failure and durable
+                    // error recording. A successor now owns retry/block policy.
+                    let request = services.store.get(token.request_id).await?;
+                    return Ok(run_output(request));
                 }
                 let request = services.store.get(token.request_id).await?;
                 return Ok(run_output(request));
@@ -862,6 +935,7 @@ async fn execute_stage(
                     "approved storage taxonomy drifted before fencing",
                 ));
             }
+            services.store.begin_quiescing(&token).await?;
             match services.store.fence(&token).await {
                 Ok(_) => {}
                 Err(buzz_db::DbError::ServingWritesNotDrained {
@@ -921,62 +995,98 @@ async fn execute_stage(
                     .context("request has no post-fence destructive storage manifest")?,
             )?;
             buzz_db::deletion::validate_storage_manifest(&storage)?;
-            let live_storage = build_storage_manifest(services, request).await?;
-            if live_storage != storage {
-                return Err(permanent(
-                    "post-fence storage inventory drifted before binding removal",
-                ));
-            }
-            for key in &storage.tenant_keys {
-                match services.media.inspect_current_version(key).await? {
-                    CurrentObjectVersion::Present { version_id: None } => {}
+            let completed = services.store.completed_storage_object_keys(&token).await?;
+            let mut processed = 0usize;
+            for object in storage
+                .tenant_objects
+                .iter()
+                .filter(|object| !completed.contains(&object.key))
+                .take(storage_delete_batch_size())
+            {
+                let already_missing = match services
+                    .media
+                    .inspect_current_object(&object.key)
+                    .await?
+                {
+                    CurrentObjectVersion::Missing => {
+                        if !missing_binding_is_resumable(completed.len()) {
+                            return Err(permanent(format!(
+                                    "fenced object binding disappeared before any deletion progress: {}",
+                                    object.key
+                                )));
+                        }
+                        true
+                    }
                     CurrentObjectVersion::Present {
                         version_id: Some(_),
+                        ..
                     } => {
                         return Err(permanent(format!(
-                            "unsupported object version after fence: {key}"
+                            "unsupported object version after fence: {}",
+                            object.key
                         )))
                     }
-                    CurrentObjectVersion::Missing => {
-                        return Err(permanent(format!(
-                            "fenced object binding disappeared before deletion: {key}"
-                        )))
-                    }
-                }
-            }
-            for key in &storage.tenant_keys {
-                run_guarded_external_step(
-                    services,
-                    &token,
-                    DeletionStage::Drained,
-                    heartbeat_lost,
-                    || async {
-                        services.media.delete(key).await?;
-                        Ok(())
-                    },
-                )
-                .await?;
-                run_guarded_external_step(
-                    services,
-                    &token,
-                    DeletionStage::Drained,
-                    heartbeat_lost,
-                    || async {
-                        if services.media.head(key).await? {
-                            return Err(transient(format!(
-                                "object binding still exists after delete: {key}"
+                    CurrentObjectVersion::Present {
+                        version_id: None,
+                        size,
+                        e_tag,
+                        ..
+                    } => {
+                        if !storage_object_matches(object, size, e_tag.as_deref()) {
+                            return Err(permanent(format!(
+                                "fenced object binding changed before deletion: {}",
+                                object.key
                             )));
                         }
-                        Ok(())
-                    },
-                )
-                .await?;
+                        run_guarded_external_step(
+                            services,
+                            &token,
+                            DeletionStage::Drained,
+                            heartbeat_lost,
+                            || async {
+                                services.media.delete(&object.key).await?;
+                                Ok(())
+                            },
+                        )
+                        .await?;
+                        run_guarded_external_step(
+                            services,
+                            &token,
+                            DeletionStage::Drained,
+                            heartbeat_lost,
+                            || async {
+                                if services.media.head(&object.key).await? {
+                                    return Err(transient(format!(
+                                        "object binding still exists after delete: {}",
+                                        object.key
+                                    )));
+                                }
+                                Ok(())
+                            },
+                        )
+                        .await?;
+                        false
+                    }
+                };
+                services
+                    .store
+                    .checkpoint_storage_object_removed(&token, &object.key, already_missing)
+                    .await?;
+                processed += 1;
+            }
+
+            let completed_count = completed.len().saturating_add(processed);
+            if completed_count < storage.tenant_objects.len() {
+                return Err(transient(format!(
+                    "storage deletion batch complete: {completed_count}/{}",
+                    storage.tenant_objects.len()
+                )));
             }
             services
                 .store
                 .mark_bindings_removed(
                     &token,
-                    serde_json::json!({"deleted_keys": storage.tenant_keys.len()}),
+                    serde_json::json!({"deleted_keys": storage.tenant_objects.len()}),
                 )
                 .await?;
         }
@@ -1046,21 +1156,29 @@ fn token_with_current_fence(token: &LeaseToken, request: &DeletionRequest) -> Le
     }
 }
 
-async fn verify_storage_absence(services: &Services, request: &DeletionRequest) -> Result<()> {
-    let storage: StorageManifest = serde_json::from_value(
-        request
-            .destructive_storage_manifest
-            .clone()
-            .context("request has no post-fence destructive storage manifest")?,
-    )?;
-    for key in &storage.tenant_keys {
-        if services.media.head(key).await? {
-            return Err(transient(format!(
-                "logical verification found object binding: {key}"
-            )));
-        }
+async fn verify_storage_absence_from_objects(
+    services: &Services,
+    request: &DeletionRequest,
+    objects: Vec<buzz_media::DeletionObject>,
+) -> Result<()> {
+    let live = build_storage_manifest_from_objects(services, request, objects).await?;
+    if live.tenant_keys.is_empty() {
+        Ok(())
+    } else {
+        Err(transient(format!(
+            "logical verification found {} live target object binding(s); first={}",
+            live.tenant_keys.len(),
+            live.tenant_keys.first().map_or("<none>", String::as_str)
+        )))
     }
-    Ok(())
+}
+
+async fn verify_storage_absence(services: &Services, request: &DeletionRequest) -> Result<()> {
+    let objects = services
+        .media
+        .list_all_for_deletion(storage_object_cap())
+        .await?;
+    verify_storage_absence_from_objects(services, request, objects).await
 }
 
 async fn publish_disconnect_community(
@@ -1162,6 +1280,15 @@ fn storage_object_cap() -> u64 {
         .and_then(|value| value.parse().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_STORAGE_OBJECT_CAP)
+}
+
+fn storage_delete_batch_size() -> usize {
+    std::env::var("BUZZ_DELETION_STORAGE_DELETE_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(10_000))
+        .unwrap_or(STORAGE_DELETE_BATCH_SIZE)
 }
 
 fn default_executor_id() -> String {
@@ -1278,8 +1405,9 @@ mod tests {
                 .await
                 .expect("inventory schema"),
             storage: StorageManifest {
-                version: 1,
+                version: 2,
                 tenant_keys: Vec::new(),
+                tenant_objects: Vec::new(),
                 git_pointer_keys: Vec::new(),
                 media_sidecar_keys: Vec::new(),
                 media_upload_keys: Vec::new(),
@@ -1327,6 +1455,51 @@ mod tests {
                 .expect("construct unused Redis pool"),
         };
         Some((services, claim))
+    }
+
+    #[test]
+    fn large_storage_work_is_bounded_per_attempt() {
+        assert_eq!(STORAGE_DELETE_BATCH_SIZE, 100);
+        let keys = (0..1_000_000).take(STORAGE_DELETE_BATCH_SIZE).count();
+        assert_eq!(keys, STORAGE_DELETE_BATCH_SIZE);
+    }
+
+    #[test]
+    fn storage_delete_batches_resume_from_completed_checkpoints() {
+        let objects = (0..250)
+            .map(|index| StorageObject {
+                key: format!("key-{index:03}"),
+                size: 1,
+                e_tag: Some(format!("etag-{index}")),
+            })
+            .collect::<Vec<_>>();
+        let completed = objects[..100]
+            .iter()
+            .map(|object| object.key.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let resumed = objects
+            .iter()
+            .filter(|object| !completed.contains(&object.key))
+            .take(STORAGE_DELETE_BATCH_SIZE)
+            .map(|object| object.key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(resumed.len(), 100);
+        assert_eq!(resumed.first().map(String::as_str), Some("key-100"));
+        assert_eq!(resumed.last().map(String::as_str), Some("key-199"));
+        assert!(missing_binding_is_resumable(completed.len()));
+        assert!(!missing_binding_is_resumable(0));
+    }
+
+    #[test]
+    fn object_identity_rejects_replacement_but_accepts_exact_match() {
+        let expected = StorageObject {
+            key: "tenant/key".to_string(),
+            size: 42,
+            e_tag: Some("etag-a".to_string()),
+        };
+        assert!(storage_object_matches(&expected, 42, Some("etag-a")));
+        assert!(!storage_object_matches(&expected, 42, Some("etag-b")));
+        assert!(!storage_object_matches(&expected, 42, None));
     }
 
     #[test]
@@ -1381,6 +1554,57 @@ mod tests {
             (0, vec!["buzz:tenant:late".to_string()]),
         ]));
         assert!(scan_proves_absence(&[(9, Vec::new()), (0, Vec::new())]));
+    }
+
+    #[tokio::test]
+    async fn final_storage_verification_rejects_late_target_binding() {
+        let Some((services, claim)) = claimed_test_deletion("deletion-late-binding").await else {
+            return;
+        };
+        let community = claim.request.community_id;
+        let late_key = format!("_meta/{community}/{}.json", "a".repeat(64));
+        let error = verify_storage_absence_from_objects(
+            &services,
+            &claim.request,
+            vec![buzz_media::DeletionObject {
+                key: late_key.clone(),
+                size: 7,
+                last_modified: "2026-08-02T00:00:00Z".to_string(),
+                e_tag: Some("etag".to_string()),
+            }],
+        )
+        .await
+        .expect_err("late target binding must fail verification");
+        assert!(format!("{error:#}").contains(&late_key));
+    }
+
+    #[tokio::test]
+    async fn stale_lease_during_failure_recording_is_lost_ownership() {
+        let Some((services, claim)) = claimed_test_deletion("deletion-stale-record").await else {
+            return;
+        };
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .expect("test database URL");
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect stale-record test DB");
+        sqlx::query(
+            "UPDATE community_deletion_requests SET lease_until = now() - interval '1 second' WHERE id = $1",
+        )
+        .bind(claim.request.id)
+        .execute(&pool)
+        .await
+        .expect("expire claim");
+        let recorded = record_stage_failure(
+            &services,
+            &claim.lease,
+            claim.request.stage,
+            &transient("test failure"),
+        )
+        .await
+        .expect("stale ownership is not fatal");
+        assert!(!recorded);
     }
 
     #[tokio::test]

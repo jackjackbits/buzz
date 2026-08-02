@@ -3244,6 +3244,7 @@ mod tests {
             .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1
         let pool = sqlx::PgPool::connect(&url).await.expect("connect test DB");
         let db = buzz_db::Db::from_pool(pool);
+        db.migrate().await.expect("migrate test DB");
         let store = buzz_deletion::store(&db);
 
         let host = format!("lane3-fence-{}.example", Uuid::new_v4().simple());
@@ -3272,8 +3273,9 @@ mod tests {
                 .await
                 .expect("schema inventory"),
             storage: StorageManifest {
-                version: 1,
+                version: 2,
                 tenant_keys: Vec::new(),
+                tenant_objects: Vec::new(),
                 git_pointer_keys: Vec::new(),
                 media_sidecar_keys: Vec::new(),
                 media_upload_keys: Vec::new(),
@@ -3295,6 +3297,7 @@ mod tests {
             .await
             .expect("claim")
             .expect("won claim");
+        store.begin_quiescing(&claim.lease).await.expect("quiesce");
         store.fence(&claim.lease).await.expect("fence");
 
         match map_serving_fence_state(store.is_serving_active(community).await) {

@@ -1020,7 +1020,12 @@ impl Db {
         sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
     }
 
-    /// Validate the live community-deletion tenant catalog and write fences.
+    /// Validate the minimum deletion fence catalog required by serving paths.
+    pub async fn validate_deletion_serving_catalog(&self) -> Result<()> {
+        self.deletion_store().validate_serving_catalog().await
+    }
+
+    /// Validate the exact live community-deletion tenant catalog for destruction.
     pub async fn validate_deletion_catalog(&self) -> Result<()> {
         self.deletion_store().validate_catalog().await
     }

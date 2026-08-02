@@ -379,7 +379,7 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
         let (pg_ok, redis_ok, deletion_catalog_ok) = tokio::join!(
             state.db.ping(),
             async { state.redis_pool.get().await.is_ok() },
-            async { state.db.validate_deletion_catalog().await.is_ok() },
+            async { state.db.validate_deletion_serving_catalog().await.is_ok() },
         );
         (pg_ok, redis_ok, deletion_catalog_ok)
     };

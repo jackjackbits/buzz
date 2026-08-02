@@ -283,6 +283,19 @@ async fn upload_attribution(
     })
 }
 
+fn serving_write_error(error: anyhow::Error) -> MediaError {
+    if buzz_deletion::ServingWriteGuard::acquisition_is_fenced(&error) {
+        MediaError::CommunityWriteFenced
+    } else {
+        MediaError::ServiceUnavailable
+    }
+}
+
+fn serving_lease_lost(error: anyhow::Error) -> MediaError {
+    tracing::warn!(%error, "media serving-write lease lost");
+    MediaError::ServiceUnavailable
+}
+
 /// PUT `/upload` or the temporary media-only `/media/upload` alias.
 ///
 /// Auth is validated via the [`AuthenticatedUpload`] extractor BEFORE the body
@@ -313,7 +326,7 @@ pub async fn upload_blob(
     let serving_write =
         buzz_deletion::acquire_serving_write(&state.db, auth.tenant.community(), "media_upload")
             .await
-            .map_err(|_| MediaError::RelayMembershipRequired)?;
+            .map_err(serving_write_error)?;
 
     if auth.route_mode == UploadRouteMode::LegacyMedia {
         metrics::counter!("buzz_media_legacy_upload_route_total").increment(1);
@@ -340,10 +353,7 @@ pub async fn upload_blob(
     }
     let replay = futures_util::stream::iter(replay_chunks.into_iter().map(Ok)).chain(source);
 
-    serving_write
-        .verify()
-        .await
-        .map_err(|_| MediaError::RelayMembershipRequired)?;
+    serving_write.verify().await.map_err(serving_lease_lost)?;
 
     let mut descriptor = serving_write
         .protect(async {
@@ -415,7 +425,7 @@ pub async fn upload_blob(
         .await
         .map_err(|error| {
             if buzz_deletion::ServingWriteGuard::is_lease_lost(&error) {
-                MediaError::RelayMembershipRequired
+                serving_lease_lost(error)
             } else {
                 match error.downcast::<MediaError>() {
                     Ok(error) => error,
@@ -466,10 +476,7 @@ pub async fn upload_blob(
         }
     }
 
-    serving_write
-        .finish()
-        .await
-        .map_err(|_| MediaError::RelayMembershipRequired)?;
+    serving_write.finish().await.map_err(serving_lease_lost)?;
     Ok(Json(descriptor))
 }
 
@@ -941,6 +948,20 @@ mod tests {
     use uuid::Uuid;
 
     const VALID_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    #[test]
+    fn serving_write_error_taxonomy_separates_fence_from_backend_failure() {
+        let fenced = anyhow::Error::from(buzz_db::DbError::AccessDenied("fenced".to_string()));
+        assert!(matches!(
+            serving_write_error(fenced),
+            MediaError::CommunityWriteFenced
+        ));
+        let backend = anyhow::Error::from(buzz_db::DbError::Sqlx(sqlx::Error::PoolTimedOut));
+        assert!(matches!(
+            serving_write_error(backend),
+            MediaError::ServiceUnavailable
+        ));
+    }
 
     #[test]
     fn upload_routes_distinguish_standard_and_legacy_modes() {

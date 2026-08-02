@@ -2339,8 +2339,9 @@ mod track_c_tests {
                 .await
                 .expect("schema inventory"),
             storage: StorageManifest {
-                version: 1,
+                version: 2,
                 tenant_keys: Vec::new(),
+                tenant_objects: Vec::new(),
                 git_pointer_keys: Vec::new(),
                 media_sidecar_keys: Vec::new(),
                 media_upload_keys: Vec::new(),
@@ -2454,6 +2455,12 @@ mod track_c_tests {
             tokio::spawn(async move { finalize_push_inner(&finalize_state, ctx, &hooks).await });
 
         gate.reached.notified().await;
+        state
+            .db
+            .deletion_store()
+            .begin_quiescing(&claim.lease)
+            .await
+            .expect("quiesce after CAS");
         let error = state
             .db
             .deletion_store()
@@ -2464,12 +2471,12 @@ mod track_c_tests {
             error,
             buzz_db::DbError::ServingWritesNotDrained { .. }
         ));
-        assert!(state
+        assert!(!state
             .db
             .deletion_store()
             .is_serving_active(community)
             .await
-            .expect("community remains active"));
+            .expect("quiescing rejects new serving work"));
 
         gate.resume.notify_one();
         let response = finalize.await.expect("finalize task");
