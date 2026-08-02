@@ -998,8 +998,10 @@ mod tests {
         let owner = test_pubkey();
         let transferee = test_pubkey();
 
-        // Give the transferee 3 communities (the max).
-        for _ in 0..3 {
+        // Give the transferee the maximum number of communities. Seed from
+        // the same limit the production path enforces so this remains correct
+        // when the operator default changes.
+        for _ in 0..max_communities_per_owner() {
             let c = make_test_community(&pool).await;
             bootstrap_owner(&pool, c, &transferee)
                 .await
