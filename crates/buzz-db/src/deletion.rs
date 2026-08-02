@@ -836,23 +836,34 @@ impl DeletionStore {
         note: Option<&str>,
     ) -> Result<DeletionRequest> {
         let mut tx = self.pool.begin().await?;
-        let digest: Vec<u8> = sqlx::query_scalar(
-            "SELECT inventory_digest FROM community_deletion_requests \
-             WHERE id = $1 AND stage = 'inventoried' AND blocked_at IS NULL FOR UPDATE",
-        )
-        .bind(request_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| {
-            DbError::DeletionSafety(format!(
-                "deletion {request_id} is not an unblocked inventoried request"
-            ))
-        })?;
+        let (community_id, digest, inventory_manifest): (Uuid, Vec<u8>, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT community_id, inventory_digest, inventory_manifest \
+                 FROM community_deletion_requests \
+                 WHERE id = $1 AND stage = 'inventoried' AND blocked_at IS NULL FOR UPDATE",
+            )
+            .bind(request_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                DbError::DeletionSafety(format!(
+                    "deletion {request_id} is not an unblocked inventoried request"
+                ))
+            })?;
+        let inventory: FrozenInventory = serde_json::from_value(inventory_manifest)?;
+        let recomputed_digest = inventory.digest()?;
+        if digest.as_slice() != recomputed_digest {
+            return Err(DbError::DeletionSafety(format!(
+                "deletion {request_id} frozen inventory digest does not match its manifest"
+            )));
+        }
         sqlx::query(
             "INSERT INTO community_deletion_approvals \
-             (request_id, inventory_digest, approved_by, note) VALUES ($1, $2, $3, $4)",
+             (request_id, community_id, inventory_digest, approved_by, note) \
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(request_id)
+        .bind(community_id)
         .bind(&digest)
         .bind(approved_by)
         .bind(note)
@@ -902,15 +913,19 @@ impl DeletionStore {
         let row = sqlx::query(
             r#"
             WITH candidate AS (
-                SELECT id
-                FROM community_deletion_requests
-                WHERE ($1::uuid IS NULL OR id = $1)
-                  AND stage IN ('approved', 'fenced', 'drained', 'bindings_removed',
+                SELECT request.id
+                FROM community_deletion_requests request
+                JOIN community_deletion_approvals approval
+                  ON approval.request_id = request.id
+                 AND approval.community_id = request.community_id
+                 AND approval.inventory_digest = request.inventory_digest
+                WHERE ($1::uuid IS NULL OR request.id = $1)
+                  AND request.stage IN ('approved', 'fenced', 'drained', 'bindings_removed',
                                 'postgres_purged', 'cache_purged', 'logically_verified')
-                  AND blocked_at IS NULL
-                  AND next_attempt_at <= now()
-                  AND (lease_until IS NULL OR lease_until < now())
-                ORDER BY created_at, id
+                  AND request.blocked_at IS NULL
+                  AND request.next_attempt_at <= now()
+                  AND (request.lease_until IS NULL OR request.lease_until < now())
+                ORDER BY request.created_at, request.id
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )
@@ -971,10 +986,17 @@ impl DeletionStore {
         let lease_seconds = i64::try_from(lease_duration.as_secs()).unwrap_or(i64::MAX);
         let mut tx = self.pool.begin().await?;
         let affected = sqlx::query(
-            "UPDATE community_deletion_requests \
+            "UPDATE community_deletion_requests request \
              SET lease_until = now() + make_interval(secs => $4), updated_at = now() \
-             WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3 \
-               AND lease_until >= now()",
+             WHERE request.id = $1 AND request.lease_owner = $2 \
+               AND request.lease_generation = $3 AND request.lease_until >= now() \
+               AND request.blocked_at IS NULL \
+               AND request.stage IN ('approved', 'fenced', 'drained', 'bindings_removed', \
+                                      'postgres_purged', 'cache_purged', 'logically_verified') \
+               AND EXISTS (SELECT 1 FROM community_deletion_approvals approval \
+                   WHERE approval.request_id = request.id \
+                     AND approval.community_id = request.community_id \
+                     AND approval.inventory_digest = request.inventory_digest)",
         )
         .bind(token.request_id)
         .bind(&token.owner)
@@ -1982,9 +2004,13 @@ async fn verify_lease(
     stage: DeletionStage,
 ) -> Result<()> {
     let valid: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM community_deletion_requests \
-         WHERE id = $1 AND community_id = $5 AND stage = $2 AND lease_owner = $3 \
-           AND lease_generation = $4 AND lease_until >= now() AND blocked_at IS NULL)",
+        "SELECT EXISTS(SELECT 1 FROM community_deletion_requests request \
+         JOIN community_deletion_approvals approval ON approval.request_id = request.id \
+          AND approval.community_id = request.community_id \
+          AND approval.inventory_digest = request.inventory_digest \
+         WHERE request.id = $1 AND request.community_id = $5 AND request.stage = $2 \
+           AND request.lease_owner = $3 AND request.lease_generation = $4 \
+           AND request.lease_until >= now() AND request.blocked_at IS NULL)",
     )
     .bind(token.request_id)
     .bind(stage.to_string())
@@ -2009,6 +2035,9 @@ async fn verify_lease_and_fence(
     let valid: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM community_deletion_requests request \
          JOIN communities community ON community.id = request.community_id \
+         JOIN community_deletion_approvals approval ON approval.request_id = request.id \
+          AND approval.community_id = request.community_id \
+          AND approval.inventory_digest = request.inventory_digest \
          WHERE request.id = $1 AND request.community_id = $6 \
            AND request.stage = $2 AND request.lease_owner = $3 \
            AND request.lease_generation = $4 AND request.lease_until >= now() \
@@ -2336,7 +2365,7 @@ mod tests {
         let inventory = FrozenInventory {
             schema: SchemaManifest {
                 revision: 1,
-                migration_version: 27,
+                migration_version: EXPECTED_MIGRATION_VERSION,
                 scoped_tables: vec!["events".to_string()],
                 row_counts: BTreeMap::from([("events".to_string(), 3)]),
                 fenced_tables: vec!["events".to_string()],
@@ -2442,9 +2471,11 @@ mod postgres_tests {
 
         let mismatched_insert = sqlx::query(
             "INSERT INTO community_deletion_approvals \
-             (request_id, inventory_digest, approved_by) VALUES ($1, $2, 'tampered')",
+             (request_id, community_id, inventory_digest, approved_by) \
+             VALUES ($1, $2, $3, 'tampered')",
         )
         .bind(request.id)
+        .bind(*request.community_id.as_uuid())
         .bind(vec![0_u8; 32])
         .execute(&db.pool)
         .await;
@@ -2488,6 +2519,109 @@ mod postgres_tests {
             .await
             .expect("claim approved")
             .is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn approved_request_cannot_be_retargeted_rewritten_or_claimed_without_approval() {
+        let (db, store) = store().await;
+        let (request, _) = inventoried_request(&db, &store).await;
+        let other_host = format!("control-{}.example", Uuid::new_v4().simple());
+        let control = db
+            .ensure_configured_community(&other_host)
+            .await
+            .expect("create control community");
+
+        for mutation in [
+            sqlx::query("UPDATE community_deletion_requests SET community_id = $2 WHERE id = $1")
+                .bind(request.id)
+                .bind(*control.id.as_uuid())
+                .execute(&db.pool)
+                .await,
+            sqlx::query("UPDATE community_deletion_requests SET community_host = $2 WHERE id = $1")
+                .bind(request.id)
+                .bind(&other_host)
+                .execute(&db.pool)
+                .await,
+            sqlx::query(
+                "UPDATE community_deletion_requests SET inventory_manifest = '{}'::jsonb WHERE id = $1",
+            )
+            .bind(request.id)
+            .execute(&db.pool)
+            .await,
+            sqlx::query(
+                "UPDATE community_deletion_requests SET storage_manifest = '{}'::jsonb WHERE id = $1",
+            )
+            .bind(request.id)
+            .execute(&db.pool)
+            .await,
+        ] {
+            assert!(mutation.is_err(), "frozen deletion target and inventory must be immutable");
+        }
+
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve request");
+        let claim = store
+            .claim_specific(request.id, "forged-executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim approved request")
+            .expect("approved request is claimable");
+        let approval_delete =
+            sqlx::query("DELETE FROM community_deletion_approvals WHERE request_id = $1")
+                .bind(request.id)
+                .execute(&db.pool)
+                .await;
+        assert!(
+            approval_delete.is_err(),
+            "approval evidence must be immutable"
+        );
+        for approval_update in [
+            "UPDATE community_deletion_approvals SET approved_by = 'forged' WHERE request_id = $1",
+            "UPDATE community_deletion_approvals SET approved_at = now() + interval '1 hour' WHERE request_id = $1",
+            "UPDATE community_deletion_approvals SET note = 'rewritten' WHERE request_id = $1",
+        ] {
+            assert!(
+                sqlx::query(approval_update)
+                    .bind(request.id)
+                    .execute(&db.pool)
+                    .await
+                    .is_err(),
+                "approval evidence updates must be rejected"
+            );
+        }
+        store
+            .verify_execution_token(&claim.lease, DeletionStage::Approved)
+            .await
+            .expect("matching approval keeps lease valid");
+        sqlx::query(
+            "UPDATE community_deletion_requests \
+             SET blocked_at = now(), blocked_reason = 'operator hold' WHERE id = $1",
+        )
+        .bind(request.id)
+        .execute(&db.pool)
+        .await
+        .expect("block claimed request");
+        assert!(
+            store
+                .heartbeat(&claim.lease, "worker", DEFAULT_LEASE_DURATION, false,)
+                .await
+                .is_err(),
+            "blocked requests must not renew destructive leases"
+        );
+
+        let (forged, _) = inventoried_request(&db, &store).await;
+        sqlx::query("UPDATE community_deletion_requests SET stage = 'approved' WHERE id = $1")
+            .bind(forged.id)
+            .execute(&db.pool)
+            .await
+            .expect("forge runnable stage without approval");
+        assert!(store
+            .claim_specific(forged.id, "forged-executor-2", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim forged request")
+            .is_none());
     }
 
     #[tokio::test]

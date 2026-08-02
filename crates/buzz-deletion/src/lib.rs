@@ -564,6 +564,46 @@ fn storage_object_action(
     }
 }
 
+fn validate_frozen_inventory(request: &DeletionRequest) -> Result<FrozenInventory> {
+    let frozen: FrozenInventory = serde_json::from_value(
+        request
+            .inventory_manifest
+            .clone()
+            .ok_or_else(|| permanent("approved request has no frozen inventory"))?,
+    )
+    .map_err(permanent_source)?;
+    let expected_digest = request
+        .inventory_digest
+        .as_deref()
+        .ok_or_else(|| permanent("approved request has no frozen inventory digest"))?;
+    let actual_digest = hex::encode(frozen.digest().map_err(permanent_source)?);
+    if actual_digest != expected_digest {
+        return Err(permanent("approved frozen inventory digest mismatch"));
+    }
+    validate_storage_ownership(request, &frozen.storage)?;
+    Ok(frozen)
+}
+
+fn validate_storage_ownership(request: &DeletionRequest, manifest: &StorageManifest) -> Result<()> {
+    buzz_db::deletion::validate_storage_manifest(manifest)?;
+    let classified = deletion_inventory(
+        *request.community_id.as_uuid(),
+        manifest
+            .tenant_objects
+            .iter()
+            .map(|object| (object.key.clone(), object.size)),
+    );
+    if classified.tenant_keys() != manifest.tenant_keys
+        || !classified.unknown_keys.is_empty()
+        || !classified.retained_shared_cas_keys.is_empty()
+    {
+        return Err(permanent(
+            "storage manifest contains keys not owned by the deletion target",
+        ));
+    }
+    Ok(())
+}
+
 async fn build_inventory(
     services: &Services,
     request: &DeletionRequest,
@@ -952,13 +992,7 @@ async fn execute_stage(
                 .store
                 .inventory_schema(request.community_id)
                 .await?;
-            let frozen: FrozenInventory = serde_json::from_value(
-                request
-                    .inventory_manifest
-                    .clone()
-                    .ok_or_else(|| permanent("approved request has no frozen inventory"))?,
-            )
-            .map_err(permanent_source)?;
+            let frozen = validate_frozen_inventory(request)?;
             if live_schema != frozen.schema {
                 return Err(permanent(
                     "approved structural catalog drifted before fencing",
@@ -1011,7 +1045,7 @@ async fn execute_stage(
                     manifest
                 }
             };
-            buzz_db::deletion::validate_storage_manifest(&destructive)?;
+            validate_storage_ownership(request, &destructive)?;
             if services
                 .store
                 .serving_writes_drained(request.community_id)
@@ -1029,7 +1063,7 @@ async fn execute_stage(
                     .clone()
                     .context("request has no post-fence destructive storage manifest")?,
             )?;
-            buzz_db::deletion::validate_storage_manifest(&storage)?;
+            validate_storage_ownership(request, &storage)?;
             let completed = services.store.completed_storage_object_keys(&token).await?;
             let mut processed = 0usize;
             for object in storage
@@ -1128,12 +1162,7 @@ async fn execute_stage(
                 .await?;
         }
         DeletionStage::LogicallyVerified => {
-            let frozen: FrozenInventory = serde_json::from_value(
-                request
-                    .inventory_manifest
-                    .clone()
-                    .context("request has no frozen inventory")?,
-            )?;
+            let frozen = validate_frozen_inventory(request)?;
             services
                 .store
                 .mark_retention_pending(
@@ -1502,6 +1531,39 @@ mod tests {
         assert_eq!(STORAGE_DELETE_BATCH_SIZE, 100);
         let keys = (0..1_000_000).take(STORAGE_DELETE_BATCH_SIZE).count();
         assert_eq!(keys, STORAGE_DELETE_BATCH_SIZE);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn frozen_inventory_digest_and_storage_ownership_fail_closed() {
+        let (_, claim) = claimed_test_deletion("deletion-integrity").await;
+        assert!(validate_frozen_inventory(&claim.request).is_ok());
+
+        let mut digest_tampered = claim.request.clone();
+        digest_tampered.inventory_manifest = Some(serde_json::json!({
+            "schema": {"revision": 0, "migration_version": 0, "scoped_tables": [], "row_counts": {}, "fenced_tables": []},
+            "storage": {"version": 2, "tenant_keys": [], "tenant_objects": [], "git_pointer_keys": [], "media_sidecar_keys": [], "media_upload_keys": [], "retained_shared_cas_keys": [], "unknown_keys": [], "unsupported_version_keys": []}
+        }));
+        assert!(validate_frozen_inventory(&digest_tampered).is_err());
+
+        let foreign_community = Uuid::new_v4();
+        let foreign_key = format!("_meta/{foreign_community}/{}.json", "a".repeat(64));
+        let foreign_manifest = StorageManifest {
+            version: 2,
+            tenant_keys: vec![foreign_key.clone()],
+            tenant_objects: vec![StorageObject {
+                key: foreign_key,
+                size: 1,
+                e_tag: Some("etag".to_string()),
+            }],
+            git_pointer_keys: Vec::new(),
+            media_sidecar_keys: Vec::new(),
+            media_upload_keys: Vec::new(),
+            retained_shared_cas_keys: Vec::new(),
+            unknown_keys: Vec::new(),
+            unsupported_version_keys: Vec::new(),
+        };
+        assert!(validate_storage_ownership(&claim.request, &foreign_manifest).is_err());
     }
 
     #[tokio::test]

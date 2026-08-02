@@ -1119,7 +1119,7 @@ CREATE TABLE community_deletion_requests (
     completed_at TIMESTAMPTZ,
     CHECK ((blocked_at IS NULL) = (blocked_reason IS NULL)),
     CHECK ((inventory_frozen_at IS NULL) = (inventory_digest IS NULL)),
-    UNIQUE (id, inventory_digest)
+    UNIQUE (id, community_id, inventory_digest)
 );
 CREATE INDEX community_deletion_requests_runnable
     ON community_deletion_requests (next_attempt_at, created_at)
@@ -1131,14 +1131,61 @@ CREATE INDEX community_deletion_requests_lease
 
 CREATE TABLE community_deletion_approvals (
     request_id UUID PRIMARY KEY,
+    community_id UUID NOT NULL,
     inventory_digest BYTEA NOT NULL CHECK (length(inventory_digest) = 32),
     approved_by TEXT NOT NULL,
     note TEXT,
     approved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    FOREIGN KEY (request_id, inventory_digest)
-        REFERENCES community_deletion_requests(id, inventory_digest)
+    FOREIGN KEY (request_id, community_id, inventory_digest)
+        REFERENCES community_deletion_requests(id, community_id, inventory_digest)
         ON DELETE RESTRICT
 );
+
+CREATE FUNCTION prevent_community_deletion_request_retargeting()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.community_id IS DISTINCT FROM OLD.community_id
+        OR NEW.community_host IS DISTINCT FROM OLD.community_host
+    THEN
+        RAISE EXCEPTION 'community deletion target identity is immutable'
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    IF OLD.inventory_frozen_at IS NOT NULL AND (
+        NEW.schema_manifest IS DISTINCT FROM OLD.schema_manifest
+        OR NEW.storage_manifest IS DISTINCT FROM OLD.storage_manifest
+        OR NEW.inventory_manifest IS DISTINCT FROM OLD.inventory_manifest
+        OR NEW.inventory_digest IS DISTINCT FROM OLD.inventory_digest
+        OR NEW.inventory_frozen_at IS DISTINCT FROM OLD.inventory_frozen_at
+    ) THEN
+        RAISE EXCEPTION 'frozen community deletion inventory is immutable'
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER community_deletion_request_retargeting_guard
+BEFORE UPDATE ON community_deletion_requests
+FOR EACH ROW
+EXECUTE FUNCTION prevent_community_deletion_request_retargeting();
+
+CREATE FUNCTION prevent_community_deletion_approval_removal()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'community deletion approval evidence is immutable'
+        USING ERRCODE = 'integrity_constraint_violation';
+END;
+$$;
+
+CREATE TRIGGER community_deletion_approval_removal_guard
+BEFORE UPDATE OR DELETE ON community_deletion_approvals
+FOR EACH ROW
+EXECUTE FUNCTION prevent_community_deletion_approval_removal();
+
 CREATE TABLE community_deletion_checkpoints (
     request_id UUID NOT NULL REFERENCES community_deletion_requests(id) ON DELETE RESTRICT,
     sequence BIGINT GENERATED ALWAYS AS IDENTITY,
