@@ -1118,7 +1118,8 @@ CREATE TABLE community_deletion_requests (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at TIMESTAMPTZ,
     CHECK ((blocked_at IS NULL) = (blocked_reason IS NULL)),
-    CHECK ((inventory_frozen_at IS NULL) = (inventory_digest IS NULL))
+    CHECK ((inventory_frozen_at IS NULL) = (inventory_digest IS NULL)),
+    UNIQUE (id, inventory_digest)
 );
 CREATE INDEX community_deletion_requests_runnable
     ON community_deletion_requests (next_attempt_at, created_at)
@@ -1129,11 +1130,14 @@ CREATE INDEX community_deletion_requests_lease
     ON community_deletion_requests (lease_until) WHERE lease_owner IS NOT NULL;
 
 CREATE TABLE community_deletion_approvals (
-    request_id UUID PRIMARY KEY REFERENCES community_deletion_requests(id) ON DELETE RESTRICT,
+    request_id UUID PRIMARY KEY,
     inventory_digest BYTEA NOT NULL CHECK (length(inventory_digest) = 32),
     approved_by TEXT NOT NULL,
     note TEXT,
-    approved_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    approved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    FOREIGN KEY (request_id, inventory_digest)
+        REFERENCES community_deletion_requests(id, inventory_digest)
+        ON DELETE RESTRICT
 );
 CREATE TABLE community_deletion_checkpoints (
     request_id UUID NOT NULL REFERENCES community_deletion_requests(id) ON DELETE RESTRICT,

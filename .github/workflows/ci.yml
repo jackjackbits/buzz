@@ -707,7 +707,7 @@ jobs:
         run: |
           cargo nextest run \
             --archive-file target/ci/backend-integration-tests.tar.zst \
-            -E '(package(buzz-deletion) and test(/tests::/)) or (package(buzz-relay) and test(/finalize_push_(holds_serving_lease_through_post_cas_publication|db_failure_after_cas_is_not_success_and_releases_lease)/))' \
+            -E '(package(buzz-deletion) and test(/tests::/)) or (package(buzz-db) and test(/deletion::postgres_tests/)) or (package(buzz-relay) and test(/finalize_push_(holds_serving_lease_through_post_cas_publication|db_failure_after_cas_is_not_success_and_releases_lease)/))' \
             --run-ignored ignored-only
         env:
           DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
