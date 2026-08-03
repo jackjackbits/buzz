@@ -1058,6 +1058,7 @@ dependencies = [
  "buzz-core",
  "buzz-db",
  "buzz-media",
+ "chrono",
  "clap",
  "deadpool-redis",
  "hex",

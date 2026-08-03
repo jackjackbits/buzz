@@ -275,37 +275,124 @@ pub struct SchemaManifest {
     pub fenced_tables: Vec<String>,
 }
 
-/// Frozen storage inventory supplied by the object-store adapter.
+/// Frozen storage inventory supplied by the object-store adapter: slim
+/// per-prefix summaries bound to a clean fleet taxonomy sweep. The concrete
+/// key list never lives on the request row — the destructive freeze persists
+/// it as chunked `community_deletion_manifest_keys` rows that must hash to
+/// these digests.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageManifest {
     /// Adapter schema version.
     pub version: i32,
-    /// Every tenant-owned key that will be removed, sorted.
-    pub tenant_keys: Vec<String>,
-    /// Immutable observations used to detect replacement under an approved key.
-    #[serde(default)]
-    pub tenant_objects: Vec<StorageObject>,
-    /// Git pointer keys among tenant keys.
-    pub git_pointer_keys: Vec<String>,
-    /// Media sidecar keys among tenant keys.
-    pub media_sidecar_keys: Vec<String>,
-    /// Media upload-record keys among tenant keys.
-    pub media_upload_keys: Vec<String>,
-    /// Fleet keys unknown to the current taxonomy. Non-empty fails inventory.
+    /// Per-prefix frozen summaries, strictly sorted by prefix.
+    pub prefixes: Vec<PrefixManifest>,
+    /// Clean fleet taxonomy sweep this inventory relied on.
+    pub taxonomy_sweep_id: Uuid,
+    /// Tenant-prefix keys outside the exact writer taxonomy. Non-empty fails.
     pub unknown_keys: Vec<String>,
-    /// Keys whose current object version cannot be safely removed. Non-empty fails.
-    pub unsupported_version_keys: Vec<String>,
 }
 
-/// Frozen observation of one tenant-owned object binding.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct StorageObject {
-    /// Exact bucket key.
-    pub key: String,
-    /// Current object size.
-    pub size: u64,
-    /// Opaque entity tag used to detect object replacement.
-    pub e_tag: Option<String>,
+/// Frozen summary of one community-scoped key prefix.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrefixManifest {
+    /// Exact community-scoped listing prefix.
+    pub prefix: String,
+    /// Objects under the prefix at enumeration time.
+    pub object_count: u64,
+    /// Total object bytes under the prefix at enumeration time.
+    pub total_bytes: u64,
+    /// Hex SHA-256 of the newline-terminated ascending key stream.
+    pub keys_digest: String,
+}
+
+/// One frozen chunk of the destructive key list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestKeyChunk {
+    /// Position in the frozen chunk sequence.
+    pub chunk_no: i64,
+    /// The tenant prefix every key in this chunk lives under.
+    pub prefix: String,
+    /// Strictly ascending keys.
+    pub keys: Vec<String>,
+}
+
+/// One durable fleet-wide object-store taxonomy sweep record.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaxonomySweep {
+    /// Sweep identity bound into storage manifests.
+    pub id: Uuid,
+    /// Listing start time.
+    pub started_at: DateTime<Utc>,
+    /// Record time.
+    pub completed_at: DateTime<Utc>,
+    /// Total objects listed.
+    pub listed_objects: i64,
+    /// Exact count of keys outside the known writer taxonomy.
+    pub unknown_object_count: i64,
+    /// Bounded sample of unknown keys.
+    pub unknown_key_sample: Vec<String>,
+    /// Fleet object cap the sweep ran under.
+    pub object_cap: i64,
+}
+
+type TaxonomySweepRow = (
+    Uuid,
+    DateTime<Utc>,
+    DateTime<Utc>,
+    i64,
+    i64,
+    sqlx::types::Json<Vec<String>>,
+    i64,
+);
+
+/// Streaming SHA-256 over a strictly ascending key stream.
+///
+/// The executor's prefix enumeration and the destructive freeze's chunk
+/// validation both fold keys through this, so "the chunk rows are exactly
+/// the frozen enumeration" reduces to digest equality. Each key is hashed
+/// with a trailing newline so concatenation cannot alias two streams.
+pub struct KeyStreamDigest {
+    hasher: Sha256,
+    last: Option<String>,
+    count: u64,
+}
+
+impl Default for KeyStreamDigest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KeyStreamDigest {
+    /// Start an empty stream.
+    pub fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            last: None,
+            count: 0,
+        }
+    }
+
+    /// Fold the next key. Keys must arrive strictly ascending — S3
+    /// `ListObjectsV2` order — so one out-of-order or duplicate key fails
+    /// closed instead of silently producing a different digest.
+    pub fn fold(&mut self, key: &str) -> Result<()> {
+        if self.last.as_deref().is_some_and(|last| last >= key) {
+            return Err(DbError::DeletionSafety(format!(
+                "storage key stream is not strictly ascending at {key}"
+            )));
+        }
+        self.hasher.update(key.as_bytes());
+        self.hasher.update(b"\n");
+        self.last = Some(key.to_owned());
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Hex digest and key count of everything folded.
+    pub fn finish(self) -> (String, u64) {
+        (hex::encode(self.hasher.finalize()), self.count)
+    }
 }
 
 /// Full frozen inventory approved at the destructive boundary.
@@ -1149,6 +1236,18 @@ impl DeletionStore {
         let mut tx = self.pool.begin().await?;
         verify_lease_and_fence(&mut tx, token, DeletionStage::Fenced, generation).await?;
         validate_storage_manifest(manifest)?;
+        // The chunk rows are the concrete delete list; the freeze commits only
+        // if they hash to the manifest's frozen per-prefix digests. Loading the
+        // full chunk stream is a one-time freeze-boundary cost bounded by the
+        // per-community object cap, not the fleet.
+        let chunks: Vec<(i64, String, sqlx::types::Json<Vec<String>>)> = sqlx::query_as(
+            "SELECT chunk_no, prefix, keys FROM community_deletion_manifest_keys \
+             WHERE request_id = $1 ORDER BY chunk_no",
+        )
+        .bind(token.request_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        validate_manifest_key_chunks(manifest, &chunks)?;
         let affected = sqlx::query(
             "UPDATE community_deletion_requests \
              SET destructive_storage_manifest = COALESCE(destructive_storage_manifest, $4), \
@@ -1174,6 +1273,185 @@ impl DeletionStore {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Remove key chunks left by an interrupted destructive freeze.
+    ///
+    /// The chunk-table guard rejects this once the destructive manifest has
+    /// frozen, so a retried freeze can only rewrite chunks that were never
+    /// bound to a committed manifest.
+    pub async fn clear_manifest_key_chunks(&self, token: &LeaseToken) -> Result<()> {
+        let generation = require_fence_generation(token)?;
+        let mut tx = self.pool.begin().await?;
+        verify_lease_and_fence(&mut tx, token, DeletionStage::Fenced, generation).await?;
+        sqlx::query("DELETE FROM community_deletion_manifest_keys WHERE request_id = $1")
+            .bind(token.request_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Append one immutable chunk of the destructive key list.
+    pub async fn append_manifest_key_chunk(
+        &self,
+        token: &LeaseToken,
+        chunk_no: i64,
+        prefix: &str,
+        keys: &[String],
+    ) -> Result<()> {
+        if keys.is_empty() {
+            return Err(DbError::DeletionSafety(
+                "refusing to persist an empty manifest key chunk".to_string(),
+            ));
+        }
+        let generation = require_fence_generation(token)?;
+        let mut tx = self.pool.begin().await?;
+        verify_lease_and_fence(&mut tx, token, DeletionStage::Fenced, generation).await?;
+        sqlx::query(
+            "INSERT INTO community_deletion_manifest_keys \
+             (request_id, chunk_no, prefix, keys) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(token.request_id)
+        .bind(chunk_no)
+        .bind(prefix)
+        .bind(sqlx::types::Json(keys))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Return the next frozen chunk not yet confirmed deleted, in chunk order.
+    pub async fn next_pending_manifest_chunk(
+        &self,
+        token: &LeaseToken,
+    ) -> Result<Option<ManifestKeyChunk>> {
+        let row: Option<(i64, String, sqlx::types::Json<Vec<String>>)> = sqlx::query_as(
+            "SELECT chunk_no, prefix, keys FROM community_deletion_manifest_keys \
+             WHERE request_id = $1 AND deleted_at IS NULL ORDER BY chunk_no LIMIT 1",
+        )
+        .bind(token.request_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(chunk_no, prefix, keys)| ManifestKeyChunk {
+            chunk_no,
+            prefix,
+            keys: keys.0,
+        }))
+    }
+
+    /// Return `(total, deleted)` chunk counts for one request.
+    pub async fn manifest_chunk_progress(&self, request_id: Uuid) -> Result<(i64, i64)> {
+        sqlx::query_as(
+            "SELECT count(*), count(deleted_at) FROM community_deletion_manifest_keys \
+             WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Stamp one chunk's keys durably removed and checkpoint it atomically.
+    pub async fn mark_manifest_chunk_deleted(
+        &self,
+        token: &LeaseToken,
+        chunk_no: i64,
+        detail: serde_json::Value,
+    ) -> Result<()> {
+        let generation = require_fence_generation(token)?;
+        let mut tx = self.pool.begin().await?;
+        verify_lease_and_fence(&mut tx, token, DeletionStage::Drained, generation).await?;
+        let affected = sqlx::query(
+            "UPDATE community_deletion_manifest_keys SET deleted_at = now() \
+             WHERE request_id = $1 AND chunk_no = $2 AND deleted_at IS NULL",
+        )
+        .bind(token.request_id)
+        .bind(chunk_no)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if affected != 1 {
+            return Err(DbError::DeletionSafety(format!(
+                "manifest key chunk {chunk_no} is missing or already stamped for request {}",
+                token.request_id
+            )));
+        }
+        checkpoint_completed_tx(
+            &mut tx,
+            token,
+            DeletionStage::Drained,
+            &format!("chunk:{chunk_no}"),
+            detail,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record one completed fleet-wide taxonomy sweep.
+    pub async fn record_taxonomy_sweep(
+        &self,
+        started_at: DateTime<Utc>,
+        listed_objects: u64,
+        unknown_object_count: u64,
+        unknown_key_sample: &[String],
+        object_cap: u64,
+    ) -> Result<TaxonomySweep> {
+        let listed = i64::try_from(listed_objects)
+            .map_err(|_| DbError::DeletionSafety("sweep object count overflow".to_string()))?;
+        let unknown = i64::try_from(unknown_object_count)
+            .map_err(|_| DbError::DeletionSafety("sweep unknown count overflow".to_string()))?;
+        let cap = i64::try_from(object_cap)
+            .map_err(|_| DbError::DeletionSafety("sweep object cap overflow".to_string()))?;
+        // completed_at is clamped server-side: the sweeper's clock supplies
+        // started_at, and skew ahead of Postgres would otherwise violate the
+        // completed_at >= started_at check.
+        let (id, completed_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
+            "INSERT INTO storage_taxonomy_sweeps \
+             (started_at, completed_at, listed_objects, unknown_object_count, \
+              unknown_key_sample, object_cap) \
+             VALUES ($1, GREATEST(now(), $1), $2, $3, $4, $5) RETURNING id, completed_at",
+        )
+        .bind(started_at)
+        .bind(listed)
+        .bind(unknown)
+        .bind(sqlx::types::Json(unknown_key_sample))
+        .bind(cap)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(TaxonomySweep {
+            id,
+            started_at,
+            completed_at,
+            listed_objects: listed,
+            unknown_object_count: unknown,
+            unknown_key_sample: unknown_key_sample.to_vec(),
+            object_cap: cap,
+        })
+    }
+
+    /// Return the most recently completed taxonomy sweep, if any.
+    pub async fn latest_taxonomy_sweep(&self) -> Result<Option<TaxonomySweep>> {
+        let row: Option<TaxonomySweepRow> = sqlx::query_as(
+            "SELECT id, started_at, completed_at, listed_objects, unknown_object_count, \
+                    unknown_key_sample, object_cap \
+             FROM storage_taxonomy_sweeps ORDER BY completed_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(id, started_at, completed_at, listed, unknown, sample, cap)| TaxonomySweep {
+                id,
+                started_at,
+                completed_at,
+                listed_objects: listed,
+                unknown_object_count: unknown,
+                unknown_key_sample: sample.0,
+                object_cap: cap,
+            },
+        ))
     }
 
     /// Return whether all pre-fence external side-effect leases have expired or released.
@@ -1223,57 +1501,6 @@ impl DeletionStore {
         .await?;
         tx.commit().await?;
         Ok(())
-    }
-
-    /// Record one completed object-binding deletion checkpoint.
-    pub async fn checkpoint_storage_object_removed(
-        &self,
-        token: &LeaseToken,
-        key: &str,
-        already_missing: bool,
-    ) -> Result<()> {
-        let generation = require_fence_generation(token)?;
-        let mut tx = self.pool.begin().await?;
-        verify_lease_and_fence(&mut tx, token, DeletionStage::Drained, generation).await?;
-        checkpoint_completed_tx(
-            &mut tx,
-            token,
-            DeletionStage::Drained,
-            &storage_checkpoint_key(key),
-            serde_json::json!({"key": key, "already_missing": already_missing}),
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// Return object keys already durably removed in the Drained stage.
-    pub async fn completed_storage_object_keys(
-        &self,
-        token: &LeaseToken,
-    ) -> Result<BTreeSet<String>> {
-        let rows: Vec<serde_json::Value> = sqlx::query_scalar(
-            "SELECT detail FROM community_deletion_checkpoints \
-             WHERE request_id = $1 AND stage = 'drained' AND status = 'completed' \
-               AND unit_key LIKE 'object:%' ORDER BY sequence",
-        )
-        .bind(token.request_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|detail| {
-                detail
-                    .get("key")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-                    .ok_or_else(|| {
-                        DbError::DeletionSafety(format!(
-                            "malformed storage checkpoint for deletion {}",
-                            token.request_id
-                        ))
-                    })
-            })
-            .collect()
     }
 
     /// Mark storage binding removal after adapter verification.
@@ -1428,20 +1655,44 @@ impl DeletionStore {
         Ok(())
     }
 
-    /// Commit the cross-store logical verification checkpoint.
+    /// Commit the cross-store logical verification checkpoint and drop the
+    /// frozen key chunks in the same transaction.
+    ///
+    /// The chunk rows are working data, not audit evidence — per-prefix
+    /// counts, digests, and checkpoint history stay on the request row, and
+    /// the raw key list of a deleted community should not be retained.
+    /// Blocked requests never reach this transition, so their chunks survive
+    /// for resumption or operator inspection.
     pub async fn mark_logically_verified(
         &self,
         token: &LeaseToken,
         detail: serde_json::Value,
     ) -> Result<()> {
-        self.advance_with_checkpoint(
+        let generation = require_fence_generation(token)?;
+        let mut tx = self.pool.begin().await?;
+        verify_lease_and_fence(&mut tx, token, DeletionStage::CachePurged, generation).await?;
+        advance_request_tx(
+            &mut tx,
             token,
             DeletionStage::CachePurged,
             DeletionStage::LogicallyVerified,
+            Some(generation),
+        )
+        .await?;
+        checkpoint_completed_tx(
+            &mut tx,
+            token,
+            DeletionStage::CachePurged,
             "verify_cross_store_absence",
             detail,
         )
-        .await
+        .await?;
+        sqlx::query("DELETE FROM community_deletion_manifest_keys WHERE request_id = $1")
+            .bind(token.request_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Finish logical deletion and enter the physical-expiry pending state.
@@ -1925,45 +2176,50 @@ fn validate_serving_migration_version(migration_version: Option<i64>) -> Result<
     }
 }
 
-/// Fail closed when storage inventory reports unknown or unsupported data.
+/// Fail closed when storage inventory reports unknown or malformed data.
 pub fn validate_storage_manifest(manifest: &StorageManifest) -> Result<()> {
-    if manifest.version != 2 {
+    if manifest.version != 3 {
         return Err(DbError::DeletionSafety(format!(
             "unsupported storage manifest version {}",
             manifest.version
         )));
     }
-    let object_keys = manifest
-        .tenant_objects
-        .iter()
-        .map(|object| object.key.as_str())
-        .collect::<Vec<_>>();
-    let tenant_keys = manifest
-        .tenant_keys
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    if object_keys != tenant_keys {
+    if manifest.prefixes.is_empty() {
         return Err(DbError::DeletionSafety(
-            "storage manifest object observations do not exactly match tenant keys".to_string(),
+            "storage manifest has no tenant prefixes".to_string(),
         ));
     }
     if manifest
-        .tenant_objects
-        .iter()
-        .any(|object| object.e_tag.is_none())
-    {
-        return Err(DbError::DeletionSafety(
-            "storage manifest contains a tenant object without ETag".to_string(),
-        ));
-    }
-    if manifest
-        .tenant_objects
+        .prefixes
         .windows(2)
-        .any(|pair| pair[0].key >= pair[1].key)
+        .any(|pair| pair[0].prefix >= pair[1].prefix)
     {
         return Err(DbError::DeletionSafety(
-            "storage manifest tenant objects are not strictly sorted".to_string(),
+            "storage manifest prefixes are not strictly sorted".to_string(),
+        ));
+    }
+    for prefix in &manifest.prefixes {
+        // An empty prefix would enumerate — and delete — the whole bucket.
+        if prefix.prefix.is_empty() {
+            return Err(DbError::DeletionSafety(
+                "storage manifest contains an empty prefix".to_string(),
+            ));
+        }
+        if prefix.keys_digest.len() != 64
+            || !prefix
+                .keys_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(DbError::DeletionSafety(format!(
+                "storage manifest digest for {} is not lowercase hex sha-256",
+                prefix.prefix
+            )));
+        }
+    }
+    if manifest.taxonomy_sweep_id.is_nil() {
+        return Err(DbError::DeletionSafety(
+            "storage manifest is not bound to a taxonomy sweep".to_string(),
         ));
     }
     if !manifest.unknown_keys.is_empty() {
@@ -1972,11 +2228,68 @@ pub fn validate_storage_manifest(manifest: &StorageManifest) -> Result<()> {
             manifest.unknown_keys.join(",")
         )));
     }
-    if !manifest.unsupported_version_keys.is_empty() {
-        return Err(DbError::DeletionSafety(format!(
-            "unsupported object versions block deletion: {}",
-            manifest.unsupported_version_keys.join(",")
-        )));
+    Ok(())
+}
+
+/// Verify the persisted chunk stream is exactly the frozen enumeration:
+/// contiguous chunk numbers, chunks grouped by manifest prefix order, every
+/// key under its chunk's prefix, and per-prefix digest/count equality.
+fn validate_manifest_key_chunks(
+    manifest: &StorageManifest,
+    chunks: &[(i64, String, sqlx::types::Json<Vec<String>>)],
+) -> Result<()> {
+    let close = |summary: &PrefixManifest, digest: KeyStreamDigest| -> Result<()> {
+        let (hex_digest, count) = digest.finish();
+        if hex_digest != summary.keys_digest || count != summary.object_count {
+            return Err(DbError::DeletionSafety(format!(
+                "frozen key chunks do not match the destructive manifest for prefix {}",
+                summary.prefix
+            )));
+        }
+        Ok(())
+    };
+    let mut remaining = manifest.prefixes.iter();
+    let mut current = remaining.next();
+    let mut digest = KeyStreamDigest::new();
+    for (index, (chunk_no, chunk_prefix, keys)) in chunks.iter().enumerate() {
+        if *chunk_no != i64::try_from(index).unwrap_or(i64::MAX) {
+            return Err(DbError::DeletionSafety(
+                "frozen key chunk sequence has gaps".to_string(),
+            ));
+        }
+        loop {
+            match current {
+                Some(summary) if summary.prefix == *chunk_prefix => break,
+                Some(summary) => {
+                    close(summary, std::mem::take(&mut digest))?;
+                    current = remaining.next();
+                }
+                None => {
+                    return Err(DbError::DeletionSafety(format!(
+                        "frozen key chunk prefix {chunk_prefix} is not in the destructive manifest"
+                    )));
+                }
+            }
+        }
+        if keys.0.is_empty() {
+            return Err(DbError::DeletionSafety(
+                "frozen key chunk is empty".to_string(),
+            ));
+        }
+        for key in &keys.0 {
+            if !key.starts_with(chunk_prefix.as_str()) {
+                return Err(DbError::DeletionSafety(format!(
+                    "frozen key {key} is outside its chunk prefix {chunk_prefix}"
+                )));
+            }
+            digest.fold(key)?;
+        }
+    }
+    if let Some(summary) = current {
+        close(summary, digest)?;
+    }
+    for summary in remaining {
+        close(summary, KeyStreamDigest::new())?;
     }
     Ok(())
 }
@@ -2153,10 +2466,6 @@ async fn checkpoint_failed_tx(
     Ok(())
 }
 
-fn storage_checkpoint_key(key: &str) -> String {
-    format!("object:{}", hex::encode(Sha256::digest(key.as_bytes())))
-}
-
 fn serialize_community_id<S>(
     community: &CommunityId,
     serializer: S,
@@ -2232,16 +2541,25 @@ fn bound_text(input: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn empty_prefix(prefix: &str) -> PrefixManifest {
+        PrefixManifest {
+            prefix: prefix.to_string(),
+            object_count: 0,
+            total_bytes: 0,
+            keys_digest: KeyStreamDigest::new().finish().0,
+        }
+    }
+
     fn storage_manifest() -> StorageManifest {
         StorageManifest {
-            version: 2,
-            tenant_keys: Vec::new(),
-            tenant_objects: Vec::new(),
-            git_pointer_keys: Vec::new(),
-            media_sidecar_keys: Vec::new(),
-            media_upload_keys: Vec::new(),
+            version: 3,
+            prefixes: vec![
+                empty_prefix("_meta/c/"),
+                empty_prefix("_uploads/c/"),
+                empty_prefix("repos/c/"),
+            ],
+            taxonomy_sweep_id: Uuid::from_u128(1),
             unknown_keys: Vec::new(),
-            unsupported_version_keys: Vec::new(),
         }
     }
 
@@ -2303,29 +2621,24 @@ mod tests {
     }
 
     #[test]
-    fn storage_manifest_rejects_missing_identity_observation() {
-        let mut manifest = storage_manifest();
-        manifest.tenant_keys.push("tenant/key".to_string());
-        assert!(validate_storage_manifest(&manifest).is_err());
-    }
+    fn storage_manifest_shape_invariants_fail_closed() {
+        assert!(validate_storage_manifest(&storage_manifest()).is_ok());
 
-    #[test]
-    fn storage_manifest_rejects_missing_object_etag() {
-        let mut manifest = storage_manifest();
-        manifest.tenant_keys.push("tenant/key".to_string());
-        manifest.tenant_objects.push(StorageObject {
-            key: "tenant/key".to_string(),
-            size: 1,
-            e_tag: None,
-        });
-        assert!(validate_storage_manifest(&manifest).is_err());
-    }
+        let mut unsorted = storage_manifest();
+        unsorted.prefixes.swap(0, 1);
+        assert!(validate_storage_manifest(&unsorted).is_err());
 
-    #[test]
-    fn object_checkpoint_keys_are_bounded_and_stable() {
-        let key = "x".repeat(4096);
-        assert_eq!(storage_checkpoint_key(&key), storage_checkpoint_key(&key));
-        assert_eq!(storage_checkpoint_key(&key).len(), "object:".len() + 64);
+        let mut whole_bucket = storage_manifest();
+        whole_bucket.prefixes[0].prefix = String::new();
+        assert!(validate_storage_manifest(&whole_bucket).is_err());
+
+        let mut malformed_digest = storage_manifest();
+        malformed_digest.prefixes[0].keys_digest = "not-hex".to_string();
+        assert!(validate_storage_manifest(&malformed_digest).is_err());
+
+        let mut unswept = storage_manifest();
+        unswept.taxonomy_sweep_id = Uuid::nil();
+        assert!(validate_storage_manifest(&unswept).is_err());
     }
 
     #[test]
@@ -2337,13 +2650,64 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_object_versions_fail_closed() {
+    fn key_stream_digest_requires_strict_order_and_is_chunking_invariant() {
+        let keys = ["a/1", "a/2", "a/3"];
+        let mut whole = KeyStreamDigest::new();
+        for key in keys {
+            whole.fold(key).expect("ascending fold");
+        }
+        // The digest must not depend on where chunk boundaries fall.
+        let mut split = KeyStreamDigest::new();
+        split.fold(keys[0]).expect("chunk one");
+        split.fold(keys[1]).expect("chunk one");
+        split.fold(keys[2]).expect("chunk two");
+        assert_eq!(whole.finish(), split.finish());
+
+        let mut out_of_order = KeyStreamDigest::new();
+        out_of_order.fold("b").expect("first key");
+        assert!(out_of_order.fold("a").is_err());
+        let mut duplicate = KeyStreamDigest::new();
+        duplicate.fold("a").expect("first key");
+        assert!(duplicate.fold("a").is_err());
+    }
+
+    #[test]
+    fn manifest_key_chunks_must_hash_to_the_frozen_summaries() {
+        let keys = vec!["_meta/c/1".to_string(), "_meta/c/2".to_string()];
+        let mut digest = KeyStreamDigest::new();
+        for key in &keys {
+            digest.fold(key).expect("fold");
+        }
+        let (hex_digest, count) = digest.finish();
         let mut manifest = storage_manifest();
-        manifest
-            .unsupported_version_keys
-            .push("_meta/community/blob.json".to_string());
-        let error = validate_storage_manifest(&manifest).expect_err("object version must block");
-        assert!(error.to_string().contains("unsupported object versions"));
+        manifest.prefixes[0].object_count = count;
+        manifest.prefixes[0].keys_digest = hex_digest;
+
+        let chunk = |chunk_no: i64, keys: &[String]| {
+            (
+                chunk_no,
+                "_meta/c/".to_string(),
+                sqlx::types::Json(keys.to_vec()),
+            )
+        };
+        assert!(validate_manifest_key_chunks(
+            &manifest,
+            &[chunk(0, &keys[..1]), chunk(1, &keys[1..])]
+        )
+        .is_ok());
+        // Missing, reordered, or extra keys change the digest.
+        assert!(validate_manifest_key_chunks(&manifest, &[chunk(0, &keys[..1])]).is_err());
+        // A gap in the chunk sequence is an interrupted write, not a manifest.
+        assert!(validate_manifest_key_chunks(&manifest, &[chunk(1, &keys)]).is_err());
+        // A key outside its chunk's prefix must never freeze.
+        let foreign = vec!["_uploads/other/1".to_string()];
+        assert!(
+            validate_manifest_key_chunks(&manifest, &[chunk(0, &keys), chunk(1, &foreign)])
+                .is_err()
+        );
+        // No chunks at all only matches an all-empty manifest.
+        assert!(validate_manifest_key_chunks(&manifest, &[]).is_err());
+        assert!(validate_manifest_key_chunks(&storage_manifest(), &[]).is_ok());
     }
 
     #[test]
@@ -2393,6 +2757,28 @@ mod postgres_tests {
         (db, store)
     }
 
+    fn empty_prefix_manifest(prefix: String) -> PrefixManifest {
+        PrefixManifest {
+            prefix,
+            object_count: 0,
+            total_bytes: 0,
+            keys_digest: KeyStreamDigest::new().finish().0,
+        }
+    }
+
+    fn empty_storage_manifest(community: CommunityId, sweep_id: Uuid) -> StorageManifest {
+        StorageManifest {
+            version: 3,
+            prefixes: vec![
+                empty_prefix_manifest(format!("_meta/{community}/")),
+                empty_prefix_manifest(format!("_uploads/{community}/")),
+                empty_prefix_manifest(format!("repos/{community}/")),
+            ],
+            taxonomy_sweep_id: sweep_id,
+            unknown_keys: Vec::new(),
+        }
+    }
+
     async fn inventoried_request(
         db: &Db,
         store: &DeletionStore,
@@ -2407,21 +2793,16 @@ mod postgres_tests {
             .await
             .expect("submit");
         assert_eq!(submitted.community_id, community.id);
+        let sweep = store
+            .record_taxonomy_sweep(Utc::now(), 0, 0, &[], 1_000_000)
+            .await
+            .expect("record clean taxonomy sweep");
         let inventory = FrozenInventory {
             schema: store
                 .inventory_schema(community.id)
                 .await
                 .expect("schema inventory"),
-            storage: StorageManifest {
-                version: 2,
-                tenant_keys: Vec::new(),
-                tenant_objects: Vec::new(),
-                git_pointer_keys: Vec::new(),
-                media_sidecar_keys: Vec::new(),
-                media_upload_keys: Vec::new(),
-                unknown_keys: Vec::new(),
-                unsupported_version_keys: Vec::new(),
-            },
+            storage: empty_storage_manifest(community.id, sweep.id),
         };
         let request = store
             .freeze_inventory(submitted.id, &inventory)
@@ -2877,9 +3258,13 @@ mod postgres_tests {
             .await
             .expect("identical destructive manifest retry");
         let mut drifted_storage = inventory.storage.clone();
-        drifted_storage
-            .media_upload_keys
-            .push("media/drifted-after-fence".to_string());
+        let mut drifted_digest = KeyStreamDigest::new();
+        drifted_digest
+            .fold("media/drifted-after-fence")
+            .expect("fold drifted key");
+        let (drifted_hex, drifted_count) = drifted_digest.finish();
+        drifted_storage.prefixes[0].object_count = drifted_count;
+        drifted_storage.prefixes[0].keys_digest = drifted_hex;
         assert!(matches!(
             store
                 .freeze_destructive_storage_manifest(&token, &drifted_storage)
@@ -2964,5 +3349,149 @@ mod postgres_tests {
         assert!(direct_delete
             .to_string()
             .contains("tombstones are permanent"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn manifest_key_chunks_bind_freeze_execution_and_cleanup() {
+        let (db, store) = store().await;
+        let (request, inventory) = inventoried_request(&db, &store).await;
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let claim = store
+            .claim_specific(request.id, "executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim")
+            .expect("won claim");
+        store.begin_quiescing(&claim.lease).await.expect("quiesce");
+        let generation = store.fence(&claim.lease).await.expect("fence");
+        let token = LeaseToken {
+            fence_generation: Some(generation),
+            ..claim.lease
+        };
+
+        let meta_prefix = format!("_meta/{}/", request.community_id);
+        let keys = vec![
+            format!("{meta_prefix}{}.json", "a".repeat(64)),
+            format!("{meta_prefix}{}.json", "b".repeat(64)),
+        ];
+        store
+            .append_manifest_key_chunk(&token, 0, &meta_prefix, &keys[..1])
+            .await
+            .expect("append chunk 0");
+        store
+            .append_manifest_key_chunk(&token, 1, &meta_prefix, &keys[1..])
+            .await
+            .expect("append chunk 1");
+
+        // A manifest whose digests do not cover the chunk stream must not freeze.
+        assert!(matches!(
+            store
+                .freeze_destructive_storage_manifest(&token, &inventory.storage)
+                .await,
+            Err(DbError::DeletionSafety(_))
+        ));
+        let mut digest = KeyStreamDigest::new();
+        for key in &keys {
+            digest.fold(key).expect("fold key");
+        }
+        let (hex_digest, count) = digest.finish();
+        let mut storage = inventory.storage.clone();
+        storage.prefixes[0].object_count = count;
+        storage.prefixes[0].total_bytes = 2;
+        storage.prefixes[0].keys_digest = hex_digest;
+        store
+            .freeze_destructive_storage_manifest(&token, &storage)
+            .await
+            .expect("freeze manifest matching chunks");
+
+        // Frozen chunks are immutable working data until terminal cleanup.
+        assert!(sqlx::query(
+            "UPDATE community_deletion_manifest_keys SET keys = '[]'::jsonb \
+             WHERE request_id = $1 AND chunk_no = 0",
+        )
+        .bind(request.id)
+        .execute(&db.pool)
+        .await
+        .is_err());
+        assert!(
+            sqlx::query("DELETE FROM community_deletion_manifest_keys WHERE request_id = $1")
+                .bind(request.id)
+                .execute(&db.pool)
+                .await
+                .is_err()
+        );
+        assert!(store.clear_manifest_key_chunks(&token).await.is_err());
+
+        store.mark_drained(&token).await.expect("drained");
+        let first = store
+            .next_pending_manifest_chunk(&token)
+            .await
+            .expect("pending chunk")
+            .expect("chunk 0 pending");
+        assert_eq!(first.chunk_no, 0);
+        assert_eq!(first.keys, keys[..1]);
+        store
+            .mark_manifest_chunk_deleted(&token, 0, serde_json::json!({"deleted": 1}))
+            .await
+            .expect("stamp chunk 0");
+        assert!(
+            matches!(
+                store
+                    .mark_manifest_chunk_deleted(&token, 0, serde_json::json!({}))
+                    .await,
+                Err(DbError::DeletionSafety(_))
+            ),
+            "a chunk stamp is one-way"
+        );
+        let second = store
+            .next_pending_manifest_chunk(&token)
+            .await
+            .expect("pending chunk")
+            .expect("chunk 1 pending after resume");
+        assert_eq!(second.chunk_no, 1);
+        store
+            .mark_manifest_chunk_deleted(&token, 1, serde_json::json!({"deleted": 1}))
+            .await
+            .expect("stamp chunk 1");
+        assert!(store
+            .next_pending_manifest_chunk(&token)
+            .await
+            .expect("pending chunk")
+            .is_none());
+        assert_eq!(
+            store
+                .manifest_chunk_progress(request.id)
+                .await
+                .expect("progress"),
+            (2, 2)
+        );
+
+        store
+            .mark_bindings_removed(&token, serde_json::json!({"deleted_keys": 2}))
+            .await
+            .expect("bindings removed");
+        store.purge_postgres(&token).await.expect("purge postgres");
+        store
+            .mark_cache_purged(&token, serde_json::json!({"keys": 0}))
+            .await
+            .expect("cache purged");
+        store
+            .verify_postgres_logically_deleted(&token)
+            .await
+            .expect("verify postgres");
+        store
+            .mark_logically_verified(&token, serde_json::json!({"all": true}))
+            .await
+            .expect("logically verified");
+        assert_eq!(
+            store
+                .manifest_chunk_progress(request.id)
+                .await
+                .expect("progress after terminal cleanup"),
+            (0, 0)
+        );
     }
 }

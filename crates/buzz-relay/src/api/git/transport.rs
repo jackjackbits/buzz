@@ -2326,27 +2326,38 @@ mod track_c_tests {
         buzz_db::deletion::DeletionRequest,
         buzz_db::deletion::ClaimedDeletion,
     ) {
-        use buzz_db::deletion::{FrozenInventory, StorageManifest, DEFAULT_LEASE_DURATION};
+        use buzz_db::deletion::{
+            FrozenInventory, KeyStreamDigest, PrefixManifest, StorageManifest,
+            DEFAULT_LEASE_DURATION,
+        };
 
         let store = state.db.deletion_store();
         let request = store
             .submit(host, "git-finalize-test", Some("post-CAS lease regression"))
             .await
             .expect("submit deletion");
+        let sweep = store
+            .record_taxonomy_sweep(chrono::Utc::now(), 0, 0, &[], 1_000_000)
+            .await
+            .expect("record clean taxonomy sweep");
         let inventory = FrozenInventory {
             schema: store
                 .inventory_schema(request.community_id)
                 .await
                 .expect("schema inventory"),
             storage: StorageManifest {
-                version: 2,
-                tenant_keys: Vec::new(),
-                tenant_objects: Vec::new(),
-                git_pointer_keys: Vec::new(),
-                media_sidecar_keys: Vec::new(),
-                media_upload_keys: Vec::new(),
+                version: 3,
+                prefixes: buzz_media::tenant_prefixes(*request.community_id.as_uuid())
+                    .into_iter()
+                    .map(|prefix| PrefixManifest {
+                        prefix,
+                        object_count: 0,
+                        total_bytes: 0,
+                        keys_digest: KeyStreamDigest::new().finish().0,
+                    })
+                    .collect(),
+                taxonomy_sweep_id: sweep.id,
                 unknown_keys: Vec::new(),
-                unsupported_version_keys: Vec::new(),
             },
         };
         store

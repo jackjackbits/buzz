@@ -146,6 +146,82 @@ CREATE TABLE community_deletion_checkpoints (
     CHECK ((status = 'failed') = (error IS NOT NULL))
 );
 
+-- Frozen destructive key list, chunked out of the request row so a large
+-- tenant (100k-1M objects) never materializes as one multi-hundred-MB JSONB
+-- value. Rows are written once in the fenced stage, stamped `deleted_at` as
+-- the executor confirms each chunk removed, and dropped at logical
+-- verification. The request row keeps only per-prefix count/bytes/digest
+-- summaries; the chunk stream must hash to those frozen digests.
+CREATE TABLE community_deletion_manifest_keys (
+    request_id UUID NOT NULL REFERENCES community_deletion_requests(id) ON DELETE CASCADE,
+    chunk_no BIGINT NOT NULL CHECK (chunk_no >= 0),
+    prefix TEXT NOT NULL,
+    keys JSONB NOT NULL,
+    deleted_at TIMESTAMPTZ,
+    PRIMARY KEY (request_id, chunk_no)
+);
+
+-- Chunk content is immutable once written; the only permitted update is the
+-- one-way deleted_at stamp. Removal is permitted only while the destructive
+-- manifest has not yet frozen (a retried partial freeze rewrites its chunks)
+-- or once the request has passed logical verification (terminal cleanup).
+CREATE FUNCTION protect_community_deletion_manifest_keys()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    frozen_at TIMESTAMPTZ;
+    request_stage TEXT;
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF NEW.request_id IS DISTINCT FROM OLD.request_id
+            OR NEW.chunk_no IS DISTINCT FROM OLD.chunk_no
+            OR NEW.prefix IS DISTINCT FROM OLD.prefix
+            OR NEW.keys IS DISTINCT FROM OLD.keys
+            OR OLD.deleted_at IS NOT NULL
+        THEN
+            RAISE EXCEPTION 'community deletion manifest key chunks are immutable'
+                USING ERRCODE = 'integrity_constraint_violation';
+        END IF;
+        RETURN NEW;
+    END IF;
+    SELECT destructive_storage_frozen_at, stage
+      INTO frozen_at, request_stage
+      FROM community_deletion_requests
+     WHERE id = OLD.request_id;
+    IF NOT FOUND
+        OR frozen_at IS NULL
+        OR request_stage IN ('logically_verified', 'retention_pending')
+    THEN
+        RETURN OLD;
+    END IF;
+    RAISE EXCEPTION 'community deletion manifest key chunks cannot be removed mid-execution'
+        USING ERRCODE = 'integrity_constraint_violation';
+END;
+$$;
+
+CREATE TRIGGER community_deletion_manifest_keys_guard
+BEFORE UPDATE OR DELETE ON community_deletion_manifest_keys
+FOR EACH ROW
+EXECUTE FUNCTION protect_community_deletion_manifest_keys();
+
+-- Fleet-wide object-store taxonomy sweep evidence. The unknown-key
+-- fail-closed invariant is a fleet property, not a per-request one: deletion
+-- inventory and fencing require a recent clean sweep instead of re-listing
+-- the whole bucket inline per request.
+CREATE TABLE storage_taxonomy_sweeps (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    started_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    listed_objects BIGINT NOT NULL CHECK (listed_objects >= 0),
+    unknown_object_count BIGINT NOT NULL CHECK (unknown_object_count >= 0),
+    unknown_key_sample JSONB NOT NULL DEFAULT '[]'::jsonb,
+    object_cap BIGINT NOT NULL CHECK (object_cap > 0),
+    CHECK (completed_at >= started_at)
+);
+CREATE INDEX storage_taxonomy_sweeps_latest
+    ON storage_taxonomy_sweeps (completed_at DESC);
+
 CREATE TABLE community_serving_write_leases (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     community_id UUID NOT NULL REFERENCES communities(id),
@@ -175,6 +251,8 @@ INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('community_deletion_requests', 'deployment deletion lifecycle and frozen inventory'),
     ('community_deletion_approvals', 'deployment operator destructive approvals'),
     ('community_deletion_checkpoints', 'deployment deletion executor checkpoints and failures'),
+    ('community_deletion_manifest_keys', 'deployment deletion frozen destructive key chunks'),
+    ('storage_taxonomy_sweeps', 'deployment object-store taxonomy sweep evidence'),
     ('community_serving_write_leases', 'deployment serving side-effect leases drained by deletion'),
     ('community_deletion_executor_heartbeats', 'deployment deletion worker liveness');
 

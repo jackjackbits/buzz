@@ -177,81 +177,45 @@ impl MediaStorage {
         }
     }
 
-    /// Exhaustively list bucket objects for deletion inventory.
+    /// Detect whether the bucket has ever had versioning enabled.
     ///
-    /// Fails rather than returning a partial listing when pagination is
-    /// malformed or the explicit object cap is exceeded.
-    pub async fn list_all_for_deletion(
-        &self,
-        max_objects: u64,
-    ) -> Result<Vec<DeletionObject>, MediaError> {
-        let mut objects = Vec::new();
-        let mut continuation = None;
-        loop {
-            let (result, _status) = self
-                .bucket
-                .list_page(String::new(), None, continuation.take(), None, Some(1000))
-                .await?;
-            let next_len = objects.len().saturating_add(result.contents.len());
-            if u64::try_from(next_len).unwrap_or(u64::MAX) > max_objects {
-                return Err(MediaError::StorageError(format!(
-                    "deletion inventory exceeds object cap {max_objects}"
-                )));
-            }
-            objects.extend(result.contents.into_iter().map(|object| DeletionObject {
-                key: object.key,
-                size: object.size,
-                last_modified: object.last_modified,
-                e_tag: object.e_tag,
-            }));
-            if !result.is_truncated {
-                break;
-            }
-            continuation = result.next_continuation_token;
-            if continuation.is_none() {
-                return Err(MediaError::StorageError(
-                    "truncated deletion inventory page has no continuation token".to_string(),
-                ));
-            }
-        }
-        Ok(objects)
+    /// rust-s3 exposes no GetBucketVersioning, so this writes and inspects a
+    /// short-lived fleet probe object instead: versioning-enabled (and
+    /// versioning-suspended) buckets stamp new writes with a version id.
+    /// Deletion refuses versioned buckets because bulk deletes without a
+    /// VersionId would only insert delete markers, not prove logical absence.
+    pub async fn bucket_versioning_detected(&self) -> Result<bool, MediaError> {
+        let key = format!("probe/deletion-versioning-{}", uuid::Uuid::new_v4());
+        self.put(&key, b"buzz deletion versioning probe", "text/plain")
+            .await?;
+        let inspected = self.bucket.head_object(&key).await;
+        let removed = self.bucket.delete_object(&key).await;
+        let (head, _) = inspected.map_err(|e| MediaError::StorageError(e.to_string()))?;
+        removed.map_err(|e| MediaError::StorageError(e.to_string()))?;
+        Ok(head.version_id.is_some())
     }
 
-    /// Return the current object identity, including whether it is versioned.
-    pub async fn inspect_current_object(
-        &self,
-        key: &str,
-    ) -> Result<CurrentObjectVersion, MediaError> {
-        match self.bucket.head_object(key).await {
-            Ok((result, _)) => Ok(CurrentObjectVersion::Present {
-                version_id: result.version_id,
-                size: result.content_length.unwrap_or_default().max(0) as u64,
-                last_modified: result.last_modified,
-                e_tag: result.e_tag,
-            }),
-            Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Ok(CurrentObjectVersion::Missing),
-            Err(error) => Err(MediaError::StorageError(error.to_string())),
-        }
-    }
-
-    /// Return the current object version id, if the backend reports one.
+    /// Bulk-delete up to one manifest chunk of keys via S3 `DeleteObjects`.
     ///
-    /// V1 refuses to delete versioned tenant bindings because rust-s3 cannot
-    /// exhaustively enumerate non-current versions; a plain delete marker would
-    /// not prove logical absence from storage.
-    pub async fn inspect_current_version(
-        &self,
-        key: &str,
-    ) -> Result<CurrentObjectVersion, MediaError> {
-        self.inspect_current_object(key).await
-    }
-
-    /// Delete tenant binding keys one at a time and fail on any backend error.
-    pub async fn delete_bindings(&self, keys: &[String]) -> Result<(), MediaError> {
-        for key in keys {
-            self.delete(key).await?;
+    /// Never fails on per-key outcomes: they are folded into
+    /// [`BulkDeleteOutcome`] so the caller owns retry/fail-closed policy.
+    /// Historical MinIO releases report already-absent keys as
+    /// `NoSuchKey`/`NoSuchVersion` errors instead of deleted; both map to
+    /// `already_missing` to keep checkpointed retry idempotent.
+    pub async fn delete_objects(&self, keys: &[String]) -> Result<BulkDeleteOutcome, MediaError> {
+        if keys.is_empty() {
+            return Ok(BulkDeleteOutcome::default());
         }
-        Ok(())
+        let identifiers = keys
+            .iter()
+            .map(|key| s3::serde_types::ObjectIdentifier::new(key.clone()))
+            .collect::<Vec<_>>();
+        let result = self
+            .bucket
+            .delete_objects(identifiers)
+            .await
+            .map_err(|e| MediaError::StorageError(e.to_string()))?;
+        Ok(fold_bulk_delete_result(result))
     }
 
     /// Build the community-scoped sidecar key for a given sha256 (bare hash).
@@ -329,10 +293,27 @@ impl MediaStorage {
         continuation_token: Option<String>,
         max_keys: usize,
     ) -> Result<crate::bucket_index::Page, MediaError> {
+        self.list_prefix_page("", continuation_token, max_keys)
+            .await
+    }
+
+    /// One page of a prefix-scoped listing.
+    ///
+    /// Deletion enumerates the target community's exact key prefixes with
+    /// this instead of listing the whole fleet bucket: cost stays
+    /// O(tenant objects) regardless of fleet size. `ListObjectsV2` returns
+    /// keys in ascending UTF-8 binary order, which callers rely on for
+    /// streaming key-stream digests.
+    pub async fn list_prefix_page(
+        &self,
+        prefix: &str,
+        continuation_token: Option<String>,
+        max_keys: usize,
+    ) -> Result<crate::bucket_index::Page, MediaError> {
         let (result, _status) = self
             .bucket
             .list_page(
-                String::new(),
+                prefix.to_string(),
                 None,
                 continuation_token,
                 None,
@@ -351,41 +332,92 @@ impl MediaStorage {
     }
 }
 
-/// Current-version observation for a tenant-owned object binding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CurrentObjectVersion {
-    /// The key does not exist.
-    Missing,
-    /// The key exists, optionally with a backend version id.
-    Present {
-        /// S3 version id. `Some` is unsupported for V1 deletion.
-        version_id: Option<String>,
-        /// Current object size.
-        size: u64,
-        /// Current last-modified timestamp, when supplied.
-        last_modified: Option<String>,
-        /// Current entity tag, when supplied.
-        e_tag: Option<String>,
-    },
+/// Per-key outcomes of one bulk `DeleteObjects` call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BulkDeleteOutcome {
+    /// Keys the backend reported deleted (S3 reports already-missing keys as
+    /// deleted too — the API is idempotent by design).
+    pub deleted: u64,
+    /// Keys reported absent via legacy MinIO `NoSuchKey`/`NoSuchVersion`
+    /// per-key errors; equivalent to deleted for retry purposes.
+    pub already_missing: u64,
+    /// Keys whose deletion produced a version artifact (delete marker or
+    /// version id) — evidence of bucket versioning, which deletion must
+    /// fail closed on.
+    pub versioned_keys: Vec<String>,
+    /// Remaining per-key failures as `(key, code, message)`.
+    pub failed: Vec<(String, String, String)>,
 }
 
-/// One object observed during exhaustive deletion inventory.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeletionObject {
-    /// Exact bucket key.
-    pub key: String,
-    /// Current object size.
-    pub size: u64,
-    /// Backend-reported last modification timestamp.
-    pub last_modified: String,
-    /// Backend entity tag, when supplied.
-    pub e_tag: Option<String>,
+fn fold_bulk_delete_result(result: s3::serde_types::DeleteObjectsResult) -> BulkDeleteOutcome {
+    let mut outcome = BulkDeleteOutcome::default();
+    for deleted in result.deleted {
+        if deleted.delete_marker == Some(true)
+            || deleted.delete_marker_version_id.is_some()
+            || deleted.version_id.is_some()
+        {
+            outcome.versioned_keys.push(deleted.key);
+        } else {
+            outcome.deleted += 1;
+        }
+    }
+    for error in result.errors {
+        if error.code == "NoSuchKey" || error.code == "NoSuchVersion" {
+            outcome.already_missing += 1;
+        } else {
+            outcome.failed.push((error.key, error.code, error.message));
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// The bulk-delete fold is the retry-idempotence contract: legacy MinIO
+    /// absent-key errors count as success, version artifacts are surfaced for
+    /// fail-closed handling, and anything else stays a per-key failure.
+    #[test]
+    fn bulk_delete_fold_maps_absent_keys_and_version_artifacts() {
+        use s3::serde_types::{DeleteError, DeleteObjectsResult, DeletedObject};
+        let deleted_object = |key: &str, marker: bool| DeletedObject {
+            key: key.to_string(),
+            version_id: None,
+            delete_marker: marker.then_some(true),
+            delete_marker_version_id: marker.then(|| "v1".to_string()),
+        };
+        let delete_error = |key: &str, code: &str, message: &str| DeleteError {
+            key: key.to_string(),
+            code: code.to_string(),
+            message: message.to_string(),
+            version_id: None,
+        };
+        let result = DeleteObjectsResult {
+            deleted: vec![
+                deleted_object("plain", false),
+                deleted_object("marked", true),
+            ],
+            errors: vec![
+                delete_error("gone", "NoSuchKey", "absent"),
+                delete_error("gone-version", "NoSuchVersion", "absent"),
+                delete_error("denied", "AccessDenied", "nope"),
+            ],
+        };
+        let outcome = fold_bulk_delete_result(result);
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.already_missing, 2);
+        assert_eq!(outcome.versioned_keys, vec!["marked".to_string()]);
+        assert_eq!(
+            outcome.failed,
+            vec![(
+                "denied".to_string(),
+                "AccessDenied".to_string(),
+                "nope".to_string()
+            )]
+        );
+    }
 
     fn tenant(n: u128) -> TenantContext {
         TenantContext::resolved(
