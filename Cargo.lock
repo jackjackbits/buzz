@@ -1055,7 +1055,6 @@ name = "buzz-deletion"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
  "buzz-core",
  "buzz-db",
  "buzz-media",

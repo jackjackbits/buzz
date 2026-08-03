@@ -12,8 +12,8 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn default_command_does_not_start_a_deletion_worker() {
-        let command = crate::Cli::try_parse_from(["buzz-admin", "list-members"]);
-        assert!(command.is_ok());
+    fn continuous_worker_command_is_not_exposed() {
+        let command = crate::Cli::try_parse_from(["buzz-admin", "deletions", "worker"]);
+        assert!(command.is_err());
     }
 }

@@ -310,28 +310,13 @@ mod tests {
                 owner_runtime,
             );
             let from = hello.sender;
-            let mut inbound = router.accept_inbound(from, hello, stream).await.unwrap();
-            let frame = inbound
-                .stream
-                .recv_validated(&echo_directory)
-                .await
-                .unwrap()
-                .unwrap();
-            let ReliableFrame::Data(payload) = frame else {
-                panic!("expected data");
-            };
-            let community = inbound.stream.community_id().unwrap();
-            inbound
-                .stream
-                .send_bytes(community, &payload)
-                .await
-                .unwrap();
-            // Keep both endpoints and the owner stream alive until the caller has
-            // consumed the echo. Dropping the last endpoint clone closes the QUIC
-            // connection and used to make this production-path regression test
-            // deterministically time out before the return frame was read.
-            let _owner_endpoint_guard = accept_endpoint;
-            tokio::time::sleep(ECHO_TIMEOUT).await;
+            let inbound = router.accept_inbound(from, hello, stream).await.unwrap();
+            crate::mesh_boot::run_demo_echo(
+                echo_directory,
+                inbound,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await;
         });
 
         // Forwarding side: join the same session through the demo core.
@@ -356,7 +341,5 @@ mod tests {
         assert_eq!(body["outcome"], "forwarded");
         assert_eq!(body["echoed_payload"], "mesh echo evidence");
         owner_task.abort();
-        drop(local_endpoint);
-        drop(owner_endpoint);
     }
 }

@@ -10,7 +10,6 @@ description = "Durable whole-community deletion engine for Buzz"
 [dependencies]
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-axum = { workspace = true }
 buzz-core = { workspace = true }
 buzz-db = { workspace = true }
 buzz-media = { workspace = true }

@@ -2,6 +2,7 @@
 #![warn(missing_docs)]
 //! Shared durable whole-community deletion engine and store adapters.
 
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +20,6 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const DEFAULT_STORAGE_OBJECT_CAP: u64 = 1_000_000;
-const WORKER_IDLE_POLL: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const STORAGE_DELETE_BATCH_SIZE: usize = 100;
@@ -36,10 +36,6 @@ fn heartbeat_interval() -> Duration {
         }
     }
     HEARTBEAT_INTERVAL
-}
-
-fn worker_health_stale_after() -> u64 {
-    HEARTBEAT_INTERVAL.as_secs().saturating_mul(3)
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -264,19 +260,12 @@ pub enum Command {
         #[arg(long)]
         executor_id: Option<String>,
     },
-    /// Poll continuously in a dedicated no-ingress worker process.
-    Worker {
-        /// Executor identity (defaults to hostname/pid).
-        #[arg(long)]
-        executor_id: Option<String>,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoopMode {
     Run,
     Drain,
-    Worker,
 }
 
 impl LoopMode {
@@ -284,7 +273,6 @@ impl LoopMode {
         match self {
             Self::Run => "run",
             Self::Drain => "drain",
-            Self::Worker => "worker",
         }
     }
 }
@@ -331,36 +319,6 @@ fn is_permanent_error(error: &anyhow::Error) -> bool {
                 .downcast_ref::<EngineError>()
                 .is_some_and(|error| matches!(error, EngineError::Permanent(_)))
     })
-}
-
-#[derive(Default)]
-struct WorkerHealth {
-    draining: AtomicBool,
-    dependencies_ready: AtomicBool,
-    last_heartbeat_epoch: AtomicU64,
-}
-
-impl WorkerHealth {
-    fn mark_heartbeat(&self) {
-        self.last_heartbeat_epoch.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            Ordering::Relaxed,
-        );
-    }
-
-    fn ready(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        !self.draining.load(Ordering::Relaxed)
-            && self.dependencies_ready.load(Ordering::Relaxed)
-            && now.saturating_sub(self.last_heartbeat_epoch.load(Ordering::Relaxed))
-                <= worker_health_stale_after()
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -434,15 +392,6 @@ pub async fn run(command: Command) -> Result<i32> {
             run_loop(
                 services,
                 LoopMode::Drain,
-                None,
-                executor_id.unwrap_or_else(default_executor_id),
-            )
-            .await
-        }
-        Command::Worker { executor_id } => {
-            run_loop(
-                services,
-                LoopMode::Worker,
                 None,
                 executor_id.unwrap_or_else(default_executor_id),
             )
@@ -687,16 +636,6 @@ async fn run_loop(
     executor_id: String,
 ) -> Result<i32> {
     let shutdown = shutdown_token();
-    let health = Arc::new(WorkerHealth::default());
-    health.mark_heartbeat();
-    health
-        .dependencies_ready
-        .store(dependencies_ready(&services).await, Ordering::Relaxed);
-    let _health_task = if mode == LoopMode::Worker {
-        Some(spawn_worker_health(shutdown.clone(), Arc::clone(&health)).await?)
-    } else {
-        None
-    };
     let mut ran = false;
     loop {
         if shutdown.is_cancelled() {
@@ -722,28 +661,15 @@ async fn run_loop(
             }
         };
         let Some(claim) = claim else {
-            match mode {
-                LoopMode::Worker => {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => continue,
-                        _ = tokio::time::sleep(WORKER_IDLE_POLL) => {
-                            health.dependencies_ready.store(
-                                dependencies_ready(&services).await,
-                                Ordering::Relaxed,
-                            );
-                            health.mark_heartbeat();
-                            continue;
-                        },
-                    }
-                }
-                LoopMode::Run if !ran => anyhow::bail!(
+            if mode == LoopMode::Run && !ran {
+                anyhow::bail!(
                     "deletion request is not runnable, is blocked, or is leased by another executor"
-                ),
-                LoopMode::Run | LoopMode::Drain => return Ok(0),
+                );
             }
+            return Ok(0);
         };
         ran = true;
-        let output = execute_claim(&services, mode, claim, &shutdown, Arc::clone(&health)).await?;
+        let output = execute_claim(&services, mode, claim, &shutdown).await?;
         print_json(&output)?;
         if mode == LoopMode::Run || shutdown.is_cancelled() {
             return Ok(i32::from(output.blocked_reason.is_some()));
@@ -796,7 +722,6 @@ async fn execute_claim(
     mode: LoopMode,
     mut claim: ClaimedDeletion,
     shutdown: &CancellationToken,
-    health: Arc<WorkerHealth>,
 ) -> Result<RunOutput> {
     let token = claim.lease.clone();
     loop {
@@ -809,10 +734,7 @@ async fn execute_claim(
             .store
             .heartbeat(&token, mode.as_str(), DEFAULT_LEASE_DURATION, false)
             .await?;
-        health.dependencies_ready.store(true, Ordering::Relaxed);
-        health.mark_heartbeat();
-        let stage_result =
-            run_stage_with_heartbeat(services, mode, &claim, shutdown, Arc::clone(&health)).await;
+        let stage_result = run_stage_with_heartbeat(services, mode, &claim, shutdown).await;
         match stage_result {
             StageOutcome::Completed => {}
             StageOutcome::Shutdown => {
@@ -846,25 +768,6 @@ async fn execute_claim(
     }
 }
 
-async fn dependencies_ready(services: &Services) -> bool {
-    if !services.store.ping().await {
-        return false;
-    }
-    let redis_ok = match services.redis.get().await {
-        Ok(mut connection) => tokio::time::timeout(
-            Duration::from_secs(5),
-            redis::cmd("PING").query_async::<String>(&mut *connection),
-        )
-        .await
-        .is_ok_and(|result| result.is_ok()),
-        Err(_) => false,
-    };
-    let storage_ok = tokio::time::timeout(Duration::from_secs(5), services.media.ping())
-        .await
-        .is_ok_and(|result| result.is_ok());
-    redis_ok && storage_ok
-}
-
 enum StageOutcome {
     Completed,
     Shutdown,
@@ -895,14 +798,12 @@ async fn run_stage_with_heartbeat(
     mode: LoopMode,
     claim: &ClaimedDeletion,
     shutdown: &CancellationToken,
-    health: Arc<WorkerHealth>,
 ) -> StageOutcome {
     let heartbeat_services = services.clone();
     let heartbeat_token = claim.lease.clone();
     let heartbeat_mode = mode.as_str();
     let heartbeat_shutdown = CancellationToken::new();
     let heartbeat_cancel = heartbeat_shutdown.clone();
-    let heartbeat_health = Arc::clone(&health);
     let heartbeat_error = CancellationToken::new();
     let heartbeat_error_signal = heartbeat_error.clone();
     let heartbeat = tokio::spawn(async move {
@@ -927,7 +828,6 @@ async fn run_stage_with_heartbeat(
                         heartbeat_error_signal.cancel();
                         return;
                     }
-                    heartbeat_health.mark_heartbeat();
                 }
             }
         }
@@ -1336,48 +1236,6 @@ fn default_executor_id() -> String {
     format!("{hostname}:{}", std::process::id())
 }
 
-async fn spawn_worker_health(
-    shutdown: CancellationToken,
-    health: Arc<WorkerHealth>,
-) -> Result<tokio::task::JoinHandle<()>> {
-    let address =
-        std::env::var("BUZZ_DELETION_HEALTH_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    let listener = tokio::net::TcpListener::bind(&address)
-        .await
-        .with_context(|| format!("bind deletion worker health endpoint {address}"))?;
-    let signal = Arc::clone(&health);
-    let cancel = shutdown.clone();
-    tokio::spawn(async move {
-        cancel.cancelled().await;
-        signal.draining.store(true, Ordering::Relaxed);
-    });
-    let router = axum::Router::new()
-        .route("/_liveness", axum::routing::get(|| async { "ok" }))
-        .route(
-            "/_readiness",
-            axum::routing::get({
-                move || {
-                    let health = Arc::clone(&health);
-                    async move {
-                        if health.ready() {
-                            (axum::http::StatusCode::OK, "ready")
-                        } else {
-                            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not_ready")
-                        }
-                    }
-                }
-            }),
-        );
-    Ok(tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown.cancelled_owned())
-            .await
-        {
-            eprintln!("deletion worker health endpoint failed: {error}");
-        }
-    }))
-}
-
 fn shutdown_token() -> CancellationToken {
     let token = CancellationToken::new();
     let signal = token.clone();
@@ -1696,21 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_readiness_requires_dependencies_heartbeat_and_not_draining() {
-        let health = WorkerHealth::default();
-        assert!(!health.ready());
-        health.dependencies_ready.store(true, Ordering::Relaxed);
-        health.mark_heartbeat();
-        assert!(health.ready());
-        health.draining.store(true, Ordering::Relaxed);
-        assert!(!health.ready());
-        health.draining.store(false, Ordering::Relaxed);
-        health.last_heartbeat_epoch.store(1, Ordering::Relaxed);
-        assert!(!health.ready());
-    }
-
-    #[test]
-    fn worker_configuration_requires_every_destructive_dependency() {
+    fn deletion_configuration_requires_every_destructive_dependency() {
         let variable = format!("BUZZ_DELETION_REQUIRED_TEST_{}", Uuid::new_v4().simple());
         assert!(required_env(&variable).is_err());
         std::env::set_var(&variable, "   ");
@@ -1869,14 +1713,7 @@ mod tests {
         let cancel = shutdown.clone();
         let services_for_run = services.clone();
         let executor = tokio::spawn(async move {
-            execute_claim(
-                &services_for_run,
-                LoopMode::Worker,
-                claim,
-                &shutdown,
-                Arc::new(WorkerHealth::default()),
-            )
-            .await
+            execute_claim(&services_for_run, LoopMode::Drain, claim, &shutdown).await
         });
         tokio::time::sleep(Duration::from_millis(10)).await;
         cancel.cancel();
@@ -1927,16 +1764,5 @@ mod tests {
                 panic!("preexisting heartbeat loss must win")
             }
         }
-    }
-
-    #[tokio::test]
-    async fn shutdown_token_can_interrupt_idle_worker_sleep() {
-        let token = CancellationToken::new();
-        token.cancel();
-        let woke = tokio::select! {
-            _ = token.cancelled() => true,
-            _ = tokio::time::sleep(Duration::from_secs(30)) => false,
-        };
-        assert!(woke);
     }
 }

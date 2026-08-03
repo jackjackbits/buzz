@@ -19,11 +19,6 @@ fn relay_ws_url() -> String {
         .replace("https://", "wss://")
 }
 
-fn relay_authority() -> String {
-    let url = url::Url::parse(&relay_http_url()).expect("relay HTTP URL");
-    url[url::Position::BeforeHost..url::Position::AfterPort].to_string()
-}
-
 fn http_client() -> Client {
     Client::builder()
         .timeout(Duration::from_secs(15))
@@ -401,7 +396,7 @@ async fn test_auth_server_tag_correct() {
             Tag::parse(["t", "upload"]).unwrap(),
             Tag::parse(["x", &sha256]).unwrap(),
             Tag::parse(["expiration", &(now + 300).to_string()]).unwrap(),
-            Tag::parse(["server", &relay_authority()]).unwrap(),
+            Tag::parse(["server", "localhost:3000"]).unwrap(),
         ],
     );
     let resp = upload_with_auth(&client, &auth, &sha256, &jpeg).await;
@@ -654,10 +649,6 @@ async fn test_ws_valid_imeta() {
     let resp = upload(&http, &keys, &jpeg).await;
     assert_eq!(resp.status(), 200);
 
-    let upload_desc: serde_json::Value = resp.json().await.expect("upload descriptor");
-    let media_url = upload_desc["url"].as_str().expect("uploaded media URL");
-    let media_size = upload_desc["size"].as_u64().expect("uploaded media size");
-
     // Connect via WebSocket
     let mut client = BuzzTestClient::connect(&relay_ws_url(), &keys)
         .await
@@ -669,10 +660,10 @@ async fn test_ws_valid_imeta() {
             Tag::parse(["h", &channel_id]).unwrap(),
             Tag::parse([
                 "imeta",
-                &format!("url {media_url}"),
+                &format!("url http://localhost:3000/media/{sha256}.jpg"),
                 "m image/jpeg",
                 &format!("x {sha256}"),
-                &format!("size {media_size}"),
+                "size 347",
             ])
             .unwrap(),
         ])
