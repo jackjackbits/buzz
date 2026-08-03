@@ -145,68 +145,6 @@ volumes, and each init container must define an appropriate security context
 and resources. Empty `relay.command` and `relay.args` arrays preserve the image
 defaults; non-empty values override its entrypoint and arguments respectively.
 
-## Whole-community deletion worker
-
-Whole-community logical deletion is CLI-only. The default chart remains inert:
-`deletionWorker.enabled=false` renders no deletion pod, Service, Ingress, or
-route, and the image ENTRYPOINT remains `buzz-relay`.
-
-Manual OSS operators run the durable engine from the existing image context:
-
-```sh
-buzz-admin deletions submit --host community.example --requested-by operator
-buzz-admin deletions approve <request-id> --approved-by operator
-buzz-admin deletions run <request-id>   # one job
-buzz-admin deletions drain              # current runnable queue
-```
-
-Hosted operators can opt into a dedicated no-ingress worker:
-
-```yaml
-deletionWorker:
-  enabled: true
-  serviceAccountName: buzz-deletion-worker
-  existingSecret: buzz-deletion-worker-credentials
-```
-
-The dedicated Secret and service account should grant only the PostgreSQL,
-Redis, and S3 delete/list capabilities needed by the worker. Its command is
-`buzz-admin deletions worker`; the private `/_liveness` and `/_readiness`
-listener exists only for pod probes, and SIGTERM marks readiness draining,
-finishes/releases the current durable unit, then exits inside the configured
-90-second window. Do not route public traffic to this pod.
-
-### Required deletion rollout order
-
-Migration 0027 installs database triggers, but replicas built before this
-release do not acquire the external-effect leases that cover S3, Redis, push,
-and workflow work. **Do not approve or run a deletion until every serving
-replica is this release or newer.** Use this order:
-
-1. Disable/scale the deletion worker to zero and leave requests unapproved.
-2. Apply migration 0027 during a low-traffic window. It sets a 5-second
-   `lock_timeout`; if any trigger's `SHARE ROW EXCLUSIVE` lock cannot be acquired,
-   the transaction fails with no partial catalog and should be retried after
-   clearing/finishing long transactions.
-3. Roll every relay replica and verify all old ReplicaSets are at zero plus
-   `/_readiness` is healthy. Serving readiness accepts migration 27 and later;
-   destructive claims intentionally require exact migration 27/catalog equality.
-4. Verify `buzz_deletion_serving_leases_active` responds to test traffic and
-   `buzz_deletion_serving_leases_expired` stays near zero. Alert on growing
-   `buzz_deletion_serving_leases_dead_tuples` and inspect autovacuum if it grows.
-5. Enable the worker and only then approve/run requests.
-
-PostgreSQL trigger attachment and lease-table maintenance add write cost.
-Track application p99 for events/media/Git/workflows alongside the lease gauges;
-investigate rising dead tuples or expired rows before raising worker scale.
-
-Object removal is checkpointed per key and each attempt deletes at most
-`deletionWorker.storageDeleteBatchSize` (default 100). Deletion is resumable
-from durable checkpoints. Missing keys are recorded as `already_missing` and
-processing continues, including the crash window where a DELETE committed
-before its first PostgreSQL checkpoint. Changed/versioned keys fail closed.
-Final verification performs a fresh complete target inventory before advancing.
-
 ## Device pairing relay
 
 The chart can run Buzz's stateless pairing WebSocket relay as an independent
@@ -261,7 +199,7 @@ default so long-lived WebSocket connections have time to drain.
 
 Schema migrations are embedded in the relay binary via `sqlx::migrate!` and run at startup, gated by `BUZZ_AUTO_MIGRATE` (default `true`). Multiple replicas race-safely behind a Postgres advisory lock. `helm upgrade` is the entire upgrade procedure.
 
-If you prefer decoupling migrations from serving, set `migrate.autoMigrate=false`. **In that mode the chart does not run migrations for you** — you own running `buzz-admin migrate` (separate Pod / one-shot Job) against the database before every `helm install` / `helm upgrade`. This release's startup/readiness check requires migration 0027's serving-fence objects (while accepting later additive migrations), so 0027 must finish before deploying these relay pods. Other feature-specific schema freshness remains operator-owned. A pre-upgrade Helm Job for this is on the chart roadmap; the values knob `migrate.preUpgradeJob.enabled` is reserved.
+If you prefer decoupling migrations from serving, set `migrate.autoMigrate=false`. **In that mode the chart does not run migrations for you** — you own running `buzz-admin migrate` (separate Pod / one-shot Job) against the database before every `helm install` / `helm upgrade`. Readiness probes only verify DB connectivity, not schema freshness, so a pod will appear healthy against an unmigrated schema and fail under load. A pre-upgrade Helm Job for this is on the chart roadmap; the values knob `migrate.preUpgradeJob.enabled` is reserved.
 
 ## Backups
 
