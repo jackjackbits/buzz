@@ -983,6 +983,18 @@ async fn execute_stage(
 ) -> Result<()> {
     let request = &claim.request;
     let token = token_with_current_fence(&claim.lease, request);
+    if matches!(
+        request.stage,
+        DeletionStage::Approved
+            | DeletionStage::Fenced
+            | DeletionStage::Drained
+            | DeletionStage::BindingsRemoved
+            | DeletionStage::PostgresPurged
+            | DeletionStage::CachePurged
+            | DeletionStage::LogicallyVerified
+    ) {
+        validate_frozen_inventory(request)?;
+    }
     match request.stage {
         DeletionStage::Approved => {
             // Approval binds immutable catalog + key taxonomy. Live row counts

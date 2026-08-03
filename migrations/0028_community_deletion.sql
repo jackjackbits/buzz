@@ -97,6 +97,13 @@ BEGIN
         RAISE EXCEPTION 'frozen community deletion inventory is immutable'
             USING ERRCODE = 'integrity_constraint_violation';
     END IF;
+    IF OLD.destructive_storage_frozen_at IS NOT NULL AND (
+        NEW.destructive_storage_manifest IS DISTINCT FROM OLD.destructive_storage_manifest
+        OR NEW.destructive_storage_frozen_at IS DISTINCT FROM OLD.destructive_storage_frozen_at
+    ) THEN
+        RAISE EXCEPTION 'frozen destructive storage manifest is immutable'
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
     RETURN NEW;
 END;
 $$;

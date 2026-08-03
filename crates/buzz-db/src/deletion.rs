@@ -872,11 +872,17 @@ impl DeletionStore {
         let row = sqlx::query(
             "UPDATE community_deletion_requests \
              SET stage = 'approved', updated_at = now(), next_attempt_at = now() \
-             WHERE id = $1 RETURNING *",
+             WHERE id = $1 AND stage = 'inventoried' AND blocked_at IS NULL \
+             RETURNING *",
         )
         .bind(request_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            DbError::DeletionSafety(format!(
+                "deletion {request_id} changed before approval could be recorded"
+            ))
+        })?;
         tx.commit().await?;
         row_to_request(row)
     }
@@ -2883,6 +2889,28 @@ mod postgres_tests {
                 .await,
             Err(DbError::DeletionSafety(_))
         ));
+        for mutation in [
+            sqlx::query(
+                "UPDATE community_deletion_requests \
+                 SET destructive_storage_manifest = '{}'::jsonb WHERE id = $1",
+            )
+            .bind(request.id)
+            .execute(&db.pool)
+            .await,
+            sqlx::query(
+                "UPDATE community_deletion_requests \
+                 SET destructive_storage_frozen_at = destructive_storage_frozen_at + interval '1 second' \
+                 WHERE id = $1",
+            )
+            .bind(request.id)
+            .execute(&db.pool)
+            .await,
+        ] {
+            assert!(
+                mutation.is_err(),
+                "frozen destructive storage evidence must be immutable"
+            );
+        }
         store.mark_drained(&token).await.expect("drain");
         store
             .mark_bindings_removed(&token, serde_json::json!({"keys": 0}))
