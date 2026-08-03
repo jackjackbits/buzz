@@ -37,7 +37,6 @@ pub const CONTROL_PLANE_TABLES: &[&str] = &[
     "community_deletion_checkpoints",
     "community_deletion_executor_heartbeats",
     "community_deletion_requests",
-    "community_deletion_retention_exceptions",
     "community_serving_write_leases",
 ];
 
@@ -292,9 +291,6 @@ pub struct StorageManifest {
     pub media_sidecar_keys: Vec<String>,
     /// Media upload-record keys among tenant keys.
     pub media_upload_keys: Vec<String>,
-    /// Reserved for future retention exceptions. Empty in V1: shared CAS is
-    /// fleet-wide and intentionally outside per-community inventory.
-    pub retained_shared_cas_keys: Vec<String>,
     /// Fleet keys unknown to the current taxonomy. Non-empty fails inventory.
     pub unknown_keys: Vec<String>,
     /// Keys whose current object version cannot be safely removed. Non-empty fails.
@@ -360,8 +356,6 @@ pub struct DeletionInspection {
     pub approval: Option<DeletionApproval>,
     /// Unit checkpoints.
     pub checkpoints: Vec<DeletionCheckpoint>,
-    /// Retention exceptions/holds.
-    pub retention_exceptions: Vec<RetentionException>,
 }
 
 /// Explicit approval evidence.
@@ -375,21 +369,6 @@ pub struct DeletionApproval {
     pub note: Option<String>,
     /// Approval timestamp.
     pub approved_at: DateTime<Utc>,
-}
-
-/// Physical-expiry retention exception.
-#[derive(Debug, Clone, Serialize)]
-pub struct RetentionException {
-    /// Stable hold/exception key.
-    pub exception_key: String,
-    /// Reason it survives logical deletion.
-    pub reason: String,
-    /// Optional expiry.
-    pub expires_at: Option<DateTime<Utc>>,
-    /// Creating operator.
-    pub created_by: String,
-    /// Creation timestamp.
-    pub created_at: DateTime<Utc>,
 }
 
 /// Monotonic lease token required by every execution mutation.
@@ -586,30 +565,10 @@ impl DeletionStore {
             })
         })
         .collect::<Result<Vec<_>>>()?;
-        let retention_exceptions = sqlx::query(
-            "SELECT exception_key, reason, expires_at, created_by, created_at \
-             FROM community_deletion_retention_exceptions WHERE request_id = $1 \
-             ORDER BY exception_key",
-        )
-        .bind(request_id)
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|row| {
-            Ok(RetentionException {
-                exception_key: row.try_get("exception_key")?,
-                reason: row.try_get("reason")?,
-                expires_at: row.try_get("expires_at")?,
-                created_by: row.try_get("created_by")?,
-                created_at: row.try_get("created_at")?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
         Ok(DeletionInspection {
             request,
             approval,
             checkpoints,
-            retention_exceptions,
         })
     }
 
@@ -2263,7 +2222,6 @@ mod tests {
             git_pointer_keys: Vec::new(),
             media_sidecar_keys: Vec::new(),
             media_upload_keys: Vec::new(),
-            retained_shared_cas_keys: Vec::new(),
             unknown_keys: Vec::new(),
             unsupported_version_keys: Vec::new(),
         }
@@ -2439,7 +2397,6 @@ mod postgres_tests {
                 git_pointer_keys: Vec::new(),
                 media_sidecar_keys: Vec::new(),
                 media_upload_keys: Vec::new(),
-                retained_shared_cas_keys: Vec::new(),
                 unknown_keys: Vec::new(),
                 unsupported_version_keys: Vec::new(),
             },

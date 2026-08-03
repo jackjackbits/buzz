@@ -146,16 +146,6 @@ CREATE TABLE community_deletion_checkpoints (
     CHECK ((status = 'failed') = (error IS NOT NULL))
 );
 
-CREATE TABLE community_deletion_retention_exceptions (
-    request_id UUID NOT NULL REFERENCES community_deletion_requests(id) ON DELETE RESTRICT,
-    exception_key TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    expires_at TIMESTAMPTZ,
-    created_by TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (request_id, exception_key)
-);
-
 CREATE TABLE community_serving_write_leases (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     community_id UUID NOT NULL REFERENCES communities(id),
@@ -166,8 +156,7 @@ CREATE TABLE community_serving_write_leases (
     fence_generation BIGINT NOT NULL CHECK (fence_generation >= 0),
     lease_until TIMESTAMPTZ NOT NULL,
     heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (community_id, id)
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX community_serving_write_leases_active
     ON community_serving_write_leases (community_id, lease_until);
@@ -186,7 +175,6 @@ INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('community_deletion_requests', 'deployment deletion lifecycle and frozen inventory'),
     ('community_deletion_approvals', 'deployment operator destructive approvals'),
     ('community_deletion_checkpoints', 'deployment deletion executor checkpoints and failures'),
-    ('community_deletion_retention_exceptions', 'deployment retention holds and expiry exceptions'),
     ('community_serving_write_leases', 'deployment serving side-effect leases drained by deletion'),
     ('community_deletion_executor_heartbeats', 'deployment deletion worker liveness');
 
@@ -208,7 +196,6 @@ LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE AS $$
         'community_deletion_requests',
         'community_deletion_approvals',
         'community_deletion_checkpoints',
-        'community_deletion_retention_exceptions',
         'community_serving_write_leases',
         'community_deletion_executor_heartbeats'
     ]::TEXT[])

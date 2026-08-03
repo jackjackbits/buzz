@@ -797,7 +797,6 @@ pub fn deletion_inventory(
     inventory.media_sidecar_keys.sort();
     inventory.media_upload_keys.sort();
     inventory.git_pointer_keys.sort();
-    inventory.retained_shared_cas_keys.sort();
     inventory.unknown_keys.sort();
     inventory
 }
@@ -845,8 +844,6 @@ pub struct DeletionBucketInventory {
     pub media_upload_keys: Vec<String>,
     /// Community Git repository pointers.
     pub git_pointer_keys: Vec<String>,
-    /// Shared immutable media/Git CAS data retained in V1.
-    pub retained_shared_cas_keys: Vec<String>,
     /// Bucket keys outside the exact writer taxonomy.
     pub unknown_keys: Vec<String>,
 }
@@ -886,7 +883,6 @@ mod deletion_inventory_tests {
         assert_eq!(inventory.media_sidecar_keys.len(), 1);
         assert_eq!(inventory.media_upload_keys.len(), 1);
         assert_eq!(inventory.git_pointer_keys.len(), 1);
-        assert!(inventory.retained_shared_cas_keys.is_empty());
         assert!(inventory.unknown_keys.is_empty());
         assert_eq!(inventory.tenant_keys().len(), 3);
     }

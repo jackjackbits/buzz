@@ -351,7 +351,6 @@ mod tests {
             "community_deletion_requests",
             "community_deletion_approvals",
             "community_deletion_checkpoints",
-            "community_deletion_retention_exceptions",
             "community_serving_write_leases",
             "community_deletion_executor_heartbeats",
         ] {

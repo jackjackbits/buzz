@@ -593,10 +593,7 @@ fn validate_storage_ownership(request: &DeletionRequest, manifest: &StorageManif
             .iter()
             .map(|object| (object.key.clone(), object.size)),
     );
-    if classified.tenant_keys() != manifest.tenant_keys
-        || !classified.unknown_keys.is_empty()
-        || !classified.retained_shared_cas_keys.is_empty()
-    {
+    if classified.tenant_keys() != manifest.tenant_keys || !classified.unknown_keys.is_empty() {
         return Err(permanent(
             "storage manifest contains keys not owned by the deletion target",
         ));
@@ -665,7 +662,6 @@ async fn build_storage_manifest_from_objects(
         git_pointer_keys: bucket.git_pointer_keys,
         media_sidecar_keys: bucket.media_sidecar_keys,
         media_upload_keys: bucket.media_upload_keys,
-        retained_shared_cas_keys: bucket.retained_shared_cas_keys,
         unknown_keys: bucket.unknown_keys,
         unsupported_version_keys,
     };
@@ -1174,13 +1170,12 @@ async fn execute_stage(
                 .await?;
         }
         DeletionStage::LogicallyVerified => {
-            let frozen = validate_frozen_inventory(request)?;
+            validate_frozen_inventory(request)?;
             services
                 .store
                 .mark_retention_pending(
                     &token,
                     serde_json::json!({
-                        "retained_shared_cas_keys": frozen.storage.retained_shared_cas_keys,
                         "policy": "member-erasure and fleet-wide shared-CAS GC are out of V1 scope"
                     }),
                 )
@@ -1456,7 +1451,6 @@ mod tests {
                 git_pointer_keys: Vec::new(),
                 media_sidecar_keys: Vec::new(),
                 media_upload_keys: Vec::new(),
-                retained_shared_cas_keys: Vec::new(),
                 unknown_keys: Vec::new(),
                 unsupported_version_keys: Vec::new(),
             },
@@ -1554,7 +1548,7 @@ mod tests {
         let mut digest_tampered = claim.request.clone();
         digest_tampered.inventory_manifest = Some(serde_json::json!({
             "schema": {"revision": 0, "migration_version": 0, "scoped_tables": [], "row_counts": {}, "fenced_tables": []},
-            "storage": {"version": 2, "tenant_keys": [], "tenant_objects": [], "git_pointer_keys": [], "media_sidecar_keys": [], "media_upload_keys": [], "retained_shared_cas_keys": [], "unknown_keys": [], "unsupported_version_keys": []}
+            "storage": {"version": 2, "tenant_keys": [], "tenant_objects": [], "git_pointer_keys": [], "media_sidecar_keys": [], "media_upload_keys": [], "unknown_keys": [], "unsupported_version_keys": []}
         }));
         assert!(validate_frozen_inventory(&digest_tampered).is_err());
 
@@ -1571,7 +1565,6 @@ mod tests {
             git_pointer_keys: Vec::new(),
             media_sidecar_keys: Vec::new(),
             media_upload_keys: Vec::new(),
-            retained_shared_cas_keys: Vec::new(),
             unknown_keys: Vec::new(),
             unsupported_version_keys: Vec::new(),
         };
@@ -1614,7 +1607,6 @@ mod tests {
             git_pointer_keys: Vec::new(),
             media_sidecar_keys: vec![object_key.clone()],
             media_upload_keys: Vec::new(),
-            retained_shared_cas_keys: Vec::new(),
             unknown_keys: Vec::new(),
             unsupported_version_keys: Vec::new(),
         };
