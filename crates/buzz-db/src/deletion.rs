@@ -1304,6 +1304,12 @@ impl DeletionStore {
         let mut tx = self.pool.begin().await?;
         verify_lease_and_fence(&mut tx, token, DeletionStage::BindingsRemoved, generation).await?;
         set_executor_gucs(&mut tx, token.community_id, generation).await?;
+        // Migration 0011 fences hard deletion of NIP-RS rows against legacy
+        // writers. Whole-community deletion is an intentional hard-delete path,
+        // and the transaction is already bound to an approved, fenced tenant.
+        sqlx::query("SELECT set_config('buzz.nip_rs_hard_delete', 'on', true)")
+            .execute(&mut *tx)
+            .await?;
 
         let mut deleted = BTreeMap::new();
         // The order is child-before-parent/FK-safe, not alphabetical. Cascades
@@ -2829,6 +2835,24 @@ mod postgres_tests {
         let (db, store) = store().await;
         let (request, inventory) = inventoried_request(&db, &store).await;
         let host = request.community_host.clone();
+        let read_state_d_tag = format!("read-state:{}", "a".repeat(32));
+        sqlx::query(
+            "INSERT INTO events \
+             (community_id, id, pubkey, created_at, kind, tags, content, sig, d_tag) \
+             VALUES ($1, $2, $3, now(), 30078, $4, '', $5, $6)",
+        )
+        .bind(request.community_id.as_uuid())
+        .bind(vec![1_u8; 32])
+        .bind(vec![2_u8; 32])
+        .bind(serde_json::json!([
+            ["d", &read_state_d_tag],
+            ["t", "read-state"]
+        ]))
+        .bind(vec![3_u8; 64])
+        .bind(&read_state_d_tag)
+        .execute(&db.pool)
+        .await
+        .expect("insert guarded NIP-RS row");
         store
             .approve(request.id, "approver", None)
             .await
