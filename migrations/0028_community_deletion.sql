@@ -215,10 +215,9 @@ BEFORE INSERT OR UPDATE OR DELETE ON community_deletion_manifest_keys
 FOR EACH ROW
 EXECUTE FUNCTION protect_community_deletion_manifest_keys();
 
--- Fleet-wide object-store taxonomy sweep evidence. The unknown-key
--- fail-closed invariant is a fleet property, not a per-request one: deletion
--- inventory and fencing require a recent clean sweep instead of re-listing
--- the whole bucket inline per request.
+-- Fleet-wide object-store taxonomy sweep evidence. This is an independent
+-- observability record: community deletion inventories only the target's owned
+-- prefixes and does not gate submission or execution on sweep state.
 CREATE TABLE storage_taxonomy_sweeps (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     started_at TIMESTAMPTZ NOT NULL,

@@ -2336,17 +2336,13 @@ mod track_c_tests {
             .submit(host, "git-finalize-test", Some("post-CAS lease regression"))
             .await
             .expect("submit deletion");
-        let sweep = store
-            .record_taxonomy_sweep(chrono::Utc::now(), 0, 0, &[], 1_000_000)
-            .await
-            .expect("record clean taxonomy sweep");
         let inventory = FrozenInventory {
             schema: store
                 .inventory_schema(request.community_id)
                 .await
                 .expect("schema inventory"),
             storage: StorageManifest {
-                version: 3,
+                version: 4,
                 prefixes: buzz_media::tenant_prefixes(*request.community_id.as_uuid())
                     .into_iter()
                     .map(|prefix| PrefixManifest {
@@ -2356,8 +2352,6 @@ mod track_c_tests {
                         keys_digest: KeyStreamDigest::new().finish().0,
                     })
                     .collect(),
-                taxonomy_sweep_id: sweep.id,
-                unknown_keys: Vec::new(),
             },
         };
         store

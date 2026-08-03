@@ -228,7 +228,7 @@ pub struct DeletionRequest {
     pub reason: Option<String>,
     /// Frozen catalog manifest.
     pub schema_manifest: Option<serde_json::Value>,
-    /// Frozen storage taxonomy manifest observed at submission.
+    /// Frozen community-prefix storage manifest observed at submission.
     pub storage_manifest: Option<serde_json::Value>,
     /// Destructive storage manifest frozen after the durable fence.
     pub destructive_storage_manifest: Option<serde_json::Value>,
@@ -276,20 +276,15 @@ pub struct SchemaManifest {
 }
 
 /// Frozen storage inventory supplied by the object-store adapter: slim
-/// per-prefix summaries bound to a clean fleet taxonomy sweep. The concrete
-/// key list never lives on the request row — the destructive freeze persists
-/// it as chunked `community_deletion_manifest_keys` rows that must hash to
-/// these digests.
+/// per-prefix summaries for the target community. The concrete key list never
+/// lives on the request row — the destructive freeze persists it as chunked
+/// `community_deletion_manifest_keys` rows that must hash to these digests.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageManifest {
     /// Adapter schema version.
     pub version: i32,
     /// Per-prefix frozen summaries, strictly sorted by prefix.
     pub prefixes: Vec<PrefixManifest>,
-    /// Clean fleet taxonomy sweep this inventory relied on.
-    pub taxonomy_sweep_id: Uuid,
-    /// Tenant-prefix keys outside the exact writer taxonomy. Non-empty fails.
-    pub unknown_keys: Vec<String>,
 }
 
 /// Frozen summary of one community-scoped key prefix.
@@ -319,7 +314,7 @@ pub struct ManifestKeyChunk {
 /// One durable fleet-wide object-store taxonomy sweep record.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaxonomySweep {
-    /// Sweep identity bound into storage manifests.
+    /// Sweep identity.
     pub id: Uuid,
     /// Listing start time.
     pub started_at: DateTime<Utc>,
@@ -1250,8 +1245,8 @@ impl DeletionStore {
         validate_storage_manifest(manifest)?;
         // The chunk rows are the concrete delete list; the freeze commits only
         // if they hash to the manifest's frozen per-prefix digests. Loading the
-        // full chunk stream is a one-time freeze-boundary cost bounded by the
-        // per-community object cap, not the fleet.
+        // full chunk stream is a one-time freeze-boundary cost proportional to
+        // this community's bindings, never the fleet bucket.
         let chunks: Vec<(i64, String, sqlx::types::Json<Vec<String>>)> = sqlx::query_as(
             "SELECT chunk_no, prefix, keys FROM community_deletion_manifest_keys \
              WHERE request_id = $1 ORDER BY chunk_no",
@@ -2195,9 +2190,9 @@ fn validate_serving_migration_version(migration_version: Option<i64>) -> Result<
     }
 }
 
-/// Fail closed when storage inventory reports unknown or malformed data.
+/// Fail closed when a community-prefix inventory has an unsafe shape.
 pub fn validate_storage_manifest(manifest: &StorageManifest) -> Result<()> {
-    if manifest.version != 3 {
+    if manifest.version != 4 {
         return Err(DbError::DeletionSafety(format!(
             "unsupported storage manifest version {}",
             manifest.version
@@ -2235,17 +2230,6 @@ pub fn validate_storage_manifest(manifest: &StorageManifest) -> Result<()> {
                 prefix.prefix
             )));
         }
-    }
-    if manifest.taxonomy_sweep_id.is_nil() {
-        return Err(DbError::DeletionSafety(
-            "storage manifest is not bound to a taxonomy sweep".to_string(),
-        ));
-    }
-    if !manifest.unknown_keys.is_empty() {
-        return Err(DbError::DeletionSafety(format!(
-            "unknown object-store keys block deletion: {}",
-            manifest.unknown_keys.join(",")
-        )));
     }
     Ok(())
 }
@@ -2571,14 +2555,12 @@ mod tests {
 
     fn storage_manifest() -> StorageManifest {
         StorageManifest {
-            version: 3,
+            version: 4,
             prefixes: vec![
                 empty_prefix("_meta/c/"),
                 empty_prefix("_uploads/c/"),
                 empty_prefix("repos/c/"),
             ],
-            taxonomy_sweep_id: Uuid::from_u128(1),
-            unknown_keys: Vec::new(),
         }
     }
 
@@ -2654,18 +2636,6 @@ mod tests {
         let mut malformed_digest = storage_manifest();
         malformed_digest.prefixes[0].keys_digest = "not-hex".to_string();
         assert!(validate_storage_manifest(&malformed_digest).is_err());
-
-        let mut unswept = storage_manifest();
-        unswept.taxonomy_sweep_id = Uuid::nil();
-        assert!(validate_storage_manifest(&unswept).is_err());
-    }
-
-    #[test]
-    fn unknown_storage_data_fails_closed() {
-        let mut manifest = storage_manifest();
-        manifest.unknown_keys.push("mystery/data".to_string());
-        let error = validate_storage_manifest(&manifest).expect_err("unknown key must block");
-        assert!(error.to_string().contains("unknown object-store keys"));
     }
 
     #[test]
@@ -2785,16 +2755,14 @@ mod postgres_tests {
         }
     }
 
-    fn empty_storage_manifest(community: CommunityId, sweep_id: Uuid) -> StorageManifest {
+    fn empty_storage_manifest(community: CommunityId) -> StorageManifest {
         StorageManifest {
-            version: 3,
+            version: 4,
             prefixes: vec![
                 empty_prefix_manifest(format!("_meta/{community}/")),
                 empty_prefix_manifest(format!("_uploads/{community}/")),
                 empty_prefix_manifest(format!("repos/{community}/")),
             ],
-            taxonomy_sweep_id: sweep_id,
-            unknown_keys: Vec::new(),
         }
     }
 
@@ -2812,16 +2780,12 @@ mod postgres_tests {
             .await
             .expect("submit");
         assert_eq!(submitted.community_id, community.id);
-        let sweep = store
-            .record_taxonomy_sweep(Utc::now(), 0, 0, &[], 1_000_000)
-            .await
-            .expect("record clean taxonomy sweep");
         let inventory = FrozenInventory {
             schema: store
                 .inventory_schema(community.id)
                 .await
                 .expect("schema inventory"),
-            storage: empty_storage_manifest(community.id, sweep.id),
+            storage: empty_storage_manifest(community.id),
         };
         let request = store
             .freeze_inventory(submitted.id, &inventory)

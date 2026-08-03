@@ -3270,17 +3270,13 @@ mod tests {
             )
             .await
             .expect("submit");
-        let sweep = store
-            .record_taxonomy_sweep(chrono::Utc::now(), 0, 0, &[], 1_000_000)
-            .await
-            .expect("record clean taxonomy sweep");
         let inventory = FrozenInventory {
             schema: store
                 .inventory_schema(community)
                 .await
                 .expect("schema inventory"),
             storage: StorageManifest {
-                version: 3,
+                version: 4,
                 prefixes: buzz_media::tenant_prefixes(*community.as_uuid())
                     .into_iter()
                     .map(|prefix| PrefixManifest {
@@ -3290,8 +3286,6 @@ mod tests {
                         keys_digest: KeyStreamDigest::new().finish().0,
                     })
                     .collect(),
-                taxonomy_sweep_id: sweep.id,
-                unknown_keys: Vec::new(),
             },
         };
         let request = store

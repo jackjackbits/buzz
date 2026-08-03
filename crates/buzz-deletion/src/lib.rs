@@ -10,8 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use buzz_db::deletion::{
     ClaimedDeletion, DeletionRequest, DeletionStage, DeletionStore, FrozenInventory,
-    KeyStreamDigest, LeaseToken, PrefixManifest, StorageManifest, TaxonomySweep,
-    DEFAULT_LEASE_DURATION,
+    KeyStreamDigest, LeaseToken, PrefixManifest, StorageManifest, DEFAULT_LEASE_DURATION,
 };
 use buzz_db::{Db, DbConfig};
 use buzz_media::{is_tenant_owned_key, tenant_prefixes, MediaStorage};
@@ -20,12 +19,8 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// Per-community object cap; the fleet cap moved to the taxonomy sweep.
-const DEFAULT_COMMUNITY_OBJECT_CAP: u64 = 1_000_000;
-/// Fleet-wide object cap for one taxonomy sweep.
+/// Fleet-wide object cap for one observational taxonomy sweep.
 const DEFAULT_SWEEP_OBJECT_CAP: u64 = 10_000_000;
-/// A deletion may rely on a clean sweep at most this old.
-const DEFAULT_SWEEP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Keys per frozen side-table chunk (one `DeleteObjects`-sized unit × 10).
 const DEFAULT_MANIFEST_CHUNK_KEYS: usize = 10_000;
 /// Unknown keys retained verbatim on a sweep record for diagnosis.
@@ -271,11 +266,10 @@ pub enum Command {
         #[arg(long)]
         executor_id: Option<String>,
     },
-    /// Sweep the whole bucket's key taxonomy and record the fleet evidence.
+    /// Sweep the whole bucket's key taxonomy and record observational evidence.
     ///
-    /// Submit and fencing require a recent clean sweep instead of re-listing
-    /// the fleet bucket per deletion. Exits non-zero when unknown writer
-    /// shapes are found.
+    /// This is independent of community deletion. It reports unknown writer
+    /// shapes but never gates submission or destructive progress.
     Sweep,
 }
 
@@ -363,12 +357,11 @@ pub async fn run(command: Command) -> Result<i32> {
             if host.is_empty() {
                 anyhow::bail!("cannot derive community host; pass --host or set RELAY_URL");
             }
-            let sweep = require_fresh_clean_sweep(&services).await?;
             let request = services
                 .store
                 .submit(&host, &requested_by, reason.as_deref())
                 .await?;
-            let inventory = build_inventory(&services, &request, sweep.id).await?;
+            let inventory = build_inventory(&services, &request).await?;
             let request = services
                 .store
                 .freeze_inventory(request.id, &inventory)
@@ -506,54 +499,6 @@ where
         .unwrap_or(default)
 }
 
-/// Gate destructive progress on recent fleet-wide taxonomy evidence.
-///
-/// A missing or stale sweep is transient — the operator runs the sweep
-/// command and retries. A dirty sweep is the fail-closed unknown-key
-/// invariant and blocks permanently.
-async fn require_fresh_clean_sweep(services: &Services) -> Result<TaxonomySweep> {
-    let sweep = services
-        .store
-        .latest_taxonomy_sweep()
-        .await?
-        .ok_or_else(|| {
-            transient("no storage taxonomy sweep recorded; run the deletions sweep command")
-        })?;
-    validate_fresh_clean_sweep(&sweep, chrono::Utc::now(), sweep_max_age())?;
-    Ok(sweep)
-}
-
-fn validate_fresh_clean_sweep(
-    sweep: &TaxonomySweep,
-    now: chrono::DateTime<chrono::Utc>,
-    max_age: Duration,
-) -> Result<()> {
-    let age = now.signed_duration_since(sweep.completed_at);
-    let max_age = chrono::Duration::from_std(max_age).unwrap_or(chrono::Duration::MAX);
-    if age < chrono::Duration::zero() {
-        return Err(transient(format!(
-            "latest storage taxonomy sweep {} completed in the future; run the deletions sweep command",
-            sweep.id
-        )));
-    }
-    if age > max_age {
-        return Err(transient(format!(
-            "latest storage taxonomy sweep {} is stale ({}h old); run the deletions sweep command",
-            sweep.id,
-            age.num_hours()
-        )));
-    }
-    if sweep.unknown_object_count > 0 {
-        return Err(permanent(format!(
-            "latest storage taxonomy sweep {} found {} unknown object-store key(s); sample: {}",
-            sweep.id,
-            sweep.unknown_object_count,
-            sweep.unknown_key_sample.join(",")
-        )));
-    }
-    Ok(())
-}
-
 fn validate_frozen_inventory(request: &DeletionRequest) -> Result<FrozenInventory> {
     let frozen: FrozenInventory = serde_json::from_value(
         request
@@ -593,13 +538,12 @@ fn validate_storage_ownership(request: &DeletionRequest, manifest: &StorageManif
 async fn build_inventory(
     services: &Services,
     request: &DeletionRequest,
-    sweep_id: Uuid,
 ) -> Result<FrozenInventory> {
     let schema = services
         .store
         .inventory_schema(request.community_id)
         .await?;
-    let storage = enumerate_tenant_prefixes(services, request, sweep_id, None, None).await?;
+    let storage = enumerate_tenant_prefixes(services, request, None, None).await?;
     Ok(FrozenInventory { schema, storage })
 }
 
@@ -625,16 +569,16 @@ async fn flush_chunk(services: &Services, sink: &mut ChunkSink<'_>, prefix: &str
 
 /// Enumerate the target's three tenant prefixes into per-prefix summaries.
 ///
-/// Cost is O(tenant objects) regardless of fleet size; the fleet-level
-/// unknown-key invariant is covered by the taxonomy sweep gate instead.
-/// Memory stays bounded at one listing page plus one buffered chunk — the
-/// full key list is never materialized. When `sink` is supplied, keys are
-/// also persisted as side-table chunks (never spanning prefixes) for the
-/// destructive freeze to bind against these digests.
+/// Cost is O(tenant objects) regardless of fleet size. Unknown shapes inside
+/// one of the owned prefixes fail closed; keys elsewhere in the shared bucket
+/// are outside this operation's contract. Memory stays bounded at one listing
+/// page plus one buffered chunk — the full key list is never materialized.
+/// When `sink` is supplied, keys are also persisted as side-table chunks
+/// (never spanning prefixes) for the destructive freeze to bind against these
+/// digests.
 async fn enumerate_tenant_prefixes(
     services: &Services,
     request: &DeletionRequest,
-    sweep_id: Uuid,
     heartbeat_lost: Option<&CancellationToken>,
     mut sink: Option<&mut ChunkSink<'_>>,
 ) -> Result<StorageManifest> {
@@ -644,10 +588,8 @@ async fn enumerate_tenant_prefixes(
         ));
     }
     let community = *request.community_id.as_uuid();
-    let cap = storage_object_cap();
     let chunk_keys = manifest_chunk_keys();
     let mut prefixes = Vec::new();
-    let mut total_objects: u64 = 0;
     for prefix in tenant_prefixes(community) {
         let mut digest = KeyStreamDigest::new();
         let mut total_bytes: u64 = 0;
@@ -660,12 +602,6 @@ async fn enumerate_tenant_prefixes(
                 .media
                 .list_prefix_page(&prefix, continuation.take(), LIST_PAGE_SIZE)
                 .await?;
-            total_objects = total_objects.saturating_add(page.objects.len() as u64);
-            if total_objects > cap {
-                return Err(permanent(format!(
-                    "community storage inventory exceeds per-community object cap {cap}"
-                )));
-            }
             for (key, size) in page.objects {
                 if !is_tenant_owned_key(community, &key) {
                     return Err(permanent(format!(
@@ -703,10 +639,8 @@ async fn enumerate_tenant_prefixes(
         });
     }
     let manifest = StorageManifest {
-        version: 3,
+        version: 4,
         prefixes,
-        taxonomy_sweep_id: sweep_id,
-        unknown_keys: Vec::new(),
     };
     buzz_db::deletion::validate_storage_manifest(&manifest)?;
     Ok(manifest)
@@ -721,7 +655,7 @@ async fn freeze_destructive_manifest(
     token: &LeaseToken,
     heartbeat_lost: &CancellationToken,
 ) -> Result<StorageManifest> {
-    let frozen = validate_frozen_inventory(request)?;
+    validate_frozen_inventory(request)?;
     // A prior interrupted freeze may have left partial chunks; they were
     // never bound to a committed manifest, so rewrite them from scratch.
     services.store.clear_manifest_key_chunks(token).await?;
@@ -730,14 +664,8 @@ async fn freeze_destructive_manifest(
         next_chunk_no: 0,
         buffered: Vec::new(),
     };
-    let manifest = enumerate_tenant_prefixes(
-        services,
-        request,
-        frozen.storage.taxonomy_sweep_id,
-        Some(heartbeat_lost),
-        Some(&mut sink),
-    )
-    .await?;
+    let manifest =
+        enumerate_tenant_prefixes(services, request, Some(heartbeat_lost), Some(&mut sink)).await?;
     services
         .store
         .freeze_destructive_storage_manifest(token, &manifest)
@@ -1009,9 +937,9 @@ async fn execute_stage(
     }
     match request.stage {
         DeletionStage::Approved => {
-            // Approval binds immutable catalog + key taxonomy. Live row counts
-            // and tenant binding keys are deliberately not equality-bound until
-            // the durable fence closes all writers.
+            // Approval binds immutable catalog + community-prefix ownership.
+            // Live row counts and tenant binding keys are deliberately not
+            // equality-bound until the durable fence closes all writers.
             let live_schema = services
                 .store
                 .inventory_schema(request.community_id)
@@ -1022,9 +950,6 @@ async fn execute_stage(
                     "approved structural catalog drifted before fencing",
                 ));
             }
-            // The fleet unknown-key invariant is sweep evidence, not an
-            // inline re-listing of the whole bucket.
-            require_fresh_clean_sweep(services).await?;
             services.store.begin_quiescing(&token).await?;
             match services.store.fence(&token).await {
                 Ok(_) => {}
@@ -1319,29 +1244,12 @@ async fn verify_redis_absence(
     }
 }
 
-fn storage_object_cap() -> u64 {
-    std::env::var("BUZZ_DELETION_STORAGE_MAX_OBJECTS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_COMMUNITY_OBJECT_CAP)
-}
-
 fn sweep_object_cap() -> u64 {
     std::env::var("BUZZ_DELETION_SWEEP_MAX_OBJECTS")
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_SWEEP_OBJECT_CAP)
-}
-
-fn sweep_max_age() -> Duration {
-    std::env::var("BUZZ_DELETION_SWEEP_MAX_AGE_SECS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_SWEEP_MAX_AGE)
 }
 
 fn manifest_chunk_keys() -> usize {
@@ -1400,28 +1308,9 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn future_taxonomy_sweep_fails_closed() {
-        let now = chrono::Utc::now();
-        let sweep = TaxonomySweep {
-            id: Uuid::new_v4(),
-            started_at: now,
-            completed_at: now + chrono::Duration::minutes(1),
-            listed_objects: 0,
-            unknown_object_count: 0,
-            unknown_key_sample: Vec::new(),
-            object_cap: 1_000_000,
-        };
-
-        assert!(validate_fresh_clean_sweep(&sweep, now, Duration::from_secs(86_400)).is_err());
-    }
-
-    fn empty_storage_manifest(
-        community: buzz_core::CommunityId,
-        sweep_id: Uuid,
-    ) -> StorageManifest {
+    fn empty_storage_manifest(community: buzz_core::CommunityId) -> StorageManifest {
         StorageManifest {
-            version: 3,
+            version: 4,
             prefixes: tenant_prefixes(*community.as_uuid())
                 .into_iter()
                 .map(|prefix| PrefixManifest {
@@ -1431,8 +1320,6 @@ mod tests {
                     keys_digest: KeyStreamDigest::new().finish().0,
                 })
                 .collect(),
-            taxonomy_sweep_id: sweep_id,
-            unknown_keys: Vec::new(),
         }
     }
 
@@ -1455,16 +1342,12 @@ mod tests {
             .submit(&host, "test", None)
             .await
             .expect("submit deletion request");
-        let sweep = store
-            .record_taxonomy_sweep(chrono::Utc::now(), 0, 0, &[], 1_000_000)
-            .await
-            .expect("record clean taxonomy sweep");
         let inventory = FrozenInventory {
             schema: store
                 .inventory_schema(community.id)
                 .await
                 .expect("inventory schema"),
-            storage: empty_storage_manifest(community.id, sweep.id),
+            storage: empty_storage_manifest(community.id),
         };
         store
             .freeze_inventory(request.id, &inventory)
@@ -1552,16 +1435,14 @@ mod tests {
         let mut digest_tampered = claim.request.clone();
         digest_tampered.inventory_manifest = Some(serde_json::json!({
             "schema": {"revision": 0, "migration_version": 0, "scoped_tables": [], "row_counts": {}, "fenced_tables": []},
-            "storage": {"version": 3, "prefixes": [], "taxonomy_sweep_id": Uuid::from_u128(1), "unknown_keys": []}
+            "storage": {"version": 4, "prefixes": []}
         }));
         assert!(validate_frozen_inventory(&digest_tampered).is_err());
 
         // A manifest scoped to another community's prefixes is never the
         // deletion target's, even when internally valid.
-        let foreign_manifest = empty_storage_manifest(
-            buzz_core::CommunityId::from_uuid(Uuid::new_v4()),
-            Uuid::from_u128(1),
-        );
+        let foreign_manifest =
+            empty_storage_manifest(buzz_core::CommunityId::from_uuid(Uuid::new_v4()));
         assert!(validate_storage_ownership(&claim.request, &foreign_manifest).is_err());
     }
 
@@ -1614,11 +1495,7 @@ mod tests {
             digest.fold(key).expect("fold key");
         }
         let (keys_digest, object_count) = digest.finish();
-        let mut storage = empty_storage_manifest(community, Uuid::from_u128(1));
-        storage.taxonomy_sweep_id = validate_frozen_inventory(&claim.request)
-            .expect("frozen inventory")
-            .storage
-            .taxonomy_sweep_id;
+        let mut storage = empty_storage_manifest(community);
         storage.prefixes[0] = PrefixManifest {
             prefix: meta_prefix.clone(),
             object_count,

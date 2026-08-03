@@ -497,6 +497,28 @@ mod tests {
     }
 
     #[test]
+    fn tenant_key_writers_are_covered_by_deletion_taxonomy() {
+        let ctx = tenant(1);
+        let community = *ctx.community().as_uuid();
+        let sha = "a".repeat(64);
+        let event_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let sidecar = MediaStorage::ctx_sidecar_key(&ctx, &sha);
+        let upload = crate::upload_record::upload_record_key(&ctx, &sha, event_id);
+        let prefixes = crate::bucket_index::tenant_prefixes(community);
+
+        for key in [sidecar, upload] {
+            assert!(
+                prefixes.iter().any(|prefix| key.starts_with(prefix)),
+                "tenant writer key {key} is outside deletion prefixes"
+            );
+            assert!(
+                crate::bucket_index::is_tenant_owned_key(community, &key),
+                "tenant writer key {key} is not recognized by deletion taxonomy"
+            );
+        }
+    }
+
+    #[test]
     fn sidecar_keys_are_community_scoped() {
         let a = tenant(1);
         let b = tenant(2);
