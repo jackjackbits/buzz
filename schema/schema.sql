@@ -794,6 +794,48 @@ INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('communities',           'the tenant registry itself; id IS the community key'),
     ('rate_limit_violations', 'deployment abuse/health; never tenant-observable; community_id is an attribution label only'),
     ('_operator_global_tables', 'the registry table itself');
+
+-- ── Additive tenant tables represented in migrations 0002/0007/0017 ──────────
+-- Keep desired-state schema parity with the embedded SQLx migration path.
+CREATE TABLE git_repo_names (
+    community_id  UUID NOT NULL REFERENCES communities(id),
+    repo_id       TEXT NOT NULL,
+    owner_pubkey  TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (community_id, repo_id)
+);
+CREATE INDEX idx_git_repo_names_owner ON git_repo_names (community_id, owner_pubkey);
+
+CREATE TABLE parameterized_event_watermarks (
+    community_id  UUID NOT NULL REFERENCES communities(id),
+    kind          INT NOT NULL,
+    pubkey        BYTEA NOT NULL,
+    d_tag         TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL,
+    event_id      BYTEA NOT NULL,
+    PRIMARY KEY (community_id, kind, pubkey, d_tag)
+);
+CREATE INDEX idx_event_mentions_community_event
+    ON event_mentions (community_id, event_id);
+
+CREATE TABLE product_feedback (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    community_id UUID NOT NULL REFERENCES communities(id),
+    event_id BYTEA NOT NULL CHECK (length(event_id) = 32),
+    submitter_pubkey BYTEA NOT NULL CHECK (length(submitter_pubkey) = 32),
+    category TEXT CHECK (category IN ('bug', 'praise', 'needs-work')),
+    body TEXT NOT NULL CHECK (length(btrim(body)) > 0),
+    tags JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(tags) = 'array'),
+    event_created_at TIMESTAMPTZ NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (event_id)
+);
+CREATE INDEX idx_product_feedback_received
+    ON product_feedback (received_at DESC, id);
+CREATE INDEX idx_product_feedback_community_received
+    ON product_feedback (community_id, received_at DESC, id);
+INSERT INTO _operator_global_tables (table_name, reason) VALUES
+    ('product_feedback', 'deployment product inbox; community_id is provenance only');
 -- NIP-PL effective lease state and durable wake outbox. Every key is led by
 -- community_id: client-provided origin is confirmation only, never routing.
 CREATE TABLE push_leases (
@@ -1399,11 +1441,11 @@ BEGIN
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE c.oid = target
-       AND n.nspname = 'public'
+       AND n.nspname = current_schema()
        AND c.relkind IN ('r', 'p')
        AND NOT c.relispartition;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'community write fence target % is not a public table', target
+        RAISE EXCEPTION 'community write fence target % is not a table in the current schema', target
             USING ERRCODE = 'wrong_object_type';
     END IF;
     IF community_write_fence_excluded_table(relation_name) THEN
@@ -1443,7 +1485,7 @@ BEGIN
           FROM pg_class c
           JOIN pg_namespace n ON n.oid = c.relnamespace
           JOIN pg_attribute a ON a.attrelid = c.oid
-         WHERE n.nspname = 'public'
+         WHERE n.nspname = current_schema()
            AND c.relkind IN ('r', 'p')
            AND NOT c.relispartition
            AND a.attname = 'community_id'
@@ -1455,3 +1497,38 @@ BEGIN
     END LOOP;
 END
 $$;
+
+-- Desired-state schema application does not replay migration history, so keep
+-- these explicit calls as first-class catalog declarations. They also make the
+-- fence contract visible to migration linting instead of hiding it only in the
+-- dynamic bootstrap loop above.
+SELECT attach_community_write_fence('api_tokens');
+SELECT attach_community_write_fence('archived_identities');
+SELECT attach_community_write_fence('audit_log');
+SELECT attach_community_write_fence('channel_members');
+SELECT attach_community_write_fence('channels');
+SELECT attach_community_write_fence('community_bans');
+SELECT attach_community_write_fence('delivery_log');
+SELECT attach_community_write_fence('event_mentions');
+SELECT attach_community_write_fence('events');
+SELECT attach_community_write_fence('git_repo_names');
+SELECT attach_community_write_fence('join_policy_acceptances');
+SELECT attach_community_write_fence('moderation_actions');
+SELECT attach_community_write_fence('moderation_reports');
+SELECT attach_community_write_fence('parameterized_event_watermarks');
+SELECT attach_community_write_fence('product_feedback');
+SELECT attach_community_write_fence('pubkey_allowlist');
+SELECT attach_community_write_fence('push_leases');
+SELECT attach_community_write_fence('push_match_queue');
+SELECT attach_community_write_fence('push_wake_outbox');
+SELECT attach_community_write_fence('rate_limit_violations');
+SELECT attach_community_write_fence('reactions');
+SELECT attach_community_write_fence('relay_invites');
+SELECT attach_community_write_fence('relay_members');
+SELECT attach_community_write_fence('scheduled_workflow_fires');
+SELECT attach_community_write_fence('subscriptions');
+SELECT attach_community_write_fence('thread_metadata');
+SELECT attach_community_write_fence('users');
+SELECT attach_community_write_fence('workflow_approvals');
+SELECT attach_community_write_fence('workflow_runs');
+SELECT attach_community_write_fence('workflows');

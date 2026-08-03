@@ -445,14 +445,17 @@ impl DeletionStore {
     }
 
     /// Check deletion control-plane/schema connectivity.
+    ///
+    /// Probe the deployed catalog rather than SQLx's migration ledger. Buzz also
+    /// supports desired-state schema application through `pgschema`, which creates
+    /// the same deletion objects without creating `_sqlx_migrations`.
     pub async fn ping(&self) -> bool {
-        sqlx::query_scalar::<_, i32>(
-            "SELECT 1 FROM _sqlx_migrations WHERE version = $1 AND success LIMIT 1",
+        sqlx::query_scalar::<_, bool>(
+            "SELECT to_regclass('community_deletion_requests') IS NOT NULL",
         )
-        .bind(EXPECTED_MIGRATION_VERSION)
-        .fetch_optional(&self.pool)
+        .fetch_one(&self.pool)
         .await
-        .is_ok_and(|row| row == Some(1))
+        .unwrap_or(false)
     }
 
     /// Persist a request. Only active non-tombstone communities may be submitted.
@@ -578,8 +581,7 @@ impl DeletionStore {
     /// and rollback. Destructive inventory still calls [`Self::validate_catalog`]
     /// and requires exact migration/table equality.
     pub async fn validate_serving_catalog(&self) -> Result<()> {
-        let migration_version = self.live_migration_version().await?;
-        validate_serving_migration_version(migration_version)?;
+        validate_serving_migration_version(self.live_migration_version().await?)?;
 
         let runtime_columns = sqlx::query(
             "SELECT attname, format_type(atttypid, atttypmod) AS type_name, attnotnull \
@@ -691,8 +693,7 @@ impl DeletionStore {
     /// Unlike relay serving compatibility, this intentionally rejects newer
     /// migrations and unknown tenant tables until the deletion manifest changes.
     pub async fn validate_catalog(&self) -> Result<()> {
-        let migration_version = self.live_migration_version().await?;
-        validate_destructive_migration_version(migration_version)?;
+        validate_destructive_migration_version(self.live_migration_version().await?)?;
 
         let expected = EXPECTED_SCOPED_TABLES
             .iter()
@@ -1832,8 +1833,17 @@ impl DeletionStore {
         Ok(())
     }
 
-    async fn live_migration_version(&self) -> Result<i64> {
-        sqlx::query_scalar("SELECT COALESCE(max(version), 0) FROM _sqlx_migrations WHERE success")
+    async fn live_migration_version(&self) -> Result<Option<i64>> {
+        let ledger_exists: bool =
+            sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+                .fetch_one(&self.pool)
+                .await?;
+        if !ledger_exists {
+            // Desired-state `pgschema` applies the checked-in final catalog but
+            // intentionally does not synthesize SQLx migration history.
+            return Ok(None);
+        }
+        sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
             .fetch_one(&self.pool)
             .await
             .map_err(Into::into)
@@ -1887,20 +1897,22 @@ impl DeletionStore {
     }
 }
 
-fn validate_destructive_migration_version(migration_version: i64) -> Result<()> {
-    if migration_version != EXPECTED_MIGRATION_VERSION {
+fn validate_destructive_migration_version(migration_version: Option<i64>) -> Result<()> {
+    if migration_version.is_some_and(|version| version != EXPECTED_MIGRATION_VERSION) {
         Err(DbError::DeletionSafety(format!(
-            "community deletion schema migration drift: expected {EXPECTED_MIGRATION_VERSION}, got {migration_version}"
+            "community deletion schema migration drift: expected {EXPECTED_MIGRATION_VERSION}, got {}",
+            migration_version.expect("checked Some")
         )))
     } else {
         Ok(())
     }
 }
 
-fn validate_serving_migration_version(migration_version: i64) -> Result<()> {
-    if migration_version < EXPECTED_MIGRATION_VERSION {
+fn validate_serving_migration_version(migration_version: Option<i64>) -> Result<()> {
+    if migration_version.is_some_and(|version| version < EXPECTED_MIGRATION_VERSION) {
         Err(DbError::DeletionSafety(format!(
-            "community serving fence migration is too old: require at least {EXPECTED_MIGRATION_VERSION}, got {migration_version}"
+            "community serving fence migration is too old: require at least {EXPECTED_MIGRATION_VERSION}, got {}",
+            migration_version.expect("checked Some")
         )))
     } else {
         Ok(())
@@ -2272,12 +2284,16 @@ mod tests {
     }
 
     #[test]
-    fn serving_catalog_accepts_future_migrations_but_destructive_catalog_does_not() {
-        assert!(validate_serving_migration_version(EXPECTED_MIGRATION_VERSION).is_ok());
-        assert!(validate_serving_migration_version(EXPECTED_MIGRATION_VERSION + 1).is_ok());
-        assert!(validate_serving_migration_version(EXPECTED_MIGRATION_VERSION - 1).is_err());
-        assert!(validate_destructive_migration_version(EXPECTED_MIGRATION_VERSION).is_ok());
-        assert!(validate_destructive_migration_version(EXPECTED_MIGRATION_VERSION + 1).is_err());
+    fn migration_checks_accept_desired_state_catalogs_without_sqlx_ledger() {
+        assert!(validate_serving_migration_version(None).is_ok());
+        assert!(validate_destructive_migration_version(None).is_ok());
+        assert!(validate_serving_migration_version(Some(EXPECTED_MIGRATION_VERSION)).is_ok());
+        assert!(validate_serving_migration_version(Some(EXPECTED_MIGRATION_VERSION + 1)).is_ok());
+        assert!(validate_serving_migration_version(Some(EXPECTED_MIGRATION_VERSION - 1)).is_err());
+        assert!(validate_destructive_migration_version(Some(EXPECTED_MIGRATION_VERSION)).is_ok());
+        assert!(
+            validate_destructive_migration_version(Some(EXPECTED_MIGRATION_VERSION + 1)).is_err()
+        );
     }
 
     #[test]

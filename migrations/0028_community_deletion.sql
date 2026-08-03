@@ -356,11 +356,11 @@ BEGIN
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE c.oid = target
-       AND n.nspname = 'public'
+       AND n.nspname = current_schema()
        AND c.relkind IN ('r', 'p')
        AND NOT c.relispartition;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'community write fence target % is not a public table', target
+        RAISE EXCEPTION 'community write fence target % is not a table in the current schema', target
             USING ERRCODE = 'wrong_object_type';
     END IF;
     IF community_write_fence_excluded_table(relation_name) THEN
@@ -400,7 +400,7 @@ BEGIN
           FROM pg_class c
           JOIN pg_namespace n ON n.oid = c.relnamespace
           JOIN pg_attribute a ON a.attrelid = c.oid
-         WHERE n.nspname = 'public'
+         WHERE n.nspname = current_schema()
            AND c.relkind IN ('r', 'p')
            AND NOT c.relispartition
            AND a.attname = 'community_id'
@@ -412,3 +412,38 @@ BEGIN
     END LOOP;
 END
 $$;
+
+-- Desired-state schema application does not replay migration history, so keep
+-- these explicit calls as first-class catalog declarations. They also make the
+-- fence contract visible to migration linting instead of hiding it only in the
+-- dynamic bootstrap loop above.
+SELECT attach_community_write_fence('api_tokens');
+SELECT attach_community_write_fence('archived_identities');
+SELECT attach_community_write_fence('audit_log');
+SELECT attach_community_write_fence('channel_members');
+SELECT attach_community_write_fence('channels');
+SELECT attach_community_write_fence('community_bans');
+SELECT attach_community_write_fence('delivery_log');
+SELECT attach_community_write_fence('event_mentions');
+SELECT attach_community_write_fence('events');
+SELECT attach_community_write_fence('git_repo_names');
+SELECT attach_community_write_fence('join_policy_acceptances');
+SELECT attach_community_write_fence('moderation_actions');
+SELECT attach_community_write_fence('moderation_reports');
+SELECT attach_community_write_fence('parameterized_event_watermarks');
+SELECT attach_community_write_fence('product_feedback');
+SELECT attach_community_write_fence('pubkey_allowlist');
+SELECT attach_community_write_fence('push_leases');
+SELECT attach_community_write_fence('push_match_queue');
+SELECT attach_community_write_fence('push_wake_outbox');
+SELECT attach_community_write_fence('rate_limit_violations');
+SELECT attach_community_write_fence('reactions');
+SELECT attach_community_write_fence('relay_invites');
+SELECT attach_community_write_fence('relay_members');
+SELECT attach_community_write_fence('scheduled_workflow_fires');
+SELECT attach_community_write_fence('subscriptions');
+SELECT attach_community_write_fence('thread_metadata');
+SELECT attach_community_write_fence('users');
+SELECT attach_community_write_fence('workflow_approvals');
+SELECT attach_community_write_fence('workflow_runs');
+SELECT attach_community_write_fence('workflows');
