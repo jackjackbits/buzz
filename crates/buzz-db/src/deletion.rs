@@ -1234,6 +1234,18 @@ impl DeletionStore {
     ) -> Result<()> {
         let generation = require_fence_generation(token)?;
         let mut tx = self.pool.begin().await?;
+        // Serialize the freeze boundary with chunk INSERTs. The database trigger
+        // takes the same request-row lock before admitting each new chunk.
+        sqlx::query("SELECT id FROM community_deletion_requests WHERE id = $1 FOR UPDATE")
+            .bind(token.request_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                DbError::DeletionSafety(format!(
+                    "deletion request {} disappeared before manifest freeze",
+                    token.request_id
+                ))
+            })?;
         verify_lease_and_fence(&mut tx, token, DeletionStage::Fenced, generation).await?;
         validate_storage_manifest(manifest)?;
         // The chunk rows are the concrete delete list; the freeze commits only
@@ -1405,22 +1417,29 @@ impl DeletionStore {
             .map_err(|_| DbError::DeletionSafety("sweep unknown count overflow".to_string()))?;
         let cap = i64::try_from(object_cap)
             .map_err(|_| DbError::DeletionSafety("sweep object cap overflow".to_string()))?;
-        // completed_at is clamped server-side: the sweeper's clock supplies
-        // started_at, and skew ahead of Postgres would otherwise violate the
-        // completed_at >= started_at check.
-        let (id, completed_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
+        // Completion is authoritative database time. Small positive sweeper
+        // skew is clamped at that boundary; materially future starts are rejected.
+        let row: Option<(Uuid, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
             "INSERT INTO storage_taxonomy_sweeps \
              (started_at, completed_at, listed_objects, unknown_object_count, \
               unknown_key_sample, object_cap) \
-             VALUES ($1, GREATEST(now(), $1), $2, $3, $4, $5) RETURNING id, completed_at",
+             SELECT LEAST($1, db_now), db_now, $2, $3, $4, $5 \
+             FROM (SELECT clock_timestamp() AS db_now) clock \
+             WHERE $1 <= db_now + interval '5 minutes' \
+             RETURNING id, started_at, completed_at",
         )
         .bind(started_at)
         .bind(listed)
         .bind(unknown)
         .bind(sqlx::types::Json(unknown_key_sample))
         .bind(cap)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
+        let (id, started_at, completed_at) = row.ok_or_else(|| {
+            DbError::DeletionSafety(
+                "taxonomy sweep start time is more than five minutes in the future".to_string(),
+            )
+        })?;
         Ok(TaxonomySweep {
             id,
             started_at,
@@ -3353,6 +3372,30 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn taxonomy_sweep_uses_database_completion_order() {
+        let (_, store) = store().await;
+        store
+            .record_taxonomy_sweep(Utc::now() + chrono::Duration::minutes(1), 1, 0, &[], 100)
+            .await
+            .expect("record skewed clean sweep");
+        let dirty = store
+            .record_taxonomy_sweep(Utc::now(), 1, 1, &["unknown".to_string()], 100)
+            .await
+            .expect("record later dirty sweep");
+
+        assert_eq!(
+            store
+                .latest_taxonomy_sweep()
+                .await
+                .expect("latest sweep")
+                .unwrap()
+                .id,
+            dirty.id
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn manifest_key_chunks_bind_freeze_execution_and_cleanup() {
         let (db, store) = store().await;
         let (request, inventory) = inventoried_request(&db, &store).await;
@@ -3424,6 +3467,19 @@ mod postgres_tests {
                 .is_err()
         );
         assert!(store.clear_manifest_key_chunks(&token).await.is_err());
+        assert!(
+            sqlx::query(
+                "INSERT INTO community_deletion_manifest_keys \
+                 (request_id, chunk_no, prefix, keys) VALUES ($1, 2, $2, $3)",
+            )
+            .bind(request.id)
+            .bind(&meta_prefix)
+            .bind(sqlx::types::Json(&keys[..1]))
+            .execute(&db.pool)
+            .await
+            .is_err(),
+            "the database must reject chunks appended after freeze"
+        );
 
         store.mark_drained(&token).await.expect("drained");
         let first = store

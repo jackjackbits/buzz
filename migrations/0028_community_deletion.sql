@@ -162,9 +162,11 @@ CREATE TABLE community_deletion_manifest_keys (
 );
 
 -- Chunk content is immutable once written; the only permitted update is the
--- one-way deleted_at stamp. Removal is permitted only while the destructive
--- manifest has not yet frozen (a retried partial freeze rewrites its chunks)
--- or once the request has passed logical verification (terminal cleanup).
+-- one-way deleted_at stamp. New chunks are permitted only while the request is
+-- fenced and its destructive manifest remains unfrozen. Removal is permitted
+-- only while the destructive manifest has not yet frozen (a retried partial
+-- freeze rewrites its chunks) or once the request has passed logical
+-- verification (terminal cleanup).
 CREATE FUNCTION protect_community_deletion_manifest_keys()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -188,7 +190,15 @@ BEGIN
     SELECT destructive_storage_frozen_at, stage
       INTO frozen_at, request_stage
       FROM community_deletion_requests
-     WHERE id = OLD.request_id;
+     WHERE id = CASE WHEN TG_OP = 'INSERT' THEN NEW.request_id ELSE OLD.request_id END
+     FOR UPDATE;
+    IF TG_OP = 'INSERT' THEN
+        IF FOUND AND frozen_at IS NULL AND request_stage = 'fenced' THEN
+            RETURN NEW;
+        END IF;
+        RAISE EXCEPTION 'community deletion manifest key chunks require an unfrozen fenced request'
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
     IF NOT FOUND
         OR frozen_at IS NULL
         OR request_stage IN ('logically_verified', 'retention_pending')
@@ -201,7 +211,7 @@ END;
 $$;
 
 CREATE TRIGGER community_deletion_manifest_keys_guard
-BEFORE UPDATE OR DELETE ON community_deletion_manifest_keys
+BEFORE INSERT OR UPDATE OR DELETE ON community_deletion_manifest_keys
 FOR EACH ROW
 EXECUTE FUNCTION protect_community_deletion_manifest_keys();
 

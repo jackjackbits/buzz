@@ -519,8 +519,23 @@ async fn require_fresh_clean_sweep(services: &Services) -> Result<TaxonomySweep>
         .ok_or_else(|| {
             transient("no storage taxonomy sweep recorded; run the deletions sweep command")
         })?;
-    let age = chrono::Utc::now().signed_duration_since(sweep.completed_at);
-    let max_age = chrono::Duration::from_std(sweep_max_age()).unwrap_or(chrono::Duration::MAX);
+    validate_fresh_clean_sweep(&sweep, chrono::Utc::now(), sweep_max_age())?;
+    Ok(sweep)
+}
+
+fn validate_fresh_clean_sweep(
+    sweep: &TaxonomySweep,
+    now: chrono::DateTime<chrono::Utc>,
+    max_age: Duration,
+) -> Result<()> {
+    let age = now.signed_duration_since(sweep.completed_at);
+    let max_age = chrono::Duration::from_std(max_age).unwrap_or(chrono::Duration::MAX);
+    if age < chrono::Duration::zero() {
+        return Err(transient(format!(
+            "latest storage taxonomy sweep {} completed in the future; run the deletions sweep command",
+            sweep.id
+        )));
+    }
     if age > max_age {
         return Err(transient(format!(
             "latest storage taxonomy sweep {} is stale ({}h old); run the deletions sweep command",
@@ -536,7 +551,7 @@ async fn require_fresh_clean_sweep(services: &Services) -> Result<TaxonomySweep>
             sweep.unknown_key_sample.join(",")
         )));
     }
-    Ok(sweep)
+    Ok(())
 }
 
 fn validate_frozen_inventory(request: &DeletionRequest) -> Result<FrozenInventory> {
@@ -1384,6 +1399,22 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn future_taxonomy_sweep_fails_closed() {
+        let now = chrono::Utc::now();
+        let sweep = TaxonomySweep {
+            id: Uuid::new_v4(),
+            started_at: now,
+            completed_at: now + chrono::Duration::minutes(1),
+            listed_objects: 0,
+            unknown_object_count: 0,
+            unknown_key_sample: Vec::new(),
+            object_cap: 1_000_000,
+        };
+
+        assert!(validate_fresh_clean_sweep(&sweep, now, Duration::from_secs(86_400)).is_err());
+    }
 
     fn empty_storage_manifest(
         community: buzz_core::CommunityId,
