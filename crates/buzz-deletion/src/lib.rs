@@ -341,22 +341,39 @@ struct RunOutput {
 
 /// Execute one nested deletion command.
 pub async fn run(command: Command) -> Result<i32> {
-    let services = connect_services().await?;
+    match command {
+        Command::List { limit } => {
+            let store = connect_store().await?;
+            print_json(&store.list(i64::from(limit)).await?)?;
+            Ok(0)
+        }
+        Command::Inspect { id } => {
+            let store = connect_store().await?;
+            print_json(&store.inspect(id).await?)?;
+            Ok(0)
+        }
+        Command::Approve {
+            id,
+            approved_by,
+            note,
+        } => {
+            let store = connect_store().await?;
+            print_json(&store.approve(id, &approved_by, note.as_deref()).await?)?;
+            Ok(0)
+        }
+        command => run_with_services(command, connect_services().await?).await,
+    }
+}
+
+async fn run_with_services(command: Command, services: Services) -> Result<i32> {
     match command {
         Command::Submit {
             host,
             requested_by,
             reason,
         } => {
-            let host = host.unwrap_or_else(|| {
-                buzz_core::tenant::relay_url_authority(
-                    &std::env::var("RELAY_URL")
-                        .unwrap_or_else(|_| "ws://localhost:3000".to_string()),
-                )
-            });
-            if host.is_empty() {
-                anyhow::bail!("cannot derive community host; pass --host or set RELAY_URL");
-            }
+            let relay_url = std::env::var("RELAY_URL").ok();
+            let host = resolve_submit_host(host.as_deref(), relay_url.as_deref())?;
             let request = services
                 .store
                 .submit(&host, &requested_by, reason.as_deref())
@@ -367,27 +384,6 @@ pub async fn run(command: Command) -> Result<i32> {
                 .freeze_inventory(request.id, &inventory)
                 .await?;
             print_json(&request)?;
-            Ok(0)
-        }
-        Command::List { limit } => {
-            print_json(&services.store.list(i64::from(limit)).await?)?;
-            Ok(0)
-        }
-        Command::Inspect { id } => {
-            print_json(&services.store.inspect(id).await?)?;
-            Ok(0)
-        }
-        Command::Approve {
-            id,
-            approved_by,
-            note,
-        } => {
-            print_json(
-                &services
-                    .store
-                    .approve(id, &approved_by, note.as_deref())
-                    .await?,
-            )?;
             Ok(0)
         }
         Command::Run { id, executor_id } => {
@@ -431,10 +427,37 @@ pub async fn run(command: Command) -> Result<i32> {
             print_json(&sweep)?;
             Ok(i32::from(sweep.unknown_object_count > 0))
         }
+        Command::List { .. } | Command::Inspect { .. } | Command::Approve { .. } => {
+            anyhow::bail!("database-only command reached full-service dispatcher")
+        }
     }
 }
 
-async fn connect_services() -> Result<Services> {
+fn resolve_submit_host(host: Option<&str>, relay_url: Option<&str>) -> Result<String> {
+    if let Some(host) = host {
+        let host = host.trim();
+        if host.is_empty() {
+            anyhow::bail!("--host must not be empty");
+        }
+        return Ok(host.to_owned());
+    }
+
+    let relay_url = relay_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("cannot derive community host; pass --host or set RELAY_URL")
+        })?;
+    let host = buzz_core::tenant::relay_url_authority(relay_url);
+    if host.is_empty() {
+        anyhow::bail!(
+            "cannot derive community host from RELAY_URL; pass --host or set a valid RELAY_URL"
+        );
+    }
+    Ok(host)
+}
+
+async fn connect_store() -> Result<DeletionStore> {
     let database_url = required_env("DATABASE_URL")?;
     let db = Db::new(&DbConfig {
         database_url,
@@ -442,7 +465,11 @@ async fn connect_services() -> Result<Services> {
         ..DbConfig::default()
     })
     .await?;
-    let store = store(&db);
+    Ok(store(&db))
+}
+
+async fn connect_services() -> Result<Services> {
+    let store = connect_store().await?;
     let media_config = buzz_media::MediaConfig {
         s3_endpoint: required_env("BUZZ_S3_ENDPOINT")?,
         s3_access_key: required_env("BUZZ_S3_ACCESS_KEY")?,
@@ -1307,6 +1334,38 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submit_host_prefers_explicit_host() {
+        assert_eq!(
+            resolve_submit_host(Some(" community.example "), Some("wss://ignored.example"))
+                .expect("explicit host"),
+            "community.example"
+        );
+    }
+
+    #[test]
+    fn submit_host_derives_from_relay_url() {
+        assert_eq!(
+            resolve_submit_host(None, Some("wss://relay.example:8443/path"))
+                .expect("relay URL host"),
+            "relay.example:8443"
+        );
+    }
+
+    #[test]
+    fn submit_host_requires_an_explicit_source() {
+        for relay_url in [None, Some(""), Some("   ")] {
+            let error = resolve_submit_host(None, relay_url).expect_err("missing host must fail");
+            assert!(error.to_string().contains("pass --host or set RELAY_URL"));
+        }
+    }
+
+    #[test]
+    fn submit_host_rejects_empty_or_invalid_values() {
+        assert!(resolve_submit_host(Some("   "), Some("wss://relay.example")).is_err());
+        assert!(resolve_submit_host(None, Some("not a URL")).is_err());
+    }
 
     fn empty_storage_manifest(community: buzz_core::CommunityId) -> StorageManifest {
         StorageManifest {
