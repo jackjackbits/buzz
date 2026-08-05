@@ -1493,7 +1493,7 @@ mod tests {
 
         let mut digest_tampered = claim.request.clone();
         digest_tampered.inventory_manifest = Some(serde_json::json!({
-            "schema": {"revision": 0, "migration_version": 0, "scoped_tables": [], "row_counts": {}, "fenced_tables": []},
+            "schema": {"scoped_tables": [], "row_counts": {}, "fenced_tables": []},
             "storage": {"version": 4, "prefixes": []}
         }));
         assert!(validate_frozen_inventory(&digest_tampered).is_err());

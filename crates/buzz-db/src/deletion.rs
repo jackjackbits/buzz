@@ -18,10 +18,6 @@ use uuid::Uuid;
 
 use crate::error::{DbError, Result};
 
-/// Exact desired catalog revision understood by this deletion engine.
-pub const CATALOG_REVISION: i32 = 1;
-/// Highest SQL migration version whose tenant catalog this engine understands.
-pub const EXPECTED_MIGRATION_VERSION: i64 = 27;
 /// Default PostgreSQL lease duration for one claimed deletion request.
 pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(60);
 /// Durable name of the schema manifest's PostgreSQL component.
@@ -263,10 +259,6 @@ pub struct DeletionRequest {
 /// Frozen PostgreSQL catalog inventory.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchemaManifest {
-    /// Engine catalog revision.
-    pub revision: i32,
-    /// Live SQLx migration version.
-    pub migration_version: i64,
     /// Sorted community-scoped table names.
     pub scoped_tables: Vec<String>,
     /// Per-table row counts for the target.
@@ -657,14 +649,8 @@ impl DeletionStore {
         })
     }
 
-    /// Validate the minimum deletion-fence catalog required by relay serving.
-    ///
-    /// Serving binaries accept newer additive migrations for rolling upgrades
-    /// and rollback. Destructive inventory still calls [`Self::validate_catalog`]
-    /// and requires exact migration/table equality.
+    /// Validate the deletion catalog contract required by relay serving.
     pub async fn validate_serving_catalog(&self) -> Result<()> {
-        validate_serving_migration_version(self.live_migration_version().await?)?;
-
         let runtime_columns = sqlx::query(
             "SELECT attname, format_type(atttypid, atttypmod) AS type_name, attnotnull \
              FROM pg_attribute WHERE attrelid = 'communities'::regclass \
@@ -772,11 +758,9 @@ impl DeletionStore {
 
     /// Validate the exact live scoped-table and write-fence catalog for destruction.
     ///
-    /// Unlike relay serving compatibility, this intentionally rejects newer
-    /// migrations and unknown tenant tables until the deletion manifest changes.
+    /// Exact table and fence equality rejects unknown tenant data even
+    /// while unrelated SQLx migrations continue to advance.
     pub async fn validate_catalog(&self) -> Result<()> {
-        validate_destructive_migration_version(self.live_migration_version().await?)?;
-
         let expected = EXPECTED_SCOPED_TABLES
             .iter()
             .copied()
@@ -825,8 +809,6 @@ impl DeletionStore {
         let fenced_tables = self.live_fenced_tables().await?;
         let _ = community; // counts are intentionally not approval-bound for a live tenant.
         Ok(SchemaManifest {
-            revision: CATALOG_REVISION,
-            migration_version: EXPECTED_MIGRATION_VERSION,
             scoped_tables: live_tables.into_iter().collect(),
             row_counts: BTreeMap::new(),
             fenced_tables: fenced_tables.into_iter().collect(),
@@ -2104,22 +2086,6 @@ impl DeletionStore {
         Ok(())
     }
 
-    async fn live_migration_version(&self) -> Result<Option<i64>> {
-        let ledger_exists: bool =
-            sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
-                .fetch_one(&self.pool)
-                .await?;
-        if !ledger_exists {
-            // Desired-state `pgschema` applies the checked-in final catalog but
-            // intentionally does not synthesize SQLx migration history.
-            return Ok(None);
-        }
-        sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(Into::into)
-    }
-
     async fn live_scoped_tables(&self) -> Result<BTreeSet<String>> {
         let rows: Vec<String> = sqlx::query_scalar(
             r#"
@@ -2165,28 +2131,6 @@ impl DeletionStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().collect())
-    }
-}
-
-fn validate_destructive_migration_version(migration_version: Option<i64>) -> Result<()> {
-    if migration_version.is_some_and(|version| version != EXPECTED_MIGRATION_VERSION) {
-        Err(DbError::DeletionSafety(format!(
-            "community deletion schema migration drift: expected {EXPECTED_MIGRATION_VERSION}, got {}",
-            migration_version.expect("checked Some")
-        )))
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_serving_migration_version(migration_version: Option<i64>) -> Result<()> {
-    if migration_version.is_some_and(|version| version < EXPECTED_MIGRATION_VERSION) {
-        Err(DbError::DeletionSafety(format!(
-            "community serving fence migration is too old: require at least {EXPECTED_MIGRATION_VERSION}, got {}",
-            migration_version.expect("checked Some")
-        )))
-    } else {
-        Ok(())
     }
 }
 
@@ -2609,19 +2553,6 @@ mod tests {
     }
 
     #[test]
-    fn migration_checks_accept_desired_state_catalogs_without_sqlx_ledger() {
-        assert!(validate_serving_migration_version(None).is_ok());
-        assert!(validate_destructive_migration_version(None).is_ok());
-        assert!(validate_serving_migration_version(Some(EXPECTED_MIGRATION_VERSION)).is_ok());
-        assert!(validate_serving_migration_version(Some(EXPECTED_MIGRATION_VERSION + 1)).is_ok());
-        assert!(validate_serving_migration_version(Some(EXPECTED_MIGRATION_VERSION - 1)).is_err());
-        assert!(validate_destructive_migration_version(Some(EXPECTED_MIGRATION_VERSION)).is_ok());
-        assert!(
-            validate_destructive_migration_version(Some(EXPECTED_MIGRATION_VERSION + 1)).is_err()
-        );
-    }
-
-    #[test]
     fn storage_manifest_shape_invariants_fail_closed() {
         assert!(validate_storage_manifest(&storage_manifest()).is_ok());
 
@@ -2703,8 +2634,6 @@ mod tests {
     fn frozen_inventory_digest_is_stable() {
         let inventory = FrozenInventory {
             schema: SchemaManifest {
-                revision: 1,
-                migration_version: EXPECTED_MIGRATION_VERSION,
                 scoped_tables: vec!["events".to_string()],
                 row_counts: BTreeMap::from([("events".to_string(), 3)]),
                 fenced_tables: vec!["events".to_string()],
