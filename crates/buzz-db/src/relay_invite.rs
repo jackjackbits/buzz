@@ -111,6 +111,14 @@ pub async fn mint_relay_invite(
     let now = Utc::now();
     let expires_at = now + chrono::Duration::seconds(ttl_secs as i64);
 
+    // Mint a v2 opaque invite inside the same lifecycle gate as every other
+    // community-scoped database write. The trigger remains the final backstop,
+    // but this typed guard keeps a quiescing community from surfacing as an
+    // opaque SQLSTATE/HTTP 500 at the API boundary.
+    let mut tx = pool.begin().await?;
+    crate::deletion::DeletionStore::new(pool.clone())
+        .guard_transaction(&mut tx, community)
+        .await?;
     let row = sqlx::query(
         "INSERT INTO relay_invites (community_id, token_hash, max_uses, expires_at, created_by) \
          VALUES ($1, $2, $3, $4, $5) \
@@ -121,8 +129,9 @@ pub async fn mint_relay_invite(
     .bind(max_uses)
     .bind(expires_at)
     .bind(created_by)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     let invite_id: uuid::Uuid = row.try_get("id")?;
 
@@ -374,6 +383,7 @@ pub async fn claim_relay_invite(
 mod tests {
     use super::*;
     use crate::relay_members::is_relay_member;
+    use sha2::Digest;
     use sqlx::PgPool;
     use uuid::Uuid;
 
@@ -446,6 +456,92 @@ mod tests {
             let error = validate_mint_inputs(ttl, max_uses).expect_err("invalid mint contract");
             assert!(matches!(error, crate::DbError::InvalidData(_)), "{error:?}");
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn mint_after_quiescing_returns_typed_fence_without_persisting() {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let db = crate::Db::new(&crate::DbConfig {
+            database_url,
+            max_connections: 5,
+            min_connections: 0,
+            ..crate::DbConfig::default()
+        })
+        .await
+        .expect("connect invite deletion test DB");
+        db.migrate().await.expect("migrate invite deletion test DB");
+        let pool = db.pool.clone();
+        let store = db.deletion_store();
+        let host = format!("relay-invite-fence-{}.example", Uuid::new_v4().simple());
+        let community = db
+            .ensure_configured_community(&host)
+            .await
+            .expect("create fenced invite community")
+            .id;
+        let request = store
+            .submit(&host, "owner", None)
+            .await
+            .expect("submit deletion request");
+        let empty_digest = hex::encode(sha2::Sha256::digest([]));
+        let inventory = crate::deletion::FrozenInventory {
+            schema: store
+                .inventory_schema(community)
+                .await
+                .expect("inventory schema"),
+            storage: crate::deletion::StorageManifest {
+                version: 4,
+                prefixes: [
+                    format!("_meta/{community}/"),
+                    format!("_uploads/{community}/"),
+                    format!("repos/{community}/"),
+                ]
+                .into_iter()
+                .map(|prefix| crate::deletion::PrefixManifest {
+                    prefix,
+                    object_count: 0,
+                    total_bytes: 0,
+                    keys_digest: empty_digest.clone(),
+                })
+                .collect(),
+            },
+        };
+        store
+            .freeze_inventory(request.id, &inventory)
+            .await
+            .expect("freeze inventory");
+        store
+            .approve(request.id, "owner", None)
+            .await
+            .expect("approve deletion");
+        let claim = store
+            .claim_specific(
+                request.id,
+                "executor",
+                crate::deletion::DEFAULT_LEASE_DURATION,
+            )
+            .await
+            .expect("claim deletion")
+            .expect("runnable deletion");
+        store
+            .begin_quiescing(&claim.lease)
+            .await
+            .expect("begin quiescing");
+
+        let error = mint_relay_invite(&pool, community, "owner", 3600, Some(1))
+            .await
+            .expect_err("quiescing must reject invite minting");
+        assert!(matches!(error, crate::error::DbError::AccessDenied(_)));
+
+        let invite_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM relay_invites WHERE community_id = $1")
+                .bind(community.as_uuid())
+                .fetch_one(&pool)
+                .await
+                .expect("count relay invites");
+        assert_eq!(invite_count, 0, "rejected mint must not persist an invite");
     }
 
     #[tokio::test]
