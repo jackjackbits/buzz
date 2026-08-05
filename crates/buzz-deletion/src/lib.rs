@@ -3,7 +3,7 @@
 //! Shared durable whole-community deletion engine and store adapters.
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,17 +30,7 @@ const LIST_PAGE_SIZE: usize = 1000;
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
-#[cfg(test)]
-static TEST_HEARTBEAT_INTERVAL_MS: AtomicU64 = AtomicU64::new(0);
-
 fn heartbeat_interval() -> Duration {
-    #[cfg(test)]
-    {
-        let milliseconds = TEST_HEARTBEAT_INTERVAL_MS.load(Ordering::Relaxed);
-        if milliseconds > 0 {
-            return Duration::from_millis(milliseconds);
-        }
-    }
     HEARTBEAT_INTERVAL
 }
 
@@ -172,6 +162,15 @@ pub async fn acquire_serving_write(
     community: buzz_core::CommunityId,
     operation: &str,
 ) -> Result<ServingWriteGuard> {
+    acquire_serving_write_with_heartbeat(db, community, operation, heartbeat_interval()).await
+}
+
+async fn acquire_serving_write_with_heartbeat(
+    db: &Db,
+    community: buzz_core::CommunityId,
+    operation: &str,
+    heartbeat_period: Duration,
+) -> Result<ServingWriteGuard> {
     let store = store(db);
     let owner = default_executor_id();
     let lease = store
@@ -184,7 +183,7 @@ pub async fn acquire_serving_write(
     let lost = CancellationToken::new();
     let heartbeat_lost = lost.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(heartbeat_interval());
+        let mut interval = tokio::time::interval(heartbeat_period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
         loop {
@@ -1382,7 +1381,7 @@ mod tests {
         }
     }
 
-    async fn claimed_test_deletion(prefix: &str) -> (Services, ClaimedDeletion) {
+    async fn claimed_test_deletion(prefix: &str) -> (Db, Services, ClaimedDeletion) {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .expect("BUZZ_TEST_DATABASE_URL or DATABASE_URL is required");
@@ -1446,7 +1445,7 @@ mod tests {
                 .create_pool(Some(deadpool_redis::Runtime::Tokio1))
                 .expect("construct unused Redis pool"),
         };
-        (services, claim)
+        (db, services, claim)
     }
 
     fn deletion_test_media_storage() -> Arc<MediaStorage> {
@@ -1488,7 +1487,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn frozen_inventory_digest_and_storage_ownership_fail_closed() {
-        let (_, claim) = claimed_test_deletion("deletion-integrity").await;
+        let (_, _, claim) = claimed_test_deletion("deletion-integrity").await;
         assert!(validate_frozen_inventory(&claim.request).is_ok());
 
         let mut digest_tampered = claim.request.clone();
@@ -1512,7 +1511,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres and S3-compatible storage"]
     async fn drained_stage_resumes_chunk_deleted_before_stamp() {
-        let (mut services, claim) = claimed_test_deletion("deletion-chunk-resume").await;
+        let (_, mut services, claim) = claimed_test_deletion("deletion-chunk-resume").await;
         services.media = deletion_test_media_storage();
         let community = claim.request.community_id;
         let meta_prefix = format!("_meta/{community}/");
@@ -1651,7 +1650,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres and S3-compatible storage"]
     async fn final_storage_verification_rejects_late_target_binding() {
-        let (mut services, claim) = claimed_test_deletion("deletion-late-binding").await;
+        let (_, mut services, claim) = claimed_test_deletion("deletion-late-binding").await;
         services.media = deletion_test_media_storage();
         let community = claim.request.community_id;
         let late_key = format!("_meta/{community}/{}.json", "a".repeat(64));
@@ -1677,7 +1676,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn stale_lease_during_failure_recording_is_lost_ownership() {
-        let (services, claim) = claimed_test_deletion("deletion-stale-record").await;
+        let (_, services, claim) = claimed_test_deletion("deletion-stale-record").await;
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .expect("test database URL");
@@ -1704,6 +1703,65 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn serving_guard_heartbeats_long_operation_through_quiescing() {
+        let (db, services, claim) = claimed_test_deletion("serving-guard-quiesce").await;
+        let community = claim.request.community_id;
+        let guard = acquire_serving_write_with_heartbeat(
+            &db,
+            community,
+            "test_quiesce",
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("serving guard");
+
+        services
+            .store
+            .begin_quiescing(&claim.lease)
+            .await
+            .expect("quiesce");
+        assert!(
+            services
+                .store
+                .acquire_serving_write_lease(
+                    community,
+                    "late_external",
+                    "late-owner",
+                    DEFAULT_LEASE_DURATION,
+                )
+                .await
+                .is_err(),
+            "quiescing must reject newly admitted work"
+        );
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let operation_completed = Arc::clone(&completed);
+        let result = guard
+            .protect(async move {
+                tokio::time::sleep(Duration::from_millis(75)).await;
+                operation_completed.store(true, Ordering::Relaxed);
+            })
+            .await;
+        assert!(
+            !guard.lost().is_cancelled(),
+            "quiescing must not cancel the admitted lease heartbeat"
+        );
+        result.expect("admitted operation survives quiescing heartbeats");
+        assert!(completed.load(Ordering::Relaxed));
+        assert!(matches!(
+            services.store.fence(&claim.lease).await,
+            Err(buzz_db::DbError::ServingWritesNotDrained {
+                active_count: 1,
+                ..
+            })
+        ));
+
+        guard.finish().await.expect("release serving guard");
+        assert_eq!(services.store.fence(&claim.lease).await.expect("fence"), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn serving_guard_cancels_protected_operation_when_heartbeat_is_lost() {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
@@ -1721,10 +1779,14 @@ mod tests {
             .await
             .expect("create test community")
             .id;
-        TEST_HEARTBEAT_INTERVAL_MS.store(10, Ordering::Relaxed);
-        let guard = acquire_serving_write(&db, community, "test_cancel")
-            .await
-            .expect("serving guard");
+        let guard = acquire_serving_write_with_heartbeat(
+            &db,
+            community,
+            "test_cancel",
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("serving guard");
         sqlx::query("DELETE FROM community_serving_write_leases WHERE community_id = $1")
             .bind(community.as_uuid())
             .execute(&pool)
@@ -1738,7 +1800,6 @@ mod tests {
                 operation_completed.store(true, Ordering::Relaxed);
             })
             .await;
-        TEST_HEARTBEAT_INTERVAL_MS.store(0, Ordering::Relaxed);
         assert!(result.is_err(), "lease loss must reject the operation");
         assert!(
             !completed.load(Ordering::Relaxed),
@@ -1749,7 +1810,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn guarded_external_step_rejects_preexisting_heartbeat_loss_without_polling_operation() {
-        let (services, claim) = claimed_test_deletion("deletion-heartbeat").await;
+        let (_, services, claim) = claimed_test_deletion("deletion-heartbeat").await;
         let heartbeat_lost = CancellationToken::new();
         heartbeat_lost.cancel();
         let polled = Arc::new(AtomicBool::new(false));
@@ -1782,7 +1843,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn shutdown_during_stage_releases_claim_without_recording_retry() {
-        let (services, claim) = claimed_test_deletion("deletion-shutdown").await;
+        let (_, services, claim) = claimed_test_deletion("deletion-shutdown").await;
         let request_id = claim.request.id;
         let retry_count = claim.request.retry_count;
         let shutdown = CancellationToken::new();

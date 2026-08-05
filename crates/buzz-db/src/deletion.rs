@@ -1089,7 +1089,8 @@ impl DeletionStore {
     ///
     /// The transition takes the same exclusive advisory lock as serving lease
     /// acquisition, so after commit no newer external effect can be admitted.
-    /// Already-acquired leases remain verifiable/releasable but cannot renew.
+    /// Already-acquired leases remain renewable, verifiable, and releasable so
+    /// admitted remote effects retain their exclusion proof until completion.
     pub async fn begin_quiescing(&self, token: &LeaseToken) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         verify_lease(&mut tx, token, DeletionStage::Approved).await?;
@@ -1921,11 +1922,14 @@ impl DeletionStore {
         Ok(lease)
     }
 
-    /// Renew an external side-effect lease only while the community is active.
+    /// Renew an already-admitted external side-effect lease while the community
+    /// is active or quiescing.
     ///
-    /// Quiescing rejects new acquisition and renewal. A pre-quiesce caller may
-    /// still verify/release its unexpired lease, but a long operation is
-    /// cancelled when its next heartbeat observes quiescing.
+    /// Quiescing rejects new acquisition, but the exact existing, unexpired
+    /// lease must remain renewable until its operation finishes. Otherwise the
+    /// heartbeat would abandon the exclusion proof while remote I/O may still
+    /// commit. Fence generation, owner, generation, expiry, and tombstone checks
+    /// continue to reject stale or post-fence renewal.
     pub async fn renew_serving_write_lease(
         &self,
         lease: &mut ServingWriteLease,
@@ -1945,7 +1949,7 @@ impl DeletionStore {
                AND lease.generation = $4 AND lease.fence_generation = $5 \
                AND lease.lease_until >= now() \
                AND community.id = lease.community_id \
-               AND community.deletion_state = 'active' \
+               AND community.deletion_state IN ('active', 'quiescing') \
                AND community.deleted_at IS NULL \
                AND community.deletion_fence_generation = lease.fence_generation \
              RETURNING lease.lease_until",
@@ -1986,8 +1990,9 @@ impl DeletionStore {
 
     /// Check that an external side-effect lease remains current for finalization.
     ///
-    /// A lease admitted before quiescing may complete/release, but cannot renew;
-    /// this preserves an accurate bounded drain without admitting new work.
+    /// A lease admitted before quiescing may renew, complete, and release; new
+    /// work remains blocked, preserving an accurate drain without abandoning an
+    /// admitted remote effect.
     pub async fn verify_serving_write_lease(&self, lease: &ServingWriteLease) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock_shared(community_deletion_lock_key($1))")
@@ -2999,7 +3004,7 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn quiescing_rejects_new_and_renewed_leases_before_fence() {
+    async fn quiescing_rejects_new_leases_but_renews_admitted_lease_until_release() {
         let (db, store) = store().await;
         let (request, _) = inventoried_request(&db, &store).await;
         store
@@ -3037,12 +3042,16 @@ mod postgres_tests {
             Err(DbError::AccessDenied(_))
         ));
         assert!(store.verify_serving_write_lease(&serving).await.is_ok());
-        assert!(matches!(
-            store
-                .renew_serving_write_lease(&mut serving, DEFAULT_LEASE_DURATION)
-                .await,
-            Err(DbError::AccessDenied(_))
-        ));
+        let lease_until_before_renewal = serving.lease_until;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        store
+            .renew_serving_write_lease(&mut serving, DEFAULT_LEASE_DURATION)
+            .await
+            .expect("admitted lease renews while quiescing");
+        assert!(
+            serving.lease_until > lease_until_before_renewal,
+            "renewal must extend the admitted lease"
+        );
         assert!(matches!(
             store.fence(&claim.lease).await,
             Err(DbError::ServingWritesNotDrained {
