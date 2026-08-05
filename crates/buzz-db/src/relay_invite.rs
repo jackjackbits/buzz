@@ -390,12 +390,44 @@ mod tests {
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
 
     async fn setup_pool() -> PgPool {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
-        PgPool::connect(&database_url)
+        PgPool::connect(&test_database_url())
             .await
             .expect("connect to test DB")
+    }
+
+    fn test_database_url() -> String {
+        std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_owned())
+    }
+
+    async fn create_scratch_database(prefix: &str) -> (PgPool, String, String) {
+        let admin_url = test_database_url();
+        let admin = PgPool::connect(&admin_url)
+            .await
+            .expect("connect to test database server");
+        let name = format!("{}_{}", prefix, Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+            .execute(&admin)
+            .await
+            .expect("create scratch database");
+        let path_start = admin_url
+            .rfind('/')
+            .expect("database URL has a path segment");
+        let scratch_url = format!("{}/{}", &admin_url[..path_start], name);
+        (admin, name, scratch_url)
+    }
+
+    async fn drop_scratch_database(admin: PgPool, db: crate::Db, name: &str) {
+        db.pool.close().await;
+        drop(db);
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop scratch database");
+        admin.close().await;
     }
 
     async fn make_test_community(pool: &PgPool) -> CommunityId {
@@ -461,9 +493,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn mint_after_quiescing_returns_typed_fence_without_persisting() {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let (admin, database_name, database_url) =
+            create_scratch_database("relay_invite_fence").await;
         let db = crate::Db::new(&crate::DbConfig {
             database_url,
             max_connections: 5,
@@ -542,6 +573,10 @@ mod tests {
                 .await
                 .expect("count relay invites");
         assert_eq!(invite_count, 0, "rejected mint must not persist an invite");
+
+        drop(store);
+        drop(pool);
+        drop_scratch_database(admin, db, &database_name).await;
     }
 
     #[tokio::test]
