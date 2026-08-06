@@ -213,8 +213,8 @@ fn all_sqlx_matches(roots: &[PathBuf]) -> Vec<serde_json::Value> {
     ast_matches_for_rule(roots, "scripts/lints/community_sqlx_calls.yml")
 }
 
-fn querybuilder_creations(roots: &[PathBuf]) -> Vec<serde_json::Value> {
-    ast_matches_for_rule(roots, "scripts/lints/community_querybuilder_creations.yml")
+fn querybuilder_mutations(roots: &[PathBuf]) -> Vec<serde_json::Value> {
+    ast_matches_for_rule(roots, "scripts/lints/community_querybuilder_mutations.yml")
 }
 
 fn querybuilder_builds(roots: &[PathBuf]) -> Vec<serde_json::Value> {
@@ -525,9 +525,19 @@ fn mutation_violation(statement: &Statement, fenced: &BTreeSet<String>) -> Optio
             if !fenced.contains(&target) {
                 return None;
             }
-            let community_index = columns
+            if columns.is_empty() {
+                return Some(format!(
+                    "INSERT into {target} omits its target column list; community_id provenance is unknown"
+                ));
+            }
+            let Some(community_index) = columns
                 .iter()
-                .position(|column| basename(column) == "community_id")?;
+                .position(|column| basename(column) == "community_id")
+            else {
+                return Some(format!(
+                    "INSERT into {target} omits community_id from its target columns"
+                ));
+            };
             let Some(source) = source else { return None };
             (!projected_community_is_safe(source, community_index)).then(|| {
                 format!(
@@ -697,34 +707,11 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
     violations
 }
 
-#[test]
-fn every_workspace_sql_execution_is_scanned_and_querybuilders_are_owned() {
-    let roots = production_roots();
-    let production_files = roots
-        .iter()
-        .flat_map(|source| {
-            walkdir::WalkDir::new(source)
-                .into_iter()
-                .filter_map(Result::ok)
-        })
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "rs"))
-        .map(|entry| entry.into_path())
-        .collect::<BTreeSet<_>>();
-    let matches = all_sqlx_matches(&roots);
-    assert!(
-        !matches.is_empty(),
-        "SQL execution coverage probe matched no calls"
-    );
-    let owners = function_owners(&roots);
-    let creations = querybuilder_creations(&roots);
-    for matched in matches {
-        let path = PathBuf::from(matched["file"].as_str().expect("SQL execution file"));
-        assert!(
-            production_files.contains(&path),
-            "SQL execution escaped workspace roots: {path:?}"
-        );
-    }
-    for build in querybuilder_builds(&roots) {
+fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
+    let owners = function_owners(roots);
+    let mutations = querybuilder_mutations(roots);
+    let mut found = Vec::new();
+    for build in querybuilder_builds(roots) {
         let path = PathBuf::from(build["file"].as_str().expect("builder file"));
         let offset = build["range"]["byteOffset"]["start"]
             .as_u64()
@@ -739,23 +726,86 @@ fn every_workspace_sql_execution_is_scanned_and_querybuilders_are_owned() {
         let receiver = build["metaVariables"]["single"]["QB"]["text"]
             .as_str()
             .expect("builder receiver");
-        let owned_creations = creations
+        let fragments = mutations
             .iter()
-            .filter(|creation| {
-                path == Path::new(creation["file"].as_str().unwrap_or_default())
-                    && creation["range"]["byteOffset"]["start"]
+            .filter(|mutation| {
+                path == Path::new(mutation["file"].as_str().unwrap_or_default())
+                    && mutation["range"]["byteOffset"]["start"]
                         .as_u64()
                         .is_some_and(|start| owner.start <= start && start < owner.end)
-                    && (owner.text.contains(&format!("{receiver}:"))
-                        || owner.text.contains(&format!("let mut {receiver} =")))
             })
-            .count();
+            .filter_map(|mutation| mutation["metaVariables"]["single"].get("SQL")?["text"].as_str())
+            .filter_map(rust_string_value)
+            .collect::<Vec<_>>();
+        if fragments.is_empty() {
+            found.push(format!(
+                "{}: QueryBuilder {receiver} has no literal fragments",
+                path.display()
+            ));
+            continue;
+        }
+        let reconstructed = fragments.join(" ");
+        if !["insert into", "update ", "delete from"]
+            .iter()
+            .any(|keyword| reconstructed.to_ascii_lowercase().contains(keyword))
+        {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(repo_root())
+            .unwrap_or(&path)
+            .to_string_lossy();
+        let statements = match parse_sql(&reconstructed) {
+            Ok(statements) => statements,
+            Err(error) => {
+                let inventoried = DYNAMIC_SQL.iter().any(|(file, expected_owner, guards)| {
+                    relative == *file
+                        && owner.name == *expected_owner
+                        && guards.iter().all(|guard| owner.text.contains(guard))
+                });
+                if !inventoried {
+                    found.push(format!("{}: mutating QueryBuilder {receiver} failed reconstruction and has no exact owner inventory: {error}; fragments={fragments:?}", path.display()));
+                }
+                continue;
+            }
+        };
+        let fenced = authority();
+        found.extend(statements.iter().filter_map(|statement| {
+            mutation_violation(statement, &fenced).map(|violation| {
+                format!(
+                    "{}: mutating QueryBuilder {receiver}: {violation}",
+                    path.display()
+                )
+            })
+        }));
+    }
+    found
+}
+
+#[test]
+fn every_workspace_sql_execution_is_scanned_and_querybuilders_are_owned() {
+    let roots = production_roots();
+    let matches = all_sqlx_matches(&roots);
+    assert!(
+        !matches.is_empty(),
+        "SQL execution coverage probe matched no calls"
+    );
+    for matched in &matches {
         assert!(
-            owned_creations >= 1,
-            "QueryBuilder execution in {} has no exact owned constructor for receiver {receiver}",
-            path.display()
+            matched["file"].as_str().is_some(),
+            "SQL execution match has no source file"
         );
     }
+    let violations = querybuilder_violations(&roots);
+    assert!(
+        violations.is_empty(),
+        "QueryBuilder violations:
+{}",
+        violations.join(
+            "
+"
+        )
+    );
 }
 
 #[test]
@@ -774,7 +824,7 @@ fn production_fenced_writers_are_structurally_tenant_bound_or_gated() {
 fn scanner_rejects_calibrated_bad_shapes_through_the_real_extractor() {
     let fixture = repo_root().join("crates/buzz-db/tests/fixtures/community_fenced_writes");
     let matches = ast_matches(std::slice::from_ref(&fixture));
-    let violations = inspect_matches(&matches, &[fixture]);
+    let violations = inspect_matches(&matches, std::slice::from_ref(&fixture));
     assert!(
         violations.iter().any(|v| v.contains("bad_insert_select")),
         "fleet INSERT SELECT control escaped: {violations:?}"
@@ -799,12 +849,30 @@ fn scanner_rejects_calibrated_bad_shapes_through_the_real_extractor() {
             "bad_dynamic_assert_sql_safe",
             "unreviewed AssertSqlSafe dynamic SQL",
         ),
+        (
+            "bad_insert_implicit_columns",
+            "implicit-column INSERT SELECT",
+        ),
+        ("bad_generic_query", "generic query constructor"),
+        ("bad_query_with", "query_with constructor"),
+        ("bad_query_as_with", "query_as_with constructor"),
+        ("bad_query_scalar_with", "query_scalar_with constructor"),
+        ("bad_raw_sql", "raw_sql constructor"),
     ] {
         assert!(
             violations
                 .iter()
                 .any(|violation| violation.contains(fixture_name)),
             "{description} control escaped: {violations:?}"
+        );
+    }
+    let builder_violations = querybuilder_violations(std::slice::from_ref(&fixture));
+    for fixture_name in ["bad_querybuilder_direct", "bad_querybuilder_split"] {
+        assert!(
+            builder_violations
+                .iter()
+                .any(|violation| violation.contains(fixture_name)),
+            "QueryBuilder control {fixture_name} escaped: {builder_violations:?}"
         );
     }
     assert!(

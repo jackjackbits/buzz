@@ -1,0 +1,11 @@
+id: community-querybuilder-mutation
+message: QueryBuilder constructor/push fragments used to reconstruct mutating builders
+severity: hint
+language: rust
+rule:
+  any:
+    - pattern: QueryBuilder::new($SQL)
+    - pattern: QueryBuilder::<$$$T>::new($SQL)
+    - pattern: sqlx::QueryBuilder::new($SQL)
+    - pattern: sqlx::QueryBuilder::<$$$T>::new($SQL)
+    - pattern: $QB.push($SQL)
