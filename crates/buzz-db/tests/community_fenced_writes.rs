@@ -31,6 +31,14 @@ const CONDITIONAL_SQL_WRITES: &[(&str, &str, &[&str])] = &[(
 
 const DYNAMIC_SQL: &[(&str, &str, &[&str])] = &[
     (
+        "crates/buzz-push-gateway/src/postgres.rs",
+        "apply_migrations_and_grants",
+        &[
+            "REVOKE CREATE ON DATABASE {database}",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE",
+        ],
+    ),
+    (
         "crates/buzz-db/src/channel.rs",
         "get_accessible_channels",
         &["FROM channels c", "WHERE c.community_id = $1"],
@@ -203,6 +211,14 @@ fn ast_matches(roots: &[PathBuf]) -> Vec<serde_json::Value> {
 
 fn all_sqlx_matches(roots: &[PathBuf]) -> Vec<serde_json::Value> {
     ast_matches_for_rule(roots, "scripts/lints/community_sqlx_calls.yml")
+}
+
+fn querybuilder_creations(roots: &[PathBuf]) -> Vec<serde_json::Value> {
+    ast_matches_for_rule(roots, "scripts/lints/community_querybuilder_creations.yml")
+}
+
+fn querybuilder_builds(roots: &[PathBuf]) -> Vec<serde_json::Value> {
+    ast_matches_for_rule(roots, "scripts/lints/community_querybuilder_builds.yml")
 }
 
 fn test_module_ranges(roots: &[PathBuf]) -> BTreeMap<PathBuf, Vec<(u64, u64)>> {
@@ -563,9 +579,15 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
             continue;
         }
         let line = matched["range"]["start"]["line"].as_u64().unwrap_or(0) + 1;
-        let sql_token = matched["metaVariables"]["single"]["SQL"]["text"]
-            .as_str()
-            .expect("SQL metavariable");
+        let sql_token = matched["metaVariables"]["single"]
+            .get("SQL")
+            .and_then(|sql| sql["text"].as_str());
+        if sql_token.is_none() {
+            // QueryBuilder execution is validated against its constructor in
+            // `querybuilder_executions_have_one_owned_creation` below.
+            continue;
+        }
+        let sql_token = sql_token.expect("checked SQL metavariable");
         let Some(sql) = rust_string_value(sql_token) else {
             let relative = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
             let source_text = fs::read_to_string(&path).unwrap_or_default();
@@ -676,7 +698,7 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
 }
 
 #[test]
-fn every_workspace_sqlx_call_is_inside_the_scanned_production_roots() {
+fn every_workspace_sql_execution_is_scanned_and_querybuilders_are_owned() {
     let roots = production_roots();
     let production_files = roots
         .iter()
@@ -689,12 +711,49 @@ fn every_workspace_sqlx_call_is_inside_the_scanned_production_roots() {
         .map(|entry| entry.into_path())
         .collect::<BTreeSet<_>>();
     let matches = all_sqlx_matches(&roots);
-    assert!(!matches.is_empty(), "SQLx coverage probe matched no calls");
+    assert!(
+        !matches.is_empty(),
+        "SQL execution coverage probe matched no calls"
+    );
+    let owners = function_owners(&roots);
+    let creations = querybuilder_creations(&roots);
     for matched in matches {
-        let path = PathBuf::from(matched["file"].as_str().expect("SQLx call file"));
+        let path = PathBuf::from(matched["file"].as_str().expect("SQL execution file"));
         assert!(
             production_files.contains(&path),
-            "SQLx call escaped workspace source roots: {path:?}"
+            "SQL execution escaped workspace roots: {path:?}"
+        );
+    }
+    for build in querybuilder_builds(&roots) {
+        let path = PathBuf::from(build["file"].as_str().expect("builder file"));
+        let offset = build["range"]["byteOffset"]["start"]
+            .as_u64()
+            .expect("builder offset");
+        let owner = owners
+            .iter()
+            .find(|owner| owner.path == path && owner.start <= offset && offset < owner.end);
+        let Some(owner) = owner else { continue };
+        if !owner.text.contains("QueryBuilder") {
+            continue;
+        }
+        let receiver = build["metaVariables"]["single"]["QB"]["text"]
+            .as_str()
+            .expect("builder receiver");
+        let owned_creations = creations
+            .iter()
+            .filter(|creation| {
+                path == Path::new(creation["file"].as_str().unwrap_or_default())
+                    && creation["range"]["byteOffset"]["start"]
+                        .as_u64()
+                        .is_some_and(|start| owner.start <= start && start < owner.end)
+                    && (owner.text.contains(&format!("{receiver}:"))
+                        || owner.text.contains(&format!("let mut {receiver} =")))
+            })
+            .count();
+        assert!(
+            owned_creations >= 1,
+            "QueryBuilder execution in {} has no exact owned constructor for receiver {receiver}",
+            path.display()
         );
     }
 }

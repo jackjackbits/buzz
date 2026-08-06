@@ -1,0 +1,10 @@
+id: community-querybuilder-creation
+message: QueryBuilder construction bound to its owning function
+severity: hint
+language: rust
+rule:
+  any:
+    - pattern: QueryBuilder::new($SQL)
+    - pattern: QueryBuilder::<$$$T>::new($SQL)
+    - pattern: sqlx::QueryBuilder::new($SQL)
+    - pattern: sqlx::QueryBuilder::<$$$T>::new($SQL)
