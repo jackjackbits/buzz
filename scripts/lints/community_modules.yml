@@ -1,6 +1,0 @@
-id: community-module
-message: Rust module range used to bind cfg(test) attributes to syntax
-severity: hint
-language: rust
-rule:
-  kind: mod_item

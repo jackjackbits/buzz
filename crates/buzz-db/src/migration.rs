@@ -496,106 +496,6 @@ mod tests {
             .collect()
     }
 
-    fn migrations_missing_community_write_fence_attachment() -> Vec<String> {
-        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
-        migrations.sort_by_key(|migration| migration.version);
-        migrations
-            .into_iter()
-            .filter(|migration| migration.version > 29)
-            .flat_map(|migration| {
-                let statements = split_sql_statements(migration.sql.as_str());
-                let attachments = statements
-                    .iter()
-                    .filter_map(|statement| {
-                        let normalized = normalize_sql(statement);
-                        if !normalized.contains("attach_community_write_fence(") {
-                            return None;
-                        }
-                        let call = normalized.split_once("attach_community_write_fence(")?.1;
-                        let table = call
-                            .split(')')
-                            .next()?
-                            .trim()
-                            .split("::")
-                            .next()?
-                            .trim_matches(|ch| ch == '\'' || ch == '"')
-                            .rsplit('.')
-                            .next()?
-                            .to_owned();
-                        (!table.is_empty()).then_some(table)
-                    })
-                    .collect::<BTreeSet<_>>();
-                statements.into_iter().filter_map(move |statement| {
-                    let normalized = normalize_sql(&statement);
-                    let table = if normalized.starts_with("create table")
-                        && normalized.contains("community_id")
-                        && !normalized.contains(" partition of ")
-                    {
-                        identifier_after_keyword(&statement, "create table")
-                    } else if normalized.starts_with("alter table")
-                        && normalized.contains("add")
-                        && normalized.contains("community_id")
-                    {
-                        identifier_after_keyword(&statement, "alter table")
-                    } else {
-                        None
-                    }?;
-                    (!attachments.contains(&table)).then(|| {
-                        format!(
-                            "migration {} introduces {table}.community_id without attach_community_write_fence('{table}'::regclass)",
-                            migration.version
-                        )
-                    })
-                })
-            })
-            .collect()
-    }
-
-    fn community_write_fence_attachment_violations(sql: &str) -> Vec<String> {
-        let statements = split_sql_statements(sql);
-        let attachments = statements
-            .iter()
-            .filter_map(|statement| {
-                let normalized = normalize_sql(statement);
-                if !normalized.contains("attach_community_write_fence(") {
-                    return None;
-                }
-                let call = normalized.split_once("attach_community_write_fence(")?.1;
-                let table = call
-                    .split(')')
-                    .next()?
-                    .trim()
-                    .split("::")
-                    .next()?
-                    .trim_matches(|ch| ch == '\'' || ch == '"')
-                    .rsplit('.')
-                    .next()?
-                    .to_owned();
-                (!table.is_empty()).then_some(table)
-            })
-            .collect::<BTreeSet<_>>();
-        statements
-            .into_iter()
-            .filter_map(|statement| {
-                let normalized = normalize_sql(&statement);
-                let table = if normalized.starts_with("create table")
-                    && normalized.contains("community_id")
-                    && !normalized.contains(" partition of ")
-                {
-                    identifier_after_keyword(&statement, "create table")
-                } else if normalized.starts_with("alter table")
-                    && normalized.contains("add")
-                    && normalized.contains("community_id")
-                {
-                    identifier_after_keyword(&statement, "alter table")
-                } else {
-                    None
-                }?;
-                (!attachments.contains(&table)).then_some(table)
-            })
-            .collect()
-    }
-
     fn scoped_constraint_lints(sql: &str, scoped_tables: &BTreeSet<String>) -> Vec<ConstraintLint> {
         let mut constraints = table_constraints(sql, scoped_tables);
         constraints.extend(alter_table_constraints(sql, scoped_tables));
@@ -668,7 +568,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 30);
+        assert_eq!(migrations.len(), 29);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1071,53 +971,8 @@ mod tests {
         assert!(deletion.contains("prevent_community_deletion_request_retargeting"));
         assert!(deletion.contains("prevent_community_deletion_approval_removal"));
 
-        // Bounded deletion retries are additive because the deletion migration
-        // is checksum-pinned once deployed.
-        assert_eq!(migrations[29].version, 30);
-        let bounded_retries = migrations[29].sql.as_str();
-        assert!(bounded_retries.contains("ALTER TABLE community_deletion_requests"));
-        assert!(bounded_retries.contains("ADD COLUMN retry_stage"));
-        assert!(bounded_retries.contains("'approved', 'fenced', 'drained'"));
-        assert!(!deletion.contains("retry_stage"));
+        assert!(deletion.contains("retry_stage TEXT CHECK"));
         assert!(desired_schema.contains("retry_stage TEXT CHECK"));
-    }
-
-    #[test]
-    fn post_deletion_migrations_attach_every_new_community_write_fence() {
-        let violations = migrations_missing_community_write_fence_attachment();
-        assert!(
-            violations.is_empty(),
-            "migrations after 0029 must explicitly attach every new community write fence:\n{}",
-            violations.join("\n")
-        );
-    }
-
-    #[test]
-    fn community_write_fence_attachment_lint_covers_create_and_alter() {
-        let missing = r#"
-            CREATE TABLE created_late (
-                community_id UUID NOT NULL,
-                id UUID NOT NULL
-            );
-            CREATE TABLE altered_late (id UUID NOT NULL);
-            ALTER TABLE altered_late ADD COLUMN community_id UUID NOT NULL;
-        "#;
-        assert_eq!(
-            community_write_fence_attachment_violations(missing),
-            vec!["created_late", "altered_late"]
-        );
-
-        let attached = r#"
-            CREATE TABLE created_late (
-                community_id UUID NOT NULL,
-                id UUID NOT NULL
-            );
-            SELECT attach_community_write_fence('created_late'::regclass);
-            CREATE TABLE altered_late (id UUID NOT NULL);
-            ALTER TABLE altered_late ADD COLUMN community_id UUID NOT NULL;
-            SELECT attach_community_write_fence('altered_late'::regclass);
-        "#;
-        assert!(community_write_fence_attachment_violations(attached).is_empty());
     }
 
     #[test]

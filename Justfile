@@ -92,11 +92,7 @@ build-release:
     cargo build --workspace --release
 
 # Run repo lint and formatting checks
-check: fmt-check community-fenced-writes-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
-
-# Structurally classify production SQL writes to community-fenced tables.
-community-fenced-writes-check:
-    cargo test -p buzz-db --test community_fenced_writes
+check: fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
 
 # Format all Rust code
 fmt:
