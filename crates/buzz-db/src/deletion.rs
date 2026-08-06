@@ -737,6 +737,9 @@ impl DeletionStore {
 
         let required_objects_present: bool = sqlx::query_scalar(
             "SELECT to_regprocedure('community_deletion_lock_key(uuid)') IS NOT NULL \
+                AND to_regprocedure('community_write_allowed(uuid)') IS NOT NULL \
+                AND (SELECT provolatile = 'v' FROM pg_proc \
+                     WHERE oid = 'community_write_allowed(uuid)'::regprocedure) \
                 AND to_regprocedure('assert_community_write_allowed(uuid)') IS NOT NULL \
                 AND to_regprocedure('enforce_community_write_fence()') IS NOT NULL \
                 AND EXISTS (SELECT 1 FROM pg_trigger t \
@@ -803,14 +806,27 @@ impl DeletionStore {
     }
 
     /// Build and validate a live PostgreSQL schema inventory.
+    ///
+    /// Row counts are observational evidence captured at submission. They bind
+    /// operator approval to the target's visible PostgreSQL footprint, but the
+    /// executor still revalidates the structural catalog and proves zero rows
+    /// after purge rather than requiring these live counts to remain unchanged.
     pub async fn inventory_schema(&self, community: CommunityId) -> Result<SchemaManifest> {
         self.validate_catalog().await?;
         let live_tables = self.live_scoped_tables().await?;
         let fenced_tables = self.live_fenced_tables().await?;
-        let _ = community; // counts are intentionally not approval-bound for a live tenant.
+        let mut row_counts = BTreeMap::new();
+        for table in &live_tables {
+            let sql = format!("SELECT count(*)::BIGINT FROM {table} WHERE community_id = $1");
+            let count: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
+                .bind(community.as_uuid())
+                .fetch_one(&self.pool)
+                .await?;
+            row_counts.insert(table.clone(), count);
+        }
         Ok(SchemaManifest {
             scoped_tables: live_tables.into_iter().collect(),
-            row_counts: BTreeMap::new(),
+            row_counts,
             fenced_tables: fenced_tables.into_iter().collect(),
         })
     }
@@ -1764,6 +1780,87 @@ impl DeletionStore {
         Ok(())
     }
 
+    /// Clear a fail-closed block after an operator has remediated its cause.
+    ///
+    /// Recovery preserves the immutable target, approval, inventory, stage,
+    /// fence generation, and prior failure checkpoint. It appends an auditable
+    /// operator checkpoint and only makes runnable stages immediately claimable.
+    pub async fn unblock(
+        &self,
+        request_id: Uuid,
+        unblocked_by: &str,
+        reason: &str,
+    ) -> Result<DeletionRequest> {
+        let unblocked_by = unblocked_by.trim();
+        let reason = reason.trim();
+        if unblocked_by.is_empty() || reason.is_empty() {
+            return Err(DbError::InvalidData(
+                "unblock requires non-empty operator identity and remediation reason".to_string(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let request_row = sqlx::query(
+            "SELECT * FROM community_deletion_requests \
+             WHERE id = $1 AND blocked_at IS NOT NULL FOR UPDATE",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            DbError::DeletionSafety(format!(
+                "deletion {request_id} is missing or is not blocked"
+            ))
+        })?;
+        let request = row_to_request(request_row)?;
+        if !request.stage.runnable() {
+            return Err(DbError::DeletionSafety(format!(
+                "blocked deletion {request_id} at stage {} cannot resume",
+                request.stage
+            )));
+        }
+        if request.lease_owner.is_some()
+            && request
+                .lease_until
+                .is_some_and(|lease_until| lease_until >= Utc::now())
+        {
+            return Err(DbError::DeletionSafety(format!(
+                "blocked deletion {request_id} still has a live executor lease"
+            )));
+        }
+
+        let prior_block = request.blocked_reason.clone();
+        sqlx::query(
+            "INSERT INTO community_deletion_checkpoints \
+             (request_id, stage, unit_key, status, lease_generation, detail, completed_at) \
+             VALUES ($1, $2, $3, 'completed', $4, $5, now())",
+        )
+        .bind(request.id)
+        .bind(request.stage.to_string())
+        .bind(format!("operator_unblock:{}", Uuid::new_v4()))
+        .bind(request.lease_generation.max(1))
+        .bind(serde_json::json!({
+            "unblocked_by": bound_text(unblocked_by, 512),
+            "reason": bound_text(reason, 4096),
+            "previous_block": prior_block,
+        }))
+        .execute(&mut *tx)
+        .await?;
+
+        let row = sqlx::query(
+            "UPDATE community_deletion_requests \
+             SET blocked_at = NULL, blocked_reason = NULL, retry_count = 0, \
+                 last_error = NULL, last_error_at = NULL, next_attempt_at = now(), \
+                 lease_owner = NULL, lease_until = NULL, updated_at = now() \
+             WHERE id = $1 AND blocked_at IS NOT NULL RETURNING *",
+        )
+        .bind(request_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row_to_request(row)
+    }
+
     /// Persist a fail-closed permanent block and release the claim.
     pub async fn block(
         &self,
@@ -1887,10 +1984,24 @@ impl DeletionStore {
     ) -> Result<ServingWriteLease> {
         let lease_seconds = i64::try_from(lease_duration.as_secs()).unwrap_or(i64::MAX);
         let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock_shared(community_deletion_lock_key($1))")
+        // The assertion owns both the shared ordering lock and the supported
+        // READ COMMITTED check. The lease table is trigger-excluded, so this
+        // explicit admission is its database-enforced write fence.
+        if let Err(error) = sqlx::query("SELECT assert_community_write_allowed($1)")
             .bind(community.as_uuid())
             .execute(&mut *tx)
-            .await?;
+            .await
+        {
+            if error.as_database_error().is_some_and(|database_error| {
+                database_error.code().as_deref() == Some("55000")
+                    && database_error.message().starts_with("community write")
+            }) {
+                return Err(DbError::AccessDenied(format!(
+                    "community {community} is write-fenced or missing"
+                )));
+            }
+            return Err(error.into());
+        }
         let row = sqlx::query(
             "INSERT INTO community_serving_write_leases \
              (community_id, operation, owner, fence_generation, lease_until) \
@@ -2740,9 +2851,9 @@ mod postgres_tests {
             .expect("claim before approval")
             .is_none());
 
-        // Approval binds structural/storage taxonomy, not live row counts. A
-        // serving write between inventory and approval must not make an active
-        // community undeletable.
+        // Row counts are frozen observational evidence. Ordinary serving
+        // churn after inventory does not invalidate approval: execution fences,
+        // purges, and verifies the live tenant state independently.
         db.add_to_allowlist(request.community_id, &[7_u8; 32], &[8_u8; 32], None)
             .await
             .expect("post-inventory serving write");
@@ -2750,7 +2861,12 @@ mod postgres_tests {
             .inventory_schema(request.community_id)
             .await
             .expect("live schema after row churn");
-        assert_eq!(current_schema, inventory.schema);
+        assert_eq!(
+            current_schema.row_counts["pubkey_allowlist"],
+            inventory.schema.row_counts["pubkey_allowlist"] + 1
+        );
+        assert_eq!(current_schema.scoped_tables, inventory.schema.scoped_tables);
+        assert_eq!(current_schema.fenced_tables, inventory.schema.fenced_tables);
 
         let mismatched_insert = sqlx::query(
             "INSERT INTO community_deletion_approvals \
@@ -2909,6 +3025,59 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn operator_unblock_preserves_approval_and_records_recovery() {
+        let (db, store) = store().await;
+        let (request, _) = inventoried_request(&db, &store).await;
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let claim = store
+            .claim_specific(request.id, "executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim")
+            .expect("approved request is claimable");
+        store
+            .block(
+                &claim.lease,
+                DeletionStage::Approved,
+                "dependency",
+                "operator repair required",
+            )
+            .await
+            .expect("block request");
+
+        assert!(store.unblock(request.id, "", "repair").await.is_err());
+        let recovered = store
+            .unblock(request.id, "operator", "bucket policy repaired")
+            .await
+            .expect("unblock after remediation");
+        assert_eq!(recovered.stage, DeletionStage::Approved);
+        assert!(recovered.blocked_reason.is_none());
+        assert!(recovered.last_error.is_none());
+        assert_eq!(recovered.inventory_digest, request.inventory_digest);
+        assert_eq!(recovered.fence_generation, request.fence_generation);
+        assert!(store
+            .unblock(request.id, "operator", "again")
+            .await
+            .is_err());
+        assert!(store
+            .claim_specific(request.id, "successor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim recovered request")
+            .is_some());
+
+        let inspection = store.inspect(request.id).await.expect("inspect recovery");
+        assert!(inspection.checkpoints.iter().any(|checkpoint| {
+            checkpoint.unit_key.starts_with("operator_unblock:")
+                && checkpoint.detail["unblocked_by"] == "operator"
+                && checkpoint.detail["reason"] == "bucket policy repaired"
+                && checkpoint.detail["previous_block"] == "operator repair required"
+        }));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn stale_claim_and_fence_generation_fail_closed() {
         let (db, store) = store().await;
         let (request, _) = inventoried_request(&db, &store).await;
@@ -3000,6 +3169,50 @@ mod postgres_tests {
                 .is_err(),
             "post-fence serving write must fail"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn write_assertion_rejects_pinned_snapshot_isolation_before_authorization() {
+        let (db, _) = store().await;
+        let community = db
+            .ensure_configured_community(&format!(
+                "isolation-guard-{}.example",
+                Uuid::new_v4().simple()
+            ))
+            .await
+            .expect("create community")
+            .id;
+
+        for isolation in ["REPEATABLE READ", "SERIALIZABLE"] {
+            let mut tx = db.pool.begin().await.expect("begin isolation probe");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SET TRANSACTION ISOLATION LEVEL {isolation}"
+            )))
+            .execute(&mut *tx)
+            .await
+            .expect("set transaction isolation");
+            sqlx::query(
+                "SELECT set_config('buzz.deletion_executor_community', $1, true), \
+                        set_config('buzz.deletion_fence_generation', '0', true)",
+            )
+            .bind(community.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("forge executor authorization");
+            let error = sqlx::query("SELECT assert_community_write_allowed($1)")
+                .bind(community.as_uuid())
+                .execute(&mut *tx)
+                .await
+                .expect_err("pinned snapshot isolation must fail before authorization");
+            assert_eq!(
+                error
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .as_deref(),
+                Some("25000")
+            );
+        }
     }
 
     #[tokio::test]
@@ -3129,6 +3342,76 @@ mod postgres_tests {
         assert_eq!(store.reap_expired_serving_write_leases(2).await.unwrap(), 2);
         let after = store.serving_lease_stats().await.expect("stats after");
         assert_eq!(after.expired, before.expired - 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn serving_lease_reaper_remains_global_across_tombstoned_tenant() {
+        let (db, store) = store().await;
+        let active_a = db
+            .ensure_configured_community(&format!("lease-a-{}.example", Uuid::new_v4().simple()))
+            .await
+            .expect("active A")
+            .id;
+        let target = db
+            .ensure_configured_community(&format!("lease-t-{}.example", Uuid::new_v4().simple()))
+            .await
+            .expect("target T")
+            .id;
+        let active_x = db
+            .ensure_configured_community(&format!("lease-x-{}.example", Uuid::new_v4().simple()))
+            .await
+            .expect("active X")
+            .id;
+        store
+            .reap_expired_serving_write_leases(10_000)
+            .await
+            .expect("clear unrelated expired leases");
+        for (community, owner) in [(active_a, "a"), (target, "t"), (active_x, "x")] {
+            let lease = store
+                .acquire_serving_write_lease(
+                    community,
+                    "global_reaper_test",
+                    owner,
+                    DEFAULT_LEASE_DURATION,
+                )
+                .await
+                .expect("acquire lease");
+            sqlx::query(
+                "UPDATE community_serving_write_leases \
+                 SET lease_until = now() - interval '1 second' WHERE id = $1",
+            )
+            .bind(lease.id)
+            .execute(&db.pool)
+            .await
+            .expect("expire lease");
+        }
+        let mut lifecycle = db.pool.begin().await.expect("begin target lifecycle");
+        sqlx::query(
+            "SELECT set_config('buzz.deletion_executor_community', $1, true), \
+                    set_config('buzz.deletion_fence_generation', '1', true)",
+        )
+        .bind(target.to_string())
+        .execute(&mut *lifecycle)
+        .await
+        .expect("authorize tombstone fixture");
+        sqlx::query(
+            "UPDATE communities SET deletion_state = 'tombstone', \
+                    deletion_fence_generation = 1, deleted_at = now() WHERE id = $1",
+        )
+        .bind(target.as_uuid())
+        .execute(&mut *lifecycle)
+        .await
+        .expect("tombstone target");
+        lifecycle.commit().await.expect("commit tombstone fixture");
+
+        assert_eq!(
+            store
+                .reap_expired_serving_write_leases(10)
+                .await
+                .expect("global lease reap"),
+            3
+        );
     }
 
     #[tokio::test]

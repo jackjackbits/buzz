@@ -1093,7 +1093,11 @@ mod tests {
         assert!(deletion.contains("CREATE TABLE community_deletion_checkpoints"));
         assert!(deletion.contains("CREATE TABLE community_serving_write_leases"));
         assert!(deletion.contains("CREATE TABLE community_deletion_executor_heartbeats"));
+        assert!(deletion.contains("CREATE FUNCTION community_write_allowed"));
+        assert!(deletion.contains("LANGUAGE plpgsql VOLATILE"));
         assert!(deletion.contains("CREATE FUNCTION assert_community_write_allowed"));
+        assert!(deletion.contains("current_setting('transaction_isolation') <> 'read committed'"));
+        assert!(deletion.contains("ERRCODE = 'invalid_transaction_state'"));
         assert!(deletion.contains("CREATE FUNCTION enforce_community_write_fence"));
         assert!(deletion.contains("CREATE FUNCTION attach_community_write_fence"));
         assert!(deletion.contains("community_write_fence_excluded_table"));

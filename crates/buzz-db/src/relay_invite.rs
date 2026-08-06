@@ -176,6 +176,7 @@ pub async fn reap_expired_relay_invites(pool: &PgPool, cutoff: DateTime<Utc>) ->
          WHERE (community_id, id) IN (\
              SELECT community_id, id FROM relay_invites \
              WHERE expires_at < $1 \
+               AND community_write_allowed(community_id) \
              ORDER BY expires_at \
              LIMIT $2\
          )",
@@ -744,6 +745,73 @@ mod tests {
         assert_eq!(remaining, vec![recent.invite_id]);
 
         delete_test_community(&pool, community).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn retention_sweep_skips_quiescing_tenant_while_active_bystanders_progress() {
+        let (admin, database_name, database_url) =
+            create_scratch_database("relay_invite_liveness").await;
+        let db = crate::Db::new(&crate::DbConfig {
+            database_url,
+            max_connections: 5,
+            min_connections: 0,
+            ..crate::DbConfig::default()
+        })
+        .await
+        .expect("connect invite liveness database");
+        db.migrate()
+            .await
+            .expect("migrate invite liveness database");
+        let pool = db.pool.clone();
+        let active_a = make_test_community(&pool).await;
+        let target = make_test_community(&pool).await;
+        let active_x = make_test_community(&pool).await;
+        let cutoff = Utc::now();
+        for community in [active_a, target, active_x] {
+            sqlx::query(
+                "INSERT INTO relay_invites \
+                 (community_id, token_hash, expires_at, created_by) \
+                 VALUES ($1, $2, $3, 'test')",
+            )
+            .bind(community.as_uuid())
+            .bind(sha2::Sha256::digest(community.as_uuid().as_bytes()).as_slice())
+            .bind(cutoff - chrono::Duration::seconds(1))
+            .execute(&pool)
+            .await
+            .expect("seed expired invite");
+        }
+        let mut lifecycle = pool.begin().await.expect("begin lifecycle fixture");
+        sqlx::query(
+            "SELECT set_config('buzz.deletion_executor_community', $1, true), \
+                    set_config('buzz.deletion_fence_generation', '0', true)",
+        )
+        .bind(target.to_string())
+        .execute(&mut *lifecycle)
+        .await
+        .expect("authorize lifecycle fixture");
+        sqlx::query("UPDATE communities SET deletion_state = 'quiescing' WHERE id = $1")
+            .bind(target.as_uuid())
+            .execute(&mut *lifecycle)
+            .await
+            .expect("quiesce target");
+        lifecycle.commit().await.expect("commit lifecycle fixture");
+
+        assert_eq!(
+            reap_expired_relay_invites(&pool, cutoff)
+                .await
+                .expect("reap active bystanders"),
+            2
+        );
+        let remaining: Vec<Uuid> =
+            sqlx::query_scalar("SELECT community_id FROM relay_invites ORDER BY community_id")
+                .fetch_all(&pool)
+                .await
+                .expect("read remaining invite attribution");
+        assert_eq!(remaining, vec![*target.as_uuid()]);
+
+        drop(pool);
+        drop_scratch_database(admin, db, &database_name).await;
     }
 
     #[tokio::test]

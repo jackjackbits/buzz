@@ -1301,6 +1301,31 @@ LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE AS $$
     ]::TEXT[])
 $$;
 
+-- Fleet-wide writers filter candidates through this VOLATILE predicate in
+-- the mutating statement so fenced tenants are skipped before row triggers run.
+CREATE FUNCTION community_write_allowed(target UUID) RETURNS BOOLEAN
+LANGUAGE plpgsql VOLATILE AS $$
+DECLARE
+    lifecycle TEXT;
+BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'community writes require READ COMMITTED isolation'
+            USING ERRCODE = 'invalid_transaction_state';
+    END IF;
+
+    IF target IS NULL THEN
+        RETURN true;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock_shared(community_deletion_lock_key(target));
+    SELECT deletion_state
+      INTO lifecycle
+      FROM communities
+     WHERE id = target;
+    RETURN FOUND AND lifecycle = 'active';
+END
+$$;
+
 CREATE FUNCTION assert_community_write_allowed(target UUID) RETURNS VOID
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -1315,6 +1340,13 @@ DECLARE
     serving_fence_generation TEXT;
     serving_lease_valid BOOLEAN := false;
 BEGIN
+    -- The fence proof requires a fresh statement snapshot after lock grant;
+    -- pinned RR/Serializable snapshots can retain pre-fence authorization.
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'community writes require READ COMMITTED isolation'
+            USING ERRCODE = 'invalid_transaction_state';
+    END IF;
+
     -- Nullable operator-attribution rows without a tenant are unrelated.
     IF target IS NULL THEN
         RETURN;

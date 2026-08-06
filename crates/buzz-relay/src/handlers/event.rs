@@ -705,53 +705,49 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
             ));
             return;
         }
-        let serving_write = match buzz_deletion::acquire_serving_write(
-            &state.db,
-            conn.tenant.community(),
-            "ephemeral_event",
-        )
-        .await
+        match buzz_deletion::store(&state.db)
+            .is_serving_active(conn.tenant.community())
+            .await
         {
-            Ok(guard) => guard,
-            Err(error) => {
+            Ok(true) => {}
+            Ok(false) => {
                 reject("restricted");
                 conn.send(RelayMessage::ok(
                     &event_id_hex,
                     false,
-                    &format!("restricted: community writes are fenced: {error}"),
+                    "restricted: community writes are fenced",
                 ));
                 return;
             }
-        };
-        let handled = serving_write
-            .protect(handle_ephemeral_event(
-                event,
-                conn_id,
-                pubkey_bytes,
-                auth_pubkey,
-                Arc::clone(&conn),
-                state,
-            ))
-            .await;
-        let terminal = match handled {
-            Ok(Ok(())) => EphemeralTerminal::Accepted,
-            Ok(Err(message)) => {
-                reject("invalid");
-                EphemeralTerminal::Rejected(message)
-            }
             Err(error) => {
-                reject("restricted");
-                EphemeralTerminal::LeaseLost(format!(
-                    "restricted: community write lease lost: {error}"
-                ))
-            }
-        };
-        if matches!(terminal, EphemeralTerminal::Accepted) {
-            if let Err(error) = serving_write.finish().await {
-                tracing::warn!(%error, event_id = %event_id_hex, "failed to release ephemeral-event serving lease");
+                reject("error");
+                tracing::warn!(%error, event_id = %event_id_hex, "failed to check ephemeral-event community lifecycle");
+                conn.send(RelayMessage::ok(
+                    &event_id_hex,
+                    false,
+                    "error: internal server error",
+                ));
+                return;
             }
         }
-        conn.send(terminal.response(&event_id_hex));
+        match handle_ephemeral_event(
+            event,
+            conn_id,
+            pubkey_bytes,
+            auth_pubkey,
+            Arc::clone(&conn),
+            state,
+        )
+        .await
+        {
+            Ok(()) => {
+                conn.send(RelayMessage::ok(&event_id_hex, true, ""));
+            }
+            Err(message) => {
+                reject("invalid");
+                conn.send(RelayMessage::ok(&event_id_hex, false, &message));
+            }
+        }
         return;
     }
 
@@ -791,23 +787,6 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
             };
             reject(reason);
             conn.send(RelayMessage::ok(&event_id_hex, false, &msg));
-        }
-    }
-}
-
-enum EphemeralTerminal {
-    Accepted,
-    Rejected(String),
-    LeaseLost(String),
-}
-
-impl EphemeralTerminal {
-    fn response(&self, event_id: &str) -> String {
-        match self {
-            Self::Accepted => RelayMessage::ok(event_id, true, ""),
-            Self::Rejected(message) | Self::LeaseLost(message) => {
-                RelayMessage::ok(event_id, false, message)
-            }
         }
     }
 }
@@ -1202,25 +1181,6 @@ mod tests {
     use tokio::sync::{mpsc, Mutex, RwLock};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
-
-    #[test]
-    fn ephemeral_terminal_builds_one_unambiguous_ok() {
-        let event_id = "abc";
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                &super::EphemeralTerminal::Accepted.response(event_id)
-            )
-            .unwrap(),
-            serde_json::json!(["OK", event_id, true, ""])
-        );
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                &super::EphemeralTerminal::LeaseLost("restricted".to_string()).response(event_id)
-            )
-            .unwrap(),
-            serde_json::json!(["OK", event_id, false, "restricted"])
-        );
-    }
 
     #[test]
     fn fanout_event_frame_matches_legacy_format_byte_for_byte() {

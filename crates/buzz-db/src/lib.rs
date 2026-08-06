@@ -3987,7 +3987,8 @@ impl Db {
                   WHERE elem->>0 = 'd' LIMIT 1), \
                  '' \
              ) \
-             WHERE kind BETWEEN 30000 AND 39999 AND d_tag IS NULL",
+             WHERE kind BETWEEN 30000 AND 39999 AND d_tag IS NULL \
+               AND community_write_allowed(community_id)",
         )
         .execute(&self.pool)
         .await?;

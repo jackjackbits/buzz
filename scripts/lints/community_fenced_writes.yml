@@ -1,0 +1,11 @@
+id: community-fenced-sqlx-write
+message: SQLx call with a direct SQL expression; classified by check-community-fenced-writes.py
+severity: hint
+language: rust
+rule:
+  any:
+    - pattern: sqlx::query($SQL)
+    - pattern: sqlx::query_scalar($SQL)
+    - pattern: sqlx::query_scalar::<$$$T>($SQL)
+    - pattern: sqlx::query_as($SQL)
+    - pattern: sqlx::query_as::<$$$T>($SQL)

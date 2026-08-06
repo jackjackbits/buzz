@@ -251,6 +251,17 @@ pub enum Command {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Resume a blocked request after remediating its recorded failure.
+    Unblock {
+        /// Deletion request UUID.
+        id: Uuid,
+        /// Operator identity recorded in the recovery checkpoint.
+        #[arg(long)]
+        unblocked_by: String,
+        /// Remediation or change reference recorded in the checkpoint.
+        #[arg(long)]
+        reason: String,
+    },
     /// Claim and run one request until terminal/blocked.
     Run {
         /// Deletion request UUID.
@@ -335,6 +346,8 @@ fn is_permanent_error(error: &anyhow::Error) -> bool {
 struct RunOutput {
     request_id: Uuid,
     stage: DeletionStage,
+    retry_count: i32,
+    last_error: Option<String>,
     blocked_reason: Option<String>,
 }
 
@@ -358,6 +371,15 @@ pub async fn run(command: Command) -> Result<i32> {
         } => {
             let store = connect_store().await?;
             print_json(&store.approve(id, &approved_by, note.as_deref()).await?)?;
+            Ok(0)
+        }
+        Command::Unblock {
+            id,
+            unblocked_by,
+            reason,
+        } => {
+            let store = connect_store().await?;
+            print_json(&store.unblock(id, &unblocked_by, &reason).await?)?;
             Ok(0)
         }
         command => run_with_services(command, connect_services().await?).await,
@@ -426,7 +448,10 @@ async fn run_with_services(command: Command, services: Services) -> Result<i32> 
             print_json(&sweep)?;
             Ok(i32::from(sweep.unknown_object_count > 0))
         }
-        Command::List { .. } | Command::Inspect { .. } | Command::Approve { .. } => {
+        Command::List { .. }
+        | Command::Inspect { .. }
+        | Command::Approve { .. }
+        | Command::Unblock { .. } => {
             anyhow::bail!("database-only command reached full-service dispatcher")
         }
     }
@@ -741,8 +766,9 @@ async fn run_loop(
         ran = true;
         let output = execute_claim(&services, mode, claim, &shutdown).await?;
         print_json(&output)?;
-        if mode == LoopMode::Run || shutdown.is_cancelled() {
-            return Ok(i32::from(output.blocked_reason.is_some()));
+        let failed = output.last_error.is_some() || output.blocked_reason.is_some();
+        if mode == LoopMode::Run || shutdown.is_cancelled() || failed {
+            return Ok(i32::from(failed));
         }
     }
 }
@@ -1321,6 +1347,8 @@ fn run_output(request: DeletionRequest) -> RunOutput {
     RunOutput {
         request_id: request.id,
         stage: request.stage,
+        retry_count: request.retry_count,
+        last_error: request.last_error,
         blocked_reason: request.blocked_reason,
     }
 }
