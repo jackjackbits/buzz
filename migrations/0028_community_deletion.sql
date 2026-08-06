@@ -40,6 +40,10 @@ CREATE TABLE community_deletion_requests (
     lease_until TIMESTAMPTZ,
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+    retry_stage TEXT CHECK (retry_stage IS NULL OR retry_stage IN (
+        'approved', 'fenced', 'drained', 'bindings_removed',
+        'postgres_purged', 'cache_purged', 'logically_verified'
+    )),
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_error TEXT,
     last_error_at TIMESTAMPTZ,

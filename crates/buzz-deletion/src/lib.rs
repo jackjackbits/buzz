@@ -348,6 +348,7 @@ struct RunOutput {
     stage: DeletionStage,
     retry_count: i32,
     last_error: Option<String>,
+    next_attempt_at: chrono::DateTime<chrono::Utc>,
     blocked_reason: Option<String>,
 }
 
@@ -1349,6 +1350,7 @@ fn run_output(request: DeletionRequest) -> RunOutput {
         stage: request.stage,
         retry_count: request.retry_count,
         last_error: request.last_error,
+        next_attempt_at: request.next_attempt_at,
         blocked_reason: request.blocked_reason,
     }
 }

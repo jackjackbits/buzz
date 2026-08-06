@@ -218,6 +218,8 @@ pub struct DeletionRequest {
     pub community_host: String,
     /// Current lifecycle stage.
     pub stage: DeletionStage,
+    /// Stage at which the current consecutive retry streak started.
+    pub retry_stage: Option<DeletionStage>,
     /// Operator identity that submitted the request.
     pub requested_by: String,
     /// Optional request reason.
@@ -242,10 +244,12 @@ pub struct DeletionRequest {
     pub lease_until: Option<DateTime<Utc>>,
     /// Number of claims.
     pub attempts: i32,
-    /// Number of failed execution units.
+    /// Number of consecutive failed execution attempts at `retry_stage`.
     pub retry_count: i32,
     /// Last bounded error.
     pub last_error: Option<String>,
+    /// Earliest time a transient failure may be claimed again.
+    pub next_attempt_at: DateTime<Utc>,
     /// Permanent fail-closed block reason.
     pub blocked_reason: Option<String>,
     /// Submission time.
@@ -1729,7 +1733,8 @@ impl DeletionStore {
         let affected = sqlx::query(
             "UPDATE community_deletion_requests \
              SET stage = 'retention_pending', completed_at = now(), updated_at = now(), \
-                 lease_owner = NULL, lease_until = NULL, last_error = NULL, last_error_at = NULL \
+                 lease_owner = NULL, lease_until = NULL, retry_count = 0, retry_stage = NULL, \
+                 last_error = NULL, last_error_at = NULL \
              WHERE id = $1 AND stage = 'logically_verified' \
                AND lease_owner = $2 AND lease_generation = $3 AND lease_until >= now() \
                AND fence_generation = $4",
@@ -1749,6 +1754,10 @@ impl DeletionStore {
     }
 
     /// Persist a retryable unit failure and release the claim.
+    ///
+    /// The eighth consecutive failure at the same stage becomes a durable
+    /// block. A successful stage transition clears the streak; an operator may
+    /// use [`Self::unblock`] after remediating an exhausted dependency failure.
     pub async fn record_retry(
         &self,
         token: &LeaseToken,
@@ -1761,11 +1770,27 @@ impl DeletionStore {
         let retry_seconds = i64::try_from(retry_after.as_secs()).unwrap_or(i64::MAX);
         let mut tx = self.pool.begin().await?;
         verify_lease(&mut tx, token, stage).await?;
+        let (retry_count, retry_stage): (i32, Option<String>) = sqlx::query_as(
+            "SELECT retry_count, retry_stage FROM community_deletion_requests WHERE id = $1 FOR UPDATE",
+        )
+        .bind(token.request_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let stage_name = stage.to_string();
+        let consecutive_retries = if retry_stage.as_deref() == Some(stage_name.as_str()) {
+            retry_count.saturating_add(1)
+        } else {
+            1
+        };
+        let exhausted = consecutive_retries >= 8;
         checkpoint_failed_tx(&mut tx, token, stage, unit_key, &bounded).await?;
         sqlx::query(
             "UPDATE community_deletion_requests \
-             SET retry_count = retry_count + 1, last_error = $4, last_error_at = now(), \
-                 next_attempt_at = now() + make_interval(secs => $5), \
+             SET retry_count = $7, retry_stage = $8, last_error = $4, last_error_at = now(), \
+                 next_attempt_at = CASE WHEN $6 THEN next_attempt_at \
+                                        ELSE now() + make_interval(secs => $5) END, \
+                 blocked_at = CASE WHEN $6 THEN now() ELSE blocked_at END, \
+                 blocked_reason = CASE WHEN $6 THEN $4 ELSE blocked_reason END, \
                  lease_owner = NULL, lease_until = NULL, updated_at = now() \
              WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3",
         )
@@ -1774,6 +1799,9 @@ impl DeletionStore {
         .bind(token.generation)
         .bind(&bounded)
         .bind(retry_seconds)
+        .bind(exhausted)
+        .bind(consecutive_retries)
+        .bind(stage_name)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1849,7 +1877,7 @@ impl DeletionStore {
 
         let row = sqlx::query(
             "UPDATE community_deletion_requests \
-             SET blocked_at = NULL, blocked_reason = NULL, retry_count = 0, \
+             SET blocked_at = NULL, blocked_reason = NULL, retry_count = 0, retry_stage = NULL, \
                  last_error = NULL, last_error_at = NULL, next_attempt_at = now(), \
                  lease_owner = NULL, lease_until = NULL, updated_at = now() \
              WHERE id = $1 AND blocked_at IS NOT NULL RETURNING *",
@@ -2453,7 +2481,8 @@ async fn advance_request_tx(
     let affected = sqlx::query(
         "UPDATE community_deletion_requests \
          SET stage = $5, fence_generation = COALESCE($6, fence_generation), \
-             updated_at = now(), last_error = NULL, last_error_at = NULL \
+             updated_at = now(), retry_count = 0, retry_stage = NULL, \
+             last_error = NULL, last_error_at = NULL \
          WHERE id = $1 AND stage = $4 AND lease_owner = $2 \
            AND lease_generation = $3 AND lease_until >= now() AND blocked_at IS NULL",
     )
@@ -2547,6 +2576,10 @@ fn row_to_request(row: sqlx::postgres::PgRow) -> Result<DeletionRequest> {
         community_id: CommunityId::from_uuid(community_id),
         community_host: row.try_get("community_host")?,
         stage: row.try_get::<String, _>("stage")?.parse()?,
+        retry_stage: row
+            .try_get::<Option<String>, _>("retry_stage")?
+            .map(|stage| stage.parse())
+            .transpose()?,
         requested_by: row.try_get("requested_by")?,
         reason: row.try_get("reason")?,
         schema_manifest: row.try_get("schema_manifest")?,
@@ -2561,6 +2594,7 @@ fn row_to_request(row: sqlx::postgres::PgRow) -> Result<DeletionRequest> {
         attempts: row.try_get("attempts")?,
         retry_count: row.try_get("retry_count")?,
         last_error: row.try_get("last_error")?,
+        next_attempt_at: row.try_get("next_attempt_at")?,
         blocked_reason: row.try_get("blocked_reason")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -3021,6 +3055,72 @@ mod postgres_tests {
             .await
             .expect("claim forged request")
             .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn retry_exhaustion_blocks_only_the_consecutive_stage_and_progress_resets_it() {
+        let (db, store) = store().await;
+        let (request, _) = inventoried_request(&db, &store).await;
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+
+        for attempt in 1..=8 {
+            let claim = store
+                .claim_specific(
+                    request.id,
+                    &format!("executor-{attempt}"),
+                    DEFAULT_LEASE_DURATION,
+                )
+                .await
+                .expect("claim retryable request")
+                .expect("request remains claimable before exhaustion");
+            store
+                .record_retry(
+                    &claim.lease,
+                    DeletionStage::Approved,
+                    "dependency",
+                    "dependency unavailable",
+                    Duration::ZERO,
+                )
+                .await
+                .expect("record retry");
+
+            let observed = store.get(request.id).await.expect("load retry state");
+            assert_eq!(observed.retry_count, attempt);
+            assert_eq!(observed.retry_stage, Some(DeletionStage::Approved));
+            assert_eq!(observed.blocked_reason.is_some(), attempt == 8);
+        }
+        assert!(store
+            .claim_specific(request.id, "blocked-executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim blocked request")
+            .is_none());
+
+        let recovered = store
+            .unblock(request.id, "operator", "dependency repaired")
+            .await
+            .expect("unblock exhausted request");
+        assert_eq!(recovered.retry_count, 0);
+        assert_eq!(recovered.retry_stage, None);
+        assert!(recovered.blocked_reason.is_none());
+
+        let claim = store
+            .claim_specific(request.id, "successor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim recovered request")
+            .expect("recovered request is claimable");
+        store
+            .begin_quiescing(&claim.lease)
+            .await
+            .expect("begin quiescing after recovery");
+        store.fence(&claim.lease).await.expect("advance stage");
+        let advanced = store.get(request.id).await.expect("load advanced request");
+        assert_eq!(advanced.stage, DeletionStage::Fenced);
+        assert_eq!(advanced.retry_count, 0);
+        assert_eq!(advanced.retry_stage, None);
     }
 
     #[tokio::test]
