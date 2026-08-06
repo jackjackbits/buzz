@@ -668,13 +668,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-<<<<<<< HEAD
         assert_eq!(migrations.len(), 29);
-||||||| parent of 2ea419e57 (fix: advance community deletion migration to 0028)
-        assert_eq!(migrations.len(), 27);
-=======
-        assert_eq!(migrations.len(), 28);
->>>>>>> 2ea419e57 (fix: advance community deletion migration to 0028)
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1033,19 +1027,6 @@ mod tests {
         assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
         assert!(heartbeat.contains("_operator_global_tables"));
 
-<<<<<<< HEAD
-
-        // Channel-id lookup index (0027).
-        let channel_id_index = migrations
-            .iter()
-            .find(|migration| migration.sql.as_str().contains("idx_channels_id_live"))
-            .expect("channel-id lookup migration");
-        assert_eq!(channel_id_index.version, 27);
-        assert!(channel_id_index.sql.as_str().contains("INCLUDE (community_id)"));
-        assert!(channel_id_index.sql.as_str().contains("WHERE deleted_at IS NULL"));
-        assert!(!channel_id_index.sql.as_str().contains("CREATE UNIQUE INDEX"));
-||||||| parent of 2ea419e57 (fix: advance community deletion migration to 0028)
-
         // Channel-id lookup index (0027): serves tenant-independent channel lookups.
         assert_eq!(migrations[26].version, 27);
         let channel_id_index = migrations[26].sql.as_str();
@@ -1053,42 +1034,12 @@ mod tests {
         assert!(channel_id_index.contains("INCLUDE (community_id)"));
         assert!(channel_id_index.contains("WHERE deleted_at IS NULL"));
         assert!(!channel_id_index.contains("CREATE UNIQUE INDEX"));
-=======
-        // Channel-id lookup index (0027): serves tenant-independent channel lookups.
-        assert_eq!(migrations[26].version, 27);
-        let channel_id_index = migrations[26].sql.as_str();
-        assert!(channel_id_index.contains("idx_channels_id_live"));
-        assert!(channel_id_index.contains("INCLUDE (community_id)"));
-        assert!(channel_id_index.contains("WHERE deleted_at IS NULL"));
-        assert!(!channel_id_index.contains("CREATE UNIQUE INDEX"));
->>>>>>> 2ea419e57 (fix: advance community deletion migration to 0028)
         assert!(desired_schema.contains("idx_channels_id_live"));
 
-        // Main owns 0028 for long reaction payloads.
-        let long_reactions = migrations
-            .iter()
-            .find(|migration| {
-                migration
-                    .sql
-                    .as_str()
-                    .contains("ALTER TABLE reactions ALTER COLUMN emoji TYPE VARCHAR(66)")
-            })
-            .expect("long-reaction migration");
-        assert_eq!(long_reactions.version, 28);
-        assert!(desired_schema.contains("emoji               VARCHAR(66) NOT NULL"));
-
-        // Durable whole-community deletion control plane. Final numbering is
-        // reconciled once all branch commits have replayed onto current main.
-        let deletion = migrations
-            .iter()
-            .find(|migration| {
-                migration
-                    .sql
-                    .as_str()
-                    .contains("CREATE TABLE community_deletion_requests")
-            })
-            .expect("community-deletion migration");
-        let deletion = deletion.sql.as_str();
+        // Durable whole-community deletion control plane and universal DB fence.
+        assert_eq!(migrations[27].version, 28);
+        let deletion = migrations[27].sql.as_str();
+        assert!(deletion.contains("CREATE TABLE community_deletion_requests"));
         assert!(deletion.contains("CREATE TABLE community_deletion_approvals"));
         assert!(deletion.contains("CREATE TABLE community_deletion_checkpoints"));
         assert!(deletion.contains("CREATE TABLE community_serving_write_leases"));
@@ -1104,10 +1055,23 @@ mod tests {
         assert!(deletion.contains("CREATE FUNCTION enforce_community_tombstone"));
         assert!(deletion.contains("community tombstones are permanent"));
         assert!(deletion.contains("SET LOCAL lock_timeout = '5s'"));
+        assert!(deletion.contains("'active', 'quiescing', 'fenced', 'tombstone'"));
+        assert!(deletion.contains("_operator_global_tables"));
+        assert!(deletion.contains("'submitted', 'inventoried', 'approved', 'fenced', 'drained'"));
         assert!(deletion.contains("UNIQUE (id, community_id, inventory_digest)"));
         assert!(deletion.contains("FOREIGN KEY (request_id, community_id, inventory_digest)"));
         assert!(deletion.contains("prevent_community_deletion_request_retargeting"));
         assert!(deletion.contains("prevent_community_deletion_approval_removal"));
+
+        // Bounded deletion retries are an additive migration because 0028 is
+        // already checksum-pinned on deployed candidates.
+        assert_eq!(migrations[28].version, 29);
+        let bounded_retries = migrations[28].sql.as_str();
+        assert!(bounded_retries.contains("ALTER TABLE community_deletion_requests"));
+        assert!(bounded_retries.contains("ADD COLUMN retry_stage"));
+        assert!(bounded_retries.contains("'approved', 'fenced', 'drained'"));
+        assert!(!deletion.contains("retry_stage"));
+        assert!(desired_schema.contains("retry_stage TEXT CHECK"));
     }
 
     #[test]
