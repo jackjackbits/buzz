@@ -998,7 +998,9 @@ async fn execute_stage(
                 .inventory_schema(request.community_id)
                 .await?;
             let frozen = validate_frozen_inventory(request)?;
-            if live_schema != frozen.schema {
+            if live_schema.scoped_tables != frozen.schema.scoped_tables
+                || live_schema.fenced_tables != frozen.schema.fenced_tables
+            {
                 return Err(permanent(
                     "approved structural catalog drifted before fencing",
                 ));
@@ -1512,6 +1514,45 @@ mod tests {
             })
             .expect("construct deletion test media service"),
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn approved_stage_allows_post_inventory_row_churn_before_fencing() {
+        let (db, services, claim) = claimed_test_deletion("deletion-row-churn").await;
+        let frozen: FrozenInventory = serde_json::from_value(
+            claim
+                .request
+                .inventory_manifest
+                .clone()
+                .expect("frozen inventory"),
+        )
+        .expect("decode frozen inventory");
+
+        db.add_to_allowlist(claim.request.community_id, &[0x41; 32], &[0x42; 32], None)
+            .await
+            .expect("post-inventory serving write");
+        let live = services
+            .store
+            .inventory_schema(claim.request.community_id)
+            .await
+            .expect("live inventory after serving churn");
+        assert_eq!(live.scoped_tables, frozen.schema.scoped_tables);
+        assert_eq!(live.fenced_tables, frozen.schema.fenced_tables);
+        assert_eq!(
+            live.row_counts["pubkey_allowlist"],
+            frozen.schema.row_counts["pubkey_allowlist"] + 1
+        );
+
+        execute_stage(&services, &claim, &CancellationToken::new())
+            .await
+            .expect("row-count churn must not fail structural revalidation");
+        let fenced = services
+            .store
+            .get(claim.request.id)
+            .await
+            .expect("load fenced request");
+        assert_eq!(fenced.stage, DeletionStage::Fenced);
     }
 
     #[tokio::test]
