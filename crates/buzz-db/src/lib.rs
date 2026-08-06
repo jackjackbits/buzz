@@ -8474,13 +8474,13 @@ mod tests {
         let admin = PgPool::connect(&admin_url().await)
             .await
             .expect("connect admin");
-        let (pool, name) = create_scratch_db(&admin, "hook_modes").await;
-        pool.close().await;
         let base = admin_url().await;
         let idx = base.rfind('/').expect("database URL path");
-        let url = format!("{}/{}", &base[..idx], name);
 
-        let (floor, isolation) = hook_mode_observation(&url, WriterHookMode::Combined)
+        let (safe_pool, safe_name) = create_scratch_db(&admin, "hook_modes_safe").await;
+        safe_pool.close().await;
+        let safe_url = format!("{}/{}", &base[..idx], safe_name);
+        let (floor, isolation) = hook_mode_observation(&safe_url, WriterHookMode::Combined)
             .await
             .expect("combined hook");
         assert_eq!(
@@ -8488,8 +8488,7 @@ mod tests {
             Some(replica_fence::CREATED_AT_FLOOR_SECS.to_string())
         );
         assert_eq!(isolation, "read committed");
-
-        let (floor, isolation) = hook_mode_observation(&url, WriterHookMode::Separate)
+        let (floor, isolation) = hook_mode_observation(&safe_url, WriterHookMode::Separate)
             .await
             .expect("separate hooks");
         assert_eq!(
@@ -8497,9 +8496,8 @@ mod tests {
             "last after_connect registration must replace floor setup"
         );
         assert_eq!(isolation, "read committed");
-
         let (floor, isolation) =
-            hook_mode_observation(&url, WriterHookMode::CombinedWithoutIsolation)
+            hook_mode_observation(&safe_url, WriterHookMode::CombinedWithoutIsolation)
                 .await
                 .expect("floor-only hook");
         assert_eq!(
@@ -8507,19 +8505,56 @@ mod tests {
             Some(replica_fence::CREATED_AT_FLOOR_SECS.to_string())
         );
         assert_eq!(isolation, "read committed");
-
-        let (floor, isolation) = hook_mode_observation(&url, WriterHookMode::None)
+        let (floor, isolation) = hook_mode_observation(&safe_url, WriterHookMode::None)
             .await
             .expect("no-hook control");
         assert_eq!(floor, None);
         assert_eq!(isolation, "read committed");
 
+        let (unsafe_pool, unsafe_name) = create_scratch_db(&admin, "hook_modes_unsafe").await;
+        unsafe_pool.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE {name} WITH (FORCE)"
+            "ALTER DATABASE {unsafe_name} SET default_transaction_isolation = 'repeatable read'"
         )))
         .execute(&admin)
         .await
-        .expect("drop hook mode database");
+        .expect("set unsafe default");
+        let unsafe_url = format!("{}/{}", &base[..idx], unsafe_name);
+        assert!(
+            hook_mode_observation(&unsafe_url, WriterHookMode::Combined)
+                .await
+                .is_err(),
+            "combined hook must reject unsafe isolation"
+        );
+        assert!(
+            hook_mode_observation(&unsafe_url, WriterHookMode::Separate)
+                .await
+                .is_err(),
+            "separate last isolation hook rejects but still lacks floor on safe arm"
+        );
+        let (floor, isolation) =
+            hook_mode_observation(&unsafe_url, WriterHookMode::CombinedWithoutIsolation)
+                .await
+                .expect("floor-only mutant admits unsafe default");
+        assert_eq!(
+            floor,
+            Some(replica_fence::CREATED_AT_FLOOR_SECS.to_string())
+        );
+        assert_eq!(isolation, "repeatable read");
+        let (floor, isolation) = hook_mode_observation(&unsafe_url, WriterHookMode::None)
+            .await
+            .expect("no-hook mutant admits unsafe default");
+        assert_eq!(floor, None);
+        assert_eq!(isolation, "repeatable read");
+
+        for name in [safe_name, unsafe_name] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE {name} WITH (FORCE)"
+            )))
+            .execute(&admin)
+            .await
+            .expect("drop hook mode database");
+        }
     }
 
     #[test]
