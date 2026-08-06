@@ -236,6 +236,13 @@ fn querybuilder_builds(roots: &[PathBuf]) -> Vec<serde_json::Value> {
     ast_matches_for_rule(roots, "scripts/lints/community_querybuilder_builds.yml")
 }
 
+fn querybuilder_control_flow(roots: &[PathBuf]) -> Vec<serde_json::Value> {
+    ast_matches_for_rule(
+        roots,
+        "scripts/lints/community_querybuilder_control_flow.yml",
+    )
+}
+
 fn test_module_ranges(roots: &[PathBuf]) -> BTreeMap<PathBuf, Vec<(u64, u64)>> {
     let mut cfg_offsets = BTreeMap::<PathBuf, Vec<u64>>::new();
     for matched in ast_matches_for_rule(roots, "scripts/lints/community_cfg_test_attributes.yml") {
@@ -829,6 +836,7 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
     let owners = function_owners(roots);
     let mutations = querybuilder_mutations(roots);
     let builds = querybuilder_builds(roots);
+    let control_flow = querybuilder_control_flow(roots);
     let mut found = Vec::new();
     for build in &builds {
         let path = PathBuf::from(build["file"].as_str().expect("builder file"));
@@ -947,6 +955,42 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
             .iter()
             .any(|keyword| reconstructed.to_ascii_lowercase().contains(keyword))
         {
+            continue;
+        }
+        // Reconstruct first so read-only builders retain ordinary conditional
+        // filters. Mutating builders fail closed when any contributing state or
+        // the build itself is nested under branch/loop/closure control flow.
+        let owner_control_flow = control_flow.iter().filter(|control| {
+            Path::new(control["file"].as_str().unwrap_or_default()) == path
+                && control["range"]["byteOffset"]["start"]
+                    .as_u64()
+                    .zip(control["range"]["byteOffset"]["end"].as_u64())
+                    .is_some_and(|(start, end)| owner.start <= start && end <= owner.end)
+        });
+        let mut state_offsets = all_owned
+            .iter()
+            .filter_map(|mutation| {
+                mutation["range"]["byteOffset"]["start"]
+                    .as_u64()
+                    .filter(|mutation_offset| {
+                        constructor_offset <= *mutation_offset && *mutation_offset < offset
+                    })
+            })
+            .collect::<Vec<_>>();
+        state_offsets.push(offset);
+        let build_state_is_conditional = state_offsets.into_iter().any(|state_offset| {
+            owner_control_flow.clone().any(|control| {
+                control["range"]["byteOffset"]["start"]
+                    .as_u64()
+                    .zip(control["range"]["byteOffset"]["end"].as_u64())
+                    .is_some_and(|(start, end)| start <= state_offset && state_offset < end)
+            })
+        });
+        if build_state_is_conditional {
+            found.push(format!(
+                "{}: mutating QueryBuilder {receiver} constructor, mutation, or build is control-flow-dependent",
+                path.display()
+            ));
             continue;
         }
         let relative = path
@@ -1139,6 +1183,7 @@ fn scanner_rejects_calibrated_bad_shapes_through_the_real_extractor() {
         "bad_querybuilder_two_receivers",
         "bad_querybuilder_branch",
         "bad_querybuilder_alias",
+        "bad_querybuilder_conditional_push",
         "bad_querybuilder_post_build_push",
     ] {
         assert!(
@@ -1148,6 +1193,19 @@ fn scanner_rejects_calibrated_bad_shapes_through_the_real_extractor() {
             "QueryBuilder control {fixture_name} escaped: {builder_violations:?}"
         );
     }
+    assert!(
+        builder_violations.iter().any(|violation| {
+            violation.contains("bad_querybuilder_conditional_push")
+                && violation.contains("control-flow-dependent")
+        }),
+        "conditional QueryBuilder tenant predicate escaped the control-flow gate: {builder_violations:?}"
+    );
+    assert!(
+        !builder_violations
+            .iter()
+            .any(|violation| violation.contains("good_querybuilder_conditional_select")),
+        "conditional SELECT QueryBuilder was rejected: {builder_violations:?}"
+    );
     assert!(
         !violations.iter().any(|v| v.contains("good_tenant_delete")),
         "tenant-bound control was rejected: {violations:?}"
