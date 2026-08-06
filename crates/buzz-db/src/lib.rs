@@ -651,7 +651,7 @@ impl Db {
     /// `buzz.created_at_floor` GUC — this is what makes the replica fence
     /// proof hold for every insert path that goes through this pool.
     pub async fn new(config: &DbConfig) -> Result<Self> {
-        let pool = Self::connect_pool(config, &config.database_url, true).await?;
+        let pool = Self::connect_pool(config, &config.database_url).await?;
         let read_max_connections = config
             .read_max_connections
             .unwrap_or(config.max_connections);
@@ -671,31 +671,39 @@ impl Db {
         })
     }
 
-    /// Connect one pool with the sizing knobs from `config`.
+    /// Connect the writer pool with all session-level safety premises.
     ///
-    /// `arm_floor_guard` sets the `buzz.created_at_floor` session GUC on
-    /// every connection, arming the deferred commit-time trigger from
-    /// migration 0021. Writer pools must arm it; replica pools are read-only
-    /// so the trigger never fires there.
-    async fn connect_pool(config: &DbConfig, url: &str, arm_floor_guard: bool) -> Result<PgPool> {
-        let mut options = PgPoolOptions::new()
+    /// SQLx stores one `after_connect` hook, so the floor guard and transaction
+    /// isolation assertion must remain in this single closure. Registering a
+    /// second hook replaces the first and silently disarms the floor trigger.
+    async fn connect_pool(config: &DbConfig, url: &str) -> Result<PgPool> {
+        let options = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .min_connections(config.min_connections)
             .acquire_timeout(Duration::from_secs(config.acquire_timeout_secs))
             .max_lifetime(Duration::from_secs(config.max_lifetime_secs))
-            .idle_timeout(Duration::from_secs(config.idle_timeout_secs));
-        if arm_floor_guard {
-            options = options.after_connect(|conn, _meta| {
+            .idle_timeout(Duration::from_secs(config.idle_timeout_secs))
+            .after_connect(|conn, _meta| {
                 Box::pin(async move {
                     // `SET` cannot take bind parameters; `set_config` can.
                     sqlx::query("SELECT set_config('buzz.created_at_floor', $1, false)")
                         .bind(replica_fence::CREATED_AT_FLOOR_SECS.to_string())
-                        .execute(conn)
+                        .execute(&mut *conn)
                         .await?;
+                    let isolation: String = sqlx::query_scalar("SHOW transaction_isolation")
+                        .fetch_one(&mut *conn)
+                        .await?;
+                    if isolation != "read committed" {
+                        return Err(sqlx::Error::Configuration(
+                            format!(
+                                "writer pool requires READ COMMITTED transaction isolation, got {isolation}"
+                            )
+                            .into(),
+                        ));
+                    }
                     Ok(())
                 })
             });
-        }
         Ok(options.connect(url).await?)
     }
 
@@ -720,8 +728,9 @@ impl Db {
     /// are dialed only on first acquire; the ~10-minute reaper never tops
     /// the pool back up, which is fine — routed reads re-fill it on demand.
     ///
-    /// No floor guard: replica sessions are read-only, the trigger never
-    /// fires there (see [`Db::connect_pool`]).
+    /// No floor guard or writer-isolation assertion: replica sessions are
+    /// read-only, so the commit-time trigger from migration 0021 never fires
+    /// here and the write fence that depends on READ COMMITTED is never reached.
     fn connect_read_pool(config: &DbConfig, url: &str, max_connections: u32) -> Result<PgPool> {
         Ok(PgPoolOptions::new()
             .max_connections(max_connections)
@@ -8374,6 +8383,76 @@ mod tests {
         drop_scratch_db(&admin, pool, &name).await;
     }
 
+    #[test]
+    fn writer_pool_safety_hook_is_single_and_composed() {
+        let source = include_str!("lib.rs");
+        let connect_pool = source
+            .split("async fn connect_pool")
+            .nth(1)
+            .and_then(|tail| tail.split("const READER_ACQUIRE_TIMEOUT").next())
+            .expect("connect_pool source block");
+        assert_eq!(
+            connect_pool.matches(".after_connect(").count(),
+            1,
+            "SQLx replaces after_connect hooks; writer safety must use exactly one"
+        );
+        assert!(connect_pool.contains("buzz.created_at_floor"));
+        assert!(connect_pool.contains("SHOW transaction_isolation"));
+        assert!(!connect_pool.contains("arm_floor_guard"));
+        assert!(!connect_pool.contains("_arm_floor_guard"));
+        assert!(!connect_pool.contains("allow(unused_variables)"));
+
+        let reader_doc = source
+            .split("fn connect_read_pool")
+            .next()
+            .and_then(|prefix| prefix.rsplit("/// Connect the read-replica").next())
+            .expect("reader pool documentation");
+        assert!(reader_doc.contains("replica sessions are"));
+        assert!(reader_doc.contains("read-only"));
+        assert!(!reader_doc.contains("Db::connect_pool"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn writer_pool_rejects_non_read_committed_database_default() {
+        let admin = PgPool::connect(&admin_url().await)
+            .await
+            .expect("connect admin");
+        let (seed_pool, name) = create_scratch_db(&admin, "writer_isolation").await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER DATABASE {name} SET default_transaction_isolation = 'repeatable read'"
+        )))
+        .execute(&admin)
+        .await
+        .expect("set unsafe database default");
+        seed_pool.close().await;
+
+        let base = admin_url().await;
+        let idx = base.rfind('/').expect("db url has a path segment");
+        let scratch_url = format!("{}/{}", &base[..idx], name);
+        let error = Db::new(&DbConfig {
+            database_url: scratch_url,
+            max_connections: 1,
+            min_connections: 1,
+            acquire_timeout_secs: 1,
+            ..DbConfig::default()
+        })
+        .await
+        .expect_err("writer pool must reject pinned-snapshot database defaults");
+        assert!(
+            error.to_string().contains("requires READ COMMITTED")
+                || error.to_string().contains("pool timed out"),
+            "unexpected isolation rejection: {error}"
+        );
+
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE {name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop isolation test database");
+    }
+
     /// The armed writer pool (`Db::new`) must enforce the floor end-to-end
     /// through the public insert APIs, and the session GUC must be verifiably
     /// set on pooled connections.
@@ -8412,6 +8491,14 @@ mod tests {
             effective,
             crate::replica_fence::CREATED_AT_FLOOR_SECS.to_string(),
             "writer pool must arm the floor guard on every connection"
+        );
+        let isolation: String = sqlx::query_scalar("SHOW transaction_isolation")
+            .fetch_one(&db.pool)
+            .await
+            .expect("SHOW writer isolation");
+        assert_eq!(
+            isolation, "read committed",
+            "the same writer after_connect hook must enforce the isolation premise"
         );
 
         let now_secs = chrono::Utc::now().timestamp() as u64;

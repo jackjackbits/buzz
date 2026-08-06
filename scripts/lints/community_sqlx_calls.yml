@@ -1,0 +1,11 @@
+id: community-sqlx-call
+message: Any SQLx execution call used to prove repository-complete source coverage
+severity: hint
+language: rust
+rule:
+  any:
+    - pattern: sqlx::query($SQL)
+    - pattern: sqlx::query_scalar($SQL)
+    - pattern: sqlx::query_scalar::<$$$T>($SQL)
+    - pattern: sqlx::query_as($SQL)
+    - pattern: sqlx::query_as::<$$$T>($SQL)

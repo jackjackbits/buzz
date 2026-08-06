@@ -7,37 +7,12 @@ use std::process::Command;
 
 use sqlparser::ast::{
     BinaryOperator, Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, Insert,
-    ObjectName, Query, Select, SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Value,
+    ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableObject, Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 const AUTHORITY: &[&str] = buzz_db::deletion::EXPECTED_SCOPED_TABLES;
-const EXEMPT_CRATES: &[&str] = &[
-    // Browser/CLI/protocol crates do not link SQLx or execute PostgreSQL.
-    "buzz-acp",
-    "buzz-agent",
-    "buzz-backend-kubernetes",
-    "buzz-cli",
-    "buzz-conformance",
-    "buzz-core",
-    "buzz-dev-mcp",
-    "buzz-media",
-    "buzz-pair-relay",
-    "buzz-pairing-cli",
-    "buzz-persona",
-    "buzz-pubsub",
-    "buzz-push-gateway", // deployment-global gateway tables only
-    "buzz-relay-mesh",
-    "buzz-sdk",
-    "buzz-test-client", // test-only client; production source has no SQL writers
-    "buzz-voice",
-    "buzz-workflow",
-    "buzz-ws-client",
-    "git-credential-nostr",
-    "git-sign-nostr",
-    "sprig",
-];
 const NAMED_SQL_WRITES: &[(&str, &str, &str)] = &[(
     "crates/buzz-db/src/reaction.rs",
     "ADD_REACTION_SQL",
@@ -54,26 +29,87 @@ const CONDITIONAL_SQL_WRITES: &[(&str, &str, &[&str])] = &[(
     ],
 )];
 
-const DYNAMIC_WRITES: &[(&str, &str, &str)] = &[
+const DYNAMIC_SQL: &[(&str, &str, &[&str])] = &[
     (
         "crates/buzz-db/src/channel.rs",
-        "UPDATE channels SET {}",
-        "WHERE community_id = ${param_idx}",
+        "get_accessible_channels",
+        &["FROM channels c", "WHERE c.community_id = $1"],
+    ),
+    (
+        "crates/buzz-db/src/channel.rs",
+        "get_users_bulk",
+        &["FROM users WHERE community_id = $1"],
+    ),
+    (
+        "crates/buzz-db/src/channel.rs",
+        "update_channel",
+        &[
+            "UPDATE channels SET {}",
+            "WHERE community_id = ${param_idx}",
+        ],
     ),
     (
         "crates/buzz-db/src/deletion.rs",
-        "DELETE FROM {table}",
-        "WHERE community_id = $1",
+        "inventory_schema",
+        &["SELECT count(*)::BIGINT FROM {table} WHERE community_id = $1"],
+    ),
+    (
+        "crates/buzz-db/src/deletion.rs",
+        "purge_postgres",
+        &["DELETE FROM {table} WHERE community_id = $1"],
+    ),
+    (
+        "crates/buzz-db/src/deletion.rs",
+        "verify_postgres_logically_deleted",
+        &["SELECT EXISTS(SELECT 1 FROM {table} WHERE community_id = $1 LIMIT 1)"],
     ),
     (
         "crates/buzz-db/src/lib.rs",
-        "INSERT INTO event_mentions",
-        "push_bind(community_id.as_uuid())",
+        "insert_mentions",
+        &[
+            "INSERT INTO event_mentions",
+            "push_bind(community_id.as_uuid())",
+        ],
+    ),
+    (
+        "crates/buzz-db/src/partition.rs",
+        "ensure_partition",
+        &["CREATE TABLE IF NOT EXISTS {partition_name} PARTITION OF {table_name}"],
+    ),
+    (
+        "crates/buzz-db/src/replica_fence.rs",
+        "reader_supports_aurora_identity",
+        &["SELECT {AURORA_IDENTITY_FN}()"],
+    ),
+    (
+        "crates/buzz-db/src/replica_fence.rs",
+        "observe_heartbeat",
+        &["FROM replica_heartbeat WHERE id = 1"],
+    ),
+    (
+        "crates/buzz-db/src/thread.rs",
+        "get_thread_replies_on",
+        &["WHERE tm.community_id = $1"],
+    ),
+    (
+        "crates/buzz-db/src/thread.rs",
+        "get_channel_window_on",
+        &["WHERE e.community_id = $1"],
+    ),
+    (
+        "crates/buzz-db/src/usage.rs",
+        "active_user_counts",
+        &["SELECT", "FROM events e"],
+    ),
+    (
+        "crates/buzz-db/src/usage.rs",
+        "active_channel_counts",
+        &["SELECT community_id", "FROM events"],
     ),
     (
         "crates/buzz-db/src/user.rs",
-        "UPDATE users SET {}",
-        "WHERE community_id = ${param_idx}",
+        "update_user_profile",
+        &["UPDATE users SET {}", "WHERE community_id = ${param_idx}"],
     ),
 ];
 
@@ -130,23 +166,13 @@ fn workspace_crates() -> BTreeSet<String> {
 }
 
 fn production_roots() -> Vec<PathBuf> {
-    let exempt = EXEMPT_CRATES.iter().copied().collect::<BTreeSet<_>>();
-    let crates = workspace_crates();
-    let unknown_exempt = exempt
-        .iter()
-        .filter(|name| !crates.contains(**name))
-        .copied()
-        .collect::<Vec<_>>();
-    assert!(
-        unknown_exempt.is_empty(),
-        "stale exempt crates: {unknown_exempt:?}"
-    );
-    crates
+    let roots = workspace_crates()
         .into_iter()
-        .filter(|name| !exempt.contains(name.as_str()))
         .map(|name| repo_root().join("crates").join(name).join("src"))
         .filter(|path| path.is_dir())
-        .collect()
+        .collect::<Vec<_>>();
+    assert!(!roots.is_empty(), "workspace has no production crate roots");
+    roots
 }
 
 fn ast_matches_for_rule(roots: &[PathBuf], rule: &str) -> Vec<serde_json::Value> {
@@ -173,6 +199,10 @@ fn ast_matches_for_rule(roots: &[PathBuf], rule: &str) -> Vec<serde_json::Value>
 
 fn ast_matches(roots: &[PathBuf]) -> Vec<serde_json::Value> {
     ast_matches_for_rule(roots, "scripts/lints/community_fenced_writes.yml")
+}
+
+fn all_sqlx_matches(roots: &[PathBuf]) -> Vec<serde_json::Value> {
+    ast_matches_for_rule(roots, "scripts/lints/community_sqlx_calls.yml")
 }
 
 fn test_module_ranges(roots: &[PathBuf]) -> BTreeMap<PathBuf, Vec<(u64, u64)>> {
@@ -232,36 +262,6 @@ fn target_aliases(factor: &TableFactor, target: &str) -> BTreeSet<String> {
     aliases
 }
 
-fn query_sources(query: &Query) -> BTreeSet<String> {
-    fn collect_select(select: &Select, out: &mut BTreeSet<String>) {
-        for TableWithJoins { relation, joins } in &select.from {
-            if let Some(name) = table_factor_name(relation) {
-                out.insert(name);
-            }
-            for join in joins {
-                if let Some(name) = table_factor_name(&join.relation) {
-                    out.insert(name);
-                }
-            }
-        }
-    }
-    let mut out = BTreeSet::new();
-    match query.body.as_ref() {
-        SetExpr::Select(select) => collect_select(select, &mut out),
-        SetExpr::Query(query) => out.extend(query_sources(query)),
-        SetExpr::SetOperation { left, right, .. } => {
-            if let SetExpr::Select(select) = left.as_ref() {
-                collect_select(select, &mut out);
-            }
-            if let SetExpr::Select(select) = right.as_ref() {
-                collect_select(select, &mut out);
-            }
-        }
-        _ => {}
-    }
-    out
-}
-
 fn is_community_column(expr: &Expr, aliases: &BTreeSet<String>) -> bool {
     match expr {
         Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case("community_id"),
@@ -302,11 +302,19 @@ fn predicate_is_directly_gated(selection: Option<&Expr>, aliases: &BTreeSet<Stri
         Expr::Nested(expr) => predicate_is_directly_gated(Some(expr), aliases),
         Expr::BinaryOp {
             left,
-            op: BinaryOperator::And | BinaryOperator::Or,
+            op: BinaryOperator::And,
             right,
         } => {
             predicate_is_directly_gated(Some(left), aliases)
                 || predicate_is_directly_gated(Some(right), aliases)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
+            predicate_is_directly_gated(Some(left), aliases)
+                && predicate_is_directly_gated(Some(right), aliases)
         }
         Expr::BinaryOp {
             left,
@@ -317,49 +325,100 @@ fn predicate_is_directly_gated(selection: Option<&Expr>, aliases: &BTreeSet<Stri
                 || (is_placeholder(left) && is_community_column(right, aliases))
         }
         Expr::InSubquery { subquery, .. } | Expr::Subquery(subquery) => {
-            query_is_tenant_bound_or_gated(subquery)
+            query_contains_direct_gate(subquery)
         }
         expr => is_allowed_function(expr, aliases),
     }
 }
 
-fn query_is_tenant_bound_or_gated(query: &Query) -> bool {
+fn select_aliases(select: &Select) -> BTreeSet<String> {
+    select
+        .from
+        .iter()
+        .filter_map(|table| {
+            table_factor_name(&table.relation)
+                .map(|target| target_aliases(&table.relation, &target))
+        })
+        .flatten()
+        .collect()
+}
+
+fn select_projection_expr(select: &Select, index: usize) -> Option<&Expr> {
+    match select.projection.get(index)? {
+        SelectItem::UnnamedExpr(expr)
+        | SelectItem::ExprWithAlias { expr, .. }
+        | SelectItem::ExprWithAliases { expr, .. } => Some(expr),
+        SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => None,
+    }
+}
+
+fn query_contains_direct_gate(query: &Query) -> bool {
     match query.body.as_ref() {
         SetExpr::Select(select) => {
-            let aliases = select
-                .from
-                .iter()
-                .filter_map(|table| {
-                    table_factor_name(&table.relation)
-                        .map(|target| target_aliases(&table.relation, &target))
-                })
-                .flatten()
-                .collect::<BTreeSet<_>>();
-            predicate_is_directly_gated(select.selection.as_ref(), &aliases)
+            predicate_is_directly_gated(select.selection.as_ref(), &select_aliases(select))
         }
-        SetExpr::Query(query) => query_is_tenant_bound_or_gated(query),
+        SetExpr::Query(query) => query_contains_direct_gate(query),
         SetExpr::SetOperation { left, right, .. } => {
-            let branch = |set: &SetExpr| match set {
-                SetExpr::Select(select) => {
-                    let aliases = select
-                        .from
-                        .iter()
-                        .filter_map(|table| {
-                            table_factor_name(&table.relation)
-                                .map(|target| target_aliases(&table.relation, &target))
-                        })
-                        .flatten()
-                        .collect::<BTreeSet<_>>();
-                    predicate_is_directly_gated(select.selection.as_ref(), &aliases)
-                }
-                SetExpr::Query(query) => query_is_tenant_bound_or_gated(query),
-                _ => false,
-            };
-            branch(left) && branch(right)
+            set_expr_contains_direct_gate(left) && set_expr_contains_direct_gate(right)
         }
-        SetExpr::Values(_) => true,
         _ => false,
     }
+}
+
+fn set_expr_contains_direct_gate(set: &SetExpr) -> bool {
+    match set {
+        SetExpr::Select(select) => {
+            predicate_is_directly_gated(select.selection.as_ref(), &select_aliases(select))
+        }
+        SetExpr::Query(query) => query_contains_direct_gate(query),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_contains_direct_gate(left) && set_expr_contains_direct_gate(right)
+        }
+        _ => false,
+    }
+}
+
+fn select_projected_community_is_safe(select: &Select, index: usize) -> bool {
+    let aliases = select_aliases(select);
+    let Some(projected) = select_projection_expr(select, index) else {
+        return false;
+    };
+    match projected {
+        Expr::Value(value) if matches!(&value.value, Value::Placeholder(_)) => true,
+        expr if is_allowed_function(expr, &aliases) => true,
+        expr if is_community_column(expr, &aliases) => {
+            let projected_alias = match expr {
+                Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+                    BTreeSet::from([parts[parts.len() - 2].value.to_ascii_lowercase()])
+                }
+                Expr::Identifier(_) if select.from.len() == 1 => aliases,
+                _ => return false,
+            };
+            predicate_is_directly_gated(select.selection.as_ref(), &projected_alias)
+        }
+        _ => false,
+    }
+}
+
+fn set_projected_community_is_safe(set: &SetExpr, index: usize) -> bool {
+    match set {
+        SetExpr::Select(select) => select_projected_community_is_safe(select, index),
+        SetExpr::Query(query) => projected_community_is_safe(query, index),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_projected_community_is_safe(left, index)
+                && set_projected_community_is_safe(right, index)
+        }
+        SetExpr::Values(values) => values.rows.iter().all(|row| {
+            row.get(index).is_some_and(|expr| {
+                matches!(expr, Expr::Value(value) if matches!(&value.value, Value::Placeholder(_)))
+            })
+        }),
+        _ => false,
+    }
+}
+
+fn projected_community_is_safe(query: &Query, index: usize) -> bool {
+    set_projected_community_is_safe(query.body.as_ref(), index)
 }
 
 fn mutation_violation(statement: &Statement, fenced: &BTreeSet<String>) -> Option<String> {
@@ -389,7 +448,12 @@ fn mutation_violation(statement: &Statement, fenced: &BTreeSet<String>) -> Optio
                 format!("fleet UPDATE of {target} lacks a direct tenant predicate or community_write_allowed")
             })
         }
-        Statement::Insert(Insert { table, source, .. }) => {
+        Statement::Insert(Insert {
+            table,
+            columns,
+            source,
+            ..
+        }) => {
             let TableObject::TableName(table_name) = table else {
                 return None;
             };
@@ -397,16 +461,15 @@ fn mutation_violation(statement: &Statement, fenced: &BTreeSet<String>) -> Optio
             if !fenced.contains(&target) {
                 return None;
             }
+            let community_index = columns
+                .iter()
+                .position(|column| basename(column) == "community_id")?;
             let Some(source) = source else { return None };
-            let sources = query_sources(source);
-            if sources.iter().any(|source| fenced.contains(source))
-                && !query_is_tenant_bound_or_gated(source)
-            {
-                return Some(format!(
-                    "fleet INSERT SELECT into {target} reads fenced sources without a direct gate"
-                ));
-            }
-            None
+            (!projected_community_is_safe(source, community_index)).then(|| {
+                format!(
+                    "INSERT into {target} does not prove target community_id is tenant-bound or gated"
+                )
+            })
         }
         _ => None,
     }
@@ -421,7 +484,14 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
     let root = repo_root();
     let mut violations = Vec::new();
     let mut observed_parser_exceptions = BTreeSet::new();
-    let test_ranges = test_module_ranges(roots);
+    let test_ranges = if roots
+        .iter()
+        .any(|root| root.to_string_lossy().contains("/tests/fixtures/"))
+    {
+        BTreeMap::new()
+    } else {
+        test_module_ranges(roots)
+    };
     let production_files = roots
         .iter()
         .flat_map(|source| {
@@ -456,11 +526,17 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
             .expect("SQL metavariable");
         let Some(sql) = rust_string_value(sql_token) else {
             let relative = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
+            let source_text = fs::read_to_string(&path).unwrap_or_default();
             let inventoried = NAMED_SQL_WRITES.iter().any(|(file, symbol, guard)| {
                 relative == *file
                     && sql_token.contains(symbol)
-                    && fs::read_to_string(&path)
-                        .is_ok_and(|source| source.contains(symbol) && source.contains(guard))
+                    && source_text.contains(symbol)
+                    && source_text.contains(guard)
+            }) || DYNAMIC_SQL.iter().any(|(file, owner, guards)| {
+                relative == *file
+                    && sql_token.contains("AssertSqlSafe")
+                    && source_text.contains(owner)
+                    && guards.iter().all(|guard| source_text.contains(guard))
             });
             let conditional = CONDITIONAL_SQL_WRITES.iter().any(|(file, symbol, guards)| {
                 relative == *file
@@ -469,7 +545,7 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
                         source.contains(symbol) && guards.iter().all(|guard| source.contains(guard))
                     })
             });
-            if !inventoried && !conditional && !sql_token.contains("AssertSqlSafe") {
+            if !inventoried && !conditional {
                 violations.push(format!(
                     "{relative}:{line}: unclassified non-literal SQL expression: {sql_token}"
                 ));
@@ -508,11 +584,11 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
         }
     }
 
-    for (relative, write_marker, scope_marker) in DYNAMIC_WRITES {
-        let text = fs::read_to_string(root.join(relative)).expect("read dynamic writer");
-        if !text.contains(write_marker) || !text.contains(scope_marker) {
+    for (relative, owner, guards) in DYNAMIC_SQL {
+        let text = fs::read_to_string(root.join(relative)).expect("read dynamic SQL owner");
+        if !text.contains(owner) || !guards.iter().all(|guard| text.contains(guard)) {
             violations.push(format!(
-                "{relative}: dynamic writer contract changed: {write_marker:?} / {scope_marker:?}"
+                "{relative}: dynamic SQL contract changed: {owner:?} / {guards:?}"
             ));
         }
     }
@@ -533,6 +609,30 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
         }
     }
     violations
+}
+
+#[test]
+fn every_workspace_sqlx_call_is_inside_the_scanned_production_roots() {
+    let roots = production_roots();
+    let production_files = roots
+        .iter()
+        .flat_map(|source| {
+            walkdir::WalkDir::new(source)
+                .into_iter()
+                .filter_map(Result::ok)
+        })
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "rs"))
+        .map(|entry| entry.into_path())
+        .collect::<BTreeSet<_>>();
+    let matches = all_sqlx_matches(&roots);
+    assert!(!matches.is_empty(), "SQLx coverage probe matched no calls");
+    for matched in matches {
+        let path = PathBuf::from(matched["file"].as_str().expect("SQLx call file"));
+        assert!(
+            production_files.contains(&path),
+            "SQLx call escaped workspace source roots: {path:?}"
+        );
+    }
 }
 
 #[test]
@@ -562,6 +662,28 @@ fn scanner_rejects_calibrated_bad_shapes_through_the_real_extractor() {
             .any(|v| v.contains("bad_unrelated_subquery")),
         "unrelated-subquery DELETE control escaped: {violations:?}"
     );
+    for (fixture_name, description) in [
+        ("bad_or_delete", "OR-broadened DELETE"),
+        (
+            "bad_insert_unfenced_source",
+            "unfenced-source INSERT SELECT",
+        ),
+        (
+            "bad_insert_unrelated_alias",
+            "unrelated-alias INSERT SELECT",
+        ),
+        (
+            "bad_dynamic_assert_sql_safe",
+            "unreviewed AssertSqlSafe dynamic SQL",
+        ),
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(fixture_name)),
+            "{description} control escaped: {violations:?}"
+        );
+    }
     assert!(
         !violations.iter().any(|v| v.contains("good_tenant_delete")),
         "tenant-bound control was rejected: {violations:?}"
