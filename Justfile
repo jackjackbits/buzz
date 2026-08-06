@@ -96,7 +96,7 @@ check: fmt-check community-fenced-writes-check clippy desktop-check desktop-taur
 
 # Structurally classify production SQL writes to community-fenced tables.
 community-fenced-writes-check:
-    ./scripts/check-community-fenced-writes.py
+    cargo test -p buzz-db --test community_fenced_writes
 
 # Format all Rust code
 fmt:

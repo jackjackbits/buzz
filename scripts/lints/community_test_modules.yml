@@ -1,0 +1,10 @@
+id: community-test-module
+message: Rust test module excluded from production SQL writer inventory
+severity: hint
+language: rust
+rule:
+  kind: mod_item
+  has:
+    field: name
+    regex: '^tests$'
+    stopBy: end

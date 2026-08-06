@@ -1,5 +1,5 @@
 id: community-fenced-sqlx-write
-message: SQLx call with a direct SQL expression; classified by check-community-fenced-writes.py
+message: SQLx call classified by the buzz-db community_fenced_writes integration test
 severity: hint
 language: rust
 rule:
