@@ -60,6 +60,8 @@ pub use error::{DbError, Result};
 pub use event::{EventQuery, ReactionEventInsertOutcome, DEFAULT_MAX_PAGE_LIMIT};
 
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use sqlx::postgres::PgConnectOptions;
 use sqlx::postgres::{PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool, QueryBuilder, Row};
 use std::time::Duration;
@@ -497,6 +499,67 @@ impl UsageMetricsLeader {
         tokio::time::timeout(std::time::Duration::from_secs(5), self.connection.ping())
             .await
             .is_ok_and(|r| r.is_ok())
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum WriterHookMode {
+    Combined,
+    Separate,
+    CombinedWithoutIsolation,
+    None,
+}
+
+#[cfg(test)]
+fn writer_pool_options_for_mode(mode: WriterHookMode) -> PgPoolOptions {
+    let floor = |options: PgPoolOptions| {
+        options.after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('buzz.created_at_floor', $1, false)")
+                    .bind(replica_fence::CREATED_AT_FLOOR_SECS.to_string())
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+    };
+    let isolation = |options: PgPoolOptions| {
+        options.after_connect(|conn, _meta| {
+            Box::pin(async move {
+                let isolation: String = sqlx::query_scalar("SHOW transaction_isolation")
+                    .fetch_one(conn)
+                    .await?;
+                if isolation != "read committed" {
+                    return Err(sqlx::Error::Configuration(
+                        format!("writer pool requires READ COMMITTED transaction isolation, got {isolation}").into(),
+                    ));
+                }
+                Ok(())
+            })
+        })
+    };
+    match mode {
+        WriterHookMode::Combined => PgPoolOptions::new().after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('buzz.created_at_floor', $1, false)")
+                    .bind(replica_fence::CREATED_AT_FLOOR_SECS.to_string())
+                    .execute(&mut *conn)
+                    .await?;
+                let isolation: String = sqlx::query_scalar("SHOW transaction_isolation")
+                    .fetch_one(&mut *conn)
+                    .await?;
+                if isolation != "read committed" {
+                    return Err(sqlx::Error::Configuration(
+                        format!("writer pool requires READ COMMITTED transaction isolation, got {isolation}").into(),
+                    ));
+                }
+                Ok(())
+            })
+        }),
+        WriterHookMode::Separate => isolation(floor(PgPoolOptions::new())),
+        WriterHookMode::CombinedWithoutIsolation => floor(PgPoolOptions::new()),
+        WriterHookMode::None => PgPoolOptions::new(),
     }
 }
 
@@ -8381,6 +8444,82 @@ mod tests {
         insert_top_level(&pool, community, channel, &old_backfill).await;
 
         drop_scratch_db(&admin, pool, &name).await;
+    }
+
+    async fn hook_mode_observation(
+        url: &str,
+        mode: WriterHookMode,
+    ) -> std::result::Result<(Option<String>, String), sqlx::Error> {
+        let connect: PgConnectOptions = url.parse()?;
+        let pool = writer_pool_options_for_mode(mode)
+            .max_connections(1)
+            .min_connections(1)
+            .acquire_timeout(Duration::from_secs(1))
+            .connect_with(connect)
+            .await?;
+        let floor: Option<String> =
+            sqlx::query_scalar("SELECT NULLIF(current_setting('buzz.created_at_floor', true), '')")
+                .fetch_one(&pool)
+                .await?;
+        let isolation: String = sqlx::query_scalar("SHOW transaction_isolation")
+            .fetch_one(&pool)
+            .await?;
+        pool.close().await;
+        Ok((floor, isolation))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn writer_hook_modes_distinguish_floor_and_isolation_verdicts() {
+        let admin = PgPool::connect(&admin_url().await)
+            .await
+            .expect("connect admin");
+        let (pool, name) = create_scratch_db(&admin, "hook_modes").await;
+        pool.close().await;
+        let base = admin_url().await;
+        let idx = base.rfind('/').expect("database URL path");
+        let url = format!("{}/{}", &base[..idx], name);
+
+        let (floor, isolation) = hook_mode_observation(&url, WriterHookMode::Combined)
+            .await
+            .expect("combined hook");
+        assert_eq!(
+            floor,
+            Some(replica_fence::CREATED_AT_FLOOR_SECS.to_string())
+        );
+        assert_eq!(isolation, "read committed");
+
+        let (floor, isolation) = hook_mode_observation(&url, WriterHookMode::Separate)
+            .await
+            .expect("separate hooks");
+        assert_eq!(
+            floor, None,
+            "last after_connect registration must replace floor setup"
+        );
+        assert_eq!(isolation, "read committed");
+
+        let (floor, isolation) =
+            hook_mode_observation(&url, WriterHookMode::CombinedWithoutIsolation)
+                .await
+                .expect("floor-only hook");
+        assert_eq!(
+            floor,
+            Some(replica_fence::CREATED_AT_FLOOR_SECS.to_string())
+        );
+        assert_eq!(isolation, "read committed");
+
+        let (floor, isolation) = hook_mode_observation(&url, WriterHookMode::None)
+            .await
+            .expect("no-hook control");
+        assert_eq!(floor, None);
+        assert_eq!(isolation, "read committed");
+
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE {name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop hook mode database");
     }
 
     #[test]
