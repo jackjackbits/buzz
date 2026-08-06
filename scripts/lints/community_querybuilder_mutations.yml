@@ -1,11 +1,11 @@
 id: community-querybuilder-mutation
-message: QueryBuilder constructor/push fragments used to reconstruct mutating builders
+message: QueryBuilder constructor/push fragments bound to one receiver
 severity: hint
 language: rust
 rule:
   any:
-    - pattern: QueryBuilder::new($SQL)
-    - pattern: QueryBuilder::<$$$T>::new($SQL)
-    - pattern: sqlx::QueryBuilder::new($SQL)
-    - pattern: sqlx::QueryBuilder::<$$$T>::new($SQL)
-    - pattern: $QB.push($SQL)
+    - pattern: 'let mut $QB: $TYPE = QueryBuilder::new($SQL);'
+    - pattern: 'let mut $QB = QueryBuilder::new($SQL);'
+    - pattern: 'let mut $QB: $TYPE = sqlx::QueryBuilder::new($SQL);'
+    - pattern: 'let mut $QB = sqlx::QueryBuilder::new($SQL);'
+    - pattern: '$QB.push($SQL)'

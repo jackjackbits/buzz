@@ -13,112 +13,100 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 const AUTHORITY: &[&str] = buzz_db::deletion::EXPECTED_SCOPED_TABLES;
-const NAMED_SQL_WRITES: &[(&str, &str, &str)] = &[(
+const NAMED_SQL: &[(&str, &str, &str)] = &[(
     "crates/buzz-db/src/reaction.rs",
     "ADD_REACTION_SQL",
-    "ON CONFLICT (community_id, event_created_at, event_id, pubkey, emoji)",
+    "ADD_REACTION_SQL",
 )];
 
-const CONDITIONAL_SQL_WRITES: &[(&str, &str, &[&str])] = &[(
+const CONDITIONAL_SQL: &[(&str, &str, &str)] = &[(
     "crates/buzz-db/src/lib.rs",
-    "let statement = if hard_delete_superseded",
-    &[
-        "DELETE FROM events",
-        "UPDATE events SET deleted_at = NOW()",
-        "WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4",
-    ],
+    "replace_parameterized_event",
+    "statement",
 )];
 
-const DYNAMIC_SQL: &[(&str, &str, &[&str])] = &[
+const DYNAMIC_SQL: &[(&str, &str, &str)] = &[
     (
         "crates/buzz-push-gateway/src/postgres.rs",
         "apply_migrations_and_grants",
-        &[
-            "REVOKE CREATE ON DATABASE {database}",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE",
-        ],
+        "AssertSqlSafe(grants)",
     ),
     (
         "crates/buzz-db/src/channel.rs",
         "get_accessible_channels",
-        &["FROM channels c", "WHERE c.community_id = $1"],
+        "sqlx::AssertSqlSafe(sql)",
     ),
     (
         "crates/buzz-db/src/channel.rs",
         "get_users_bulk",
-        &["FROM users WHERE community_id = $1"],
+        "sqlx::AssertSqlSafe(sql)",
     ),
     (
         "crates/buzz-db/src/channel.rs",
         "update_channel",
-        &[
-            "UPDATE channels SET {}",
-            "WHERE community_id = ${param_idx}",
-        ],
+        "sqlx::AssertSqlSafe(sql)",
     ),
     (
         "crates/buzz-db/src/deletion.rs",
         "inventory_schema",
-        &["SELECT count(*)::BIGINT FROM {table} WHERE community_id = $1"],
+        "AssertSqlSafe(sql)",
     ),
     (
         "crates/buzz-db/src/deletion.rs",
         "purge_postgres",
-        &["DELETE FROM {table} WHERE community_id = $1"],
+        "AssertSqlSafe(sql)",
     ),
     (
         "crates/buzz-db/src/deletion.rs",
         "verify_postgres_logically_deleted",
-        &["SELECT EXISTS(SELECT 1 FROM {table} WHERE community_id = $1 LIMIT 1)"],
-    ),
-    (
-        "crates/buzz-db/src/lib.rs",
-        "insert_mentions",
-        &[
-            "INSERT INTO event_mentions",
-            "push_bind(community_id.as_uuid())",
-        ],
+        "AssertSqlSafe(sql)",
     ),
     (
         "crates/buzz-db/src/partition.rs",
         "ensure_partition",
-        &["CREATE TABLE IF NOT EXISTS {partition_name} PARTITION OF {table_name}"],
+        "sqlx::AssertSqlSafe(sql)",
     ),
     (
         "crates/buzz-db/src/replica_fence.rs",
         "reader_supports_aurora_identity",
-        &["SELECT {AURORA_IDENTITY_FN}()"],
+        r#"sqlx::AssertSqlSafe(format!("SELECT {AURORA_IDENTITY_FN}()"))"#,
     ),
     (
         "crates/buzz-db/src/replica_fence.rs",
         "observe_heartbeat",
-        &["FROM replica_heartbeat WHERE id = 1"],
+        "sqlx::AssertSqlSafe(sql)",
     ),
     (
         "crates/buzz-db/src/thread.rs",
         "get_thread_replies_on",
-        &["WHERE tm.community_id = $1"],
+        "sqlx::AssertSqlSafe(sql)",
     ),
     (
         "crates/buzz-db/src/thread.rs",
         "get_channel_window_on",
-        &["WHERE e.community_id = $1"],
+        "sqlx::AssertSqlSafe(sql)",
     ),
     (
         "crates/buzz-db/src/usage.rs",
         "active_user_counts",
-        &["SELECT", "FROM events e"],
+        "sqlx::AssertSqlSafe(sql)",
     ),
     (
         "crates/buzz-db/src/usage.rs",
         "active_channel_counts",
-        &["SELECT community_id", "FROM events"],
+        "sqlx::AssertSqlSafe(sql)",
     ),
     (
         "crates/buzz-db/src/user.rs",
         "update_user_profile",
-        &["UPDATE users SET {}", "WHERE community_id = ${param_idx}"],
+        "sqlx::AssertSqlSafe(sql)",
     ),
+];
+
+const QUERY_BUILDER_EXCEPTIONS: &[(&str, &str)] = &[
+    ("crates/buzz-db/src/lib.rs", "insert_mentions"),
+    ("crates/buzz-db/src/event.rs", "query_events_on"),
+    ("crates/buzz-db/src/event.rs", "count_events_on"),
 ];
 
 // PostgreSQL syntax intentionally unsupported by sqlparser 0.62. Each entry is
@@ -282,6 +270,18 @@ fn function_owners(roots: &[PathBuf]) -> Vec<FunctionOwner> {
             })
         })
         .collect()
+}
+
+fn const_sql_definitions(roots: &[PathBuf]) -> Vec<serde_json::Value> {
+    ast_matches_for_rule(roots, "scripts/lints/community_const_sql.yml")
+}
+
+fn conditional_sql_definitions(roots: &[PathBuf]) -> Vec<serde_json::Value> {
+    ast_matches_for_rule(roots, "scripts/lints/community_conditional_sql.yml")
+}
+
+fn normalize_token(token: &str) -> String {
+    token.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 fn rust_string_value(token: &str) -> Option<String> {
@@ -559,6 +559,8 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
     let mut violations = Vec::new();
     let mut observed_parser_exceptions = BTreeSet::new();
     let owners = function_owners(roots);
+    let const_defs = const_sql_definitions(roots);
+    let conditional_defs = conditional_sql_definitions(roots);
     let test_ranges = test_module_ranges(roots);
     let production_files = roots
         .iter()
@@ -600,34 +602,56 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
         let sql_token = sql_token.expect("checked SQL metavariable");
         let Some(sql) = rust_string_value(sql_token) else {
             let relative = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
-            let source_text = fs::read_to_string(&path).unwrap_or_default();
             let owner = owners
                 .iter()
                 .find(|owner| owner.path == path && owner.start <= offset && offset < owner.end);
-            let inventoried = NAMED_SQL_WRITES.iter().any(|(file, symbol, guard)| {
-                relative == *file
-                    && sql_token.contains(symbol)
-                    && source_text.contains(symbol)
-                    && source_text.contains(guard)
-            }) || owner.is_some_and(|owner| {
-                DYNAMIC_SQL.iter().any(|(file, expected_owner, guards)| {
-                    relative == *file
-                        && owner.name == *expected_owner
-                        && sql_token.contains("AssertSqlSafe")
-                        && guards.iter().all(|guard| owner.text.contains(guard))
-                })
+            let dynamic_matches = owner.map_or(0, |owner| {
+                DYNAMIC_SQL
+                    .iter()
+                    .filter(|(file, expected_owner, expression)| {
+                        relative == *file
+                            && owner.name == *expected_owner
+                            && normalize_token(sql_token) == normalize_token(expression)
+                    })
+                    .count()
             });
-            let conditional = owner.is_some_and(|owner| {
-                CONDITIONAL_SQL_WRITES.iter().any(|(file, symbol, guards)| {
+            let named_matches = NAMED_SQL
+                .iter()
+                .filter(|(file, symbol, expression)| {
                     relative == *file
-                        && sql_token == "statement"
-                        && owner.text.contains(symbol)
-                        && guards.iter().all(|guard| owner.text.contains(guard))
+                        && sql_token == *expression
+                        && const_defs.iter().any(|definition| {
+                            Path::new(definition["file"].as_str().unwrap_or_default()) == path
+                                && definition["metaVariables"]["single"]["NAME"]["text"].as_str()
+                                    == Some(*symbol)
+                        })
                 })
+                .count();
+            let conditional_matches = owner.map_or(0, |owner| {
+                CONDITIONAL_SQL
+                    .iter()
+                    .filter(|(file, expected_owner, expression)| {
+                        relative == *file
+                            && owner.name == *expected_owner
+                            && sql_token == *expression
+                            && conditional_defs.iter().any(|definition| {
+                                Path::new(definition["file"].as_str().unwrap_or_default()) == path
+                                    && definition["range"]["byteOffset"]["start"]
+                                        .as_u64()
+                                        .is_some_and(|start| {
+                                            owner.start <= start && start < owner.end
+                                        })
+                                    && definition["metaVariables"]["single"]["NAME"]["text"]
+                                        .as_str()
+                                        == Some(*expression)
+                            })
+                    })
+                    .count()
             });
-            if !inventoried && !conditional {
+            let total = dynamic_matches + named_matches + conditional_matches;
+            if total != 1 {
                 violations.push(format!(
-                    "{relative}:{line}: unclassified non-literal SQL expression: {sql_token}"
+                    "{relative}:{line}: nonliteral SQL expression must match exactly one inventory entry; got {total}: {sql_token}"
                 ));
             }
             continue;
@@ -664,44 +688,78 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
         }
     }
 
-    for (relative, expected_owner, guards) in DYNAMIC_SQL {
+    for (relative, expected_owner, expression) in DYNAMIC_SQL {
         let path = root.join(relative);
-        let matches = owners
+        let count = matches
             .iter()
-            .filter(|owner| {
-                owner.path == path
-                    && owner.name == *expected_owner
-                    && guards.iter().all(|guard| owner.text.contains(guard))
+            .filter(|matched| {
+                Path::new(matched["file"].as_str().unwrap_or_default()) == path
+                    && matched["metaVariables"]["single"]
+                        .get("SQL")
+                        .and_then(|sql| sql["text"].as_str())
+                        .is_some_and(|token| normalize_token(token) == normalize_token(expression))
+                    && matched["range"]["byteOffset"]["start"]
+                        .as_u64()
+                        .is_some_and(|offset| {
+                            owners.iter().any(|owner| {
+                                owner.path == path
+                                    && owner.name == *expected_owner
+                                    && owner.start <= offset
+                                    && offset < owner.end
+                            })
+                        })
             })
             .count();
-        if matches != 1 {
-            violations.push(format!(
-                "{relative}: dynamic SQL contract must match exactly once: {expected_owner:?} / {guards:?}; got {matches}"
-            ));
+        if count != 1 {
+            violations.push(format!("{relative}: dynamic SQL inventory must match exactly once: owner={expected_owner:?} expression={expression:?}; got {count}"));
         }
     }
-    for (relative, symbol, guards) in CONDITIONAL_SQL_WRITES {
+    for (relative, symbol, expression) in NAMED_SQL {
         let path = root.join(relative);
-        let matches = owners
+        let definitions = const_defs
             .iter()
-            .filter(|owner| {
-                owner.path == path
-                    && owner.text.contains(symbol)
-                    && guards.iter().all(|guard| owner.text.contains(guard))
+            .filter(|definition| {
+                Path::new(definition["file"].as_str().unwrap_or_default()) == path
+                    && definition["metaVariables"]["single"]["NAME"]["text"].as_str()
+                        == Some(*symbol)
             })
             .count();
-        if matches != 1 {
-            violations.push(format!(
-                "{relative}: conditional SQL contract must match exactly once: {symbol:?} / {guards:?}; got {matches}"
-            ));
+        let executions = matches
+            .iter()
+            .filter(|matched| {
+                Path::new(matched["file"].as_str().unwrap_or_default()) == path
+                    && matched["metaVariables"]["single"]
+                        .get("SQL")
+                        .and_then(|sql| sql["text"].as_str())
+                        == Some(*expression)
+            })
+            .count();
+        if definitions != 1 || executions == 0 {
+            violations.push(format!("{relative}: named SQL inventory mismatch for {symbol}: definitions={definitions} executions={executions}"));
         }
     }
-    for (relative, symbol, guard) in NAMED_SQL_WRITES {
-        let text = fs::read_to_string(root.join(relative)).expect("read named SQL writer");
-        if !text.contains(symbol) || !text.contains(guard) {
-            violations.push(format!(
-                "{relative}: named SQL writer contract changed: {symbol:?} / {guard:?}"
-            ));
+    for (relative, expected_owner, expression) in CONDITIONAL_SQL {
+        let path = root.join(relative);
+        let definitions = conditional_defs
+            .iter()
+            .filter(|definition| {
+                Path::new(definition["file"].as_str().unwrap_or_default()) == path
+                    && definition["metaVariables"]["single"]["NAME"]["text"].as_str()
+                        == Some(*expression)
+                    && definition["range"]["byteOffset"]["start"]
+                        .as_u64()
+                        .is_some_and(|offset| {
+                            owners.iter().any(|owner| {
+                                owner.path == path
+                                    && owner.name == *expected_owner
+                                    && owner.start <= offset
+                                    && offset < owner.end
+                            })
+                        })
+            })
+            .count();
+        if definitions != 1 {
+            violations.push(format!("{relative}: conditional SQL inventory mismatch: owner={expected_owner} expression={expression} definitions={definitions}"));
         }
     }
     violations
@@ -710,40 +768,99 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
 fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
     let owners = function_owners(roots);
     let mutations = querybuilder_mutations(roots);
+    let builds = querybuilder_builds(roots);
     let mut found = Vec::new();
-    for build in querybuilder_builds(roots) {
+    for build in &builds {
         let path = PathBuf::from(build["file"].as_str().expect("builder file"));
         let offset = build["range"]["byteOffset"]["start"]
             .as_u64()
             .expect("builder offset");
-        let owner = owners
+        let Some(owner) = owners
             .iter()
-            .find(|owner| owner.path == path && owner.start <= offset && offset < owner.end);
-        let Some(owner) = owner else { continue };
+            .find(|owner| owner.path == path && owner.start <= offset && offset < owner.end)
+        else {
+            continue;
+        };
         if !owner.text.contains("QueryBuilder") {
             continue;
         }
         let receiver = build["metaVariables"]["single"]["QB"]["text"]
             .as_str()
             .expect("builder receiver");
-        let fragments = mutations
-            .iter()
-            .filter(|mutation| {
-                path == Path::new(mutation["file"].as_str().unwrap_or_default())
-                    && mutation["range"]["byteOffset"]["start"]
-                        .as_u64()
-                        .is_some_and(|start| owner.start <= start && start < owner.end)
-            })
-            .filter_map(|mutation| mutation["metaVariables"]["single"].get("SQL")?["text"].as_str())
-            .filter_map(rust_string_value)
-            .collect::<Vec<_>>();
-        if fragments.is_empty() {
+        if !receiver
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        {
             found.push(format!(
-                "{}: QueryBuilder {receiver} has no literal fragments",
+                "{}: QueryBuilder build has non-identifier receiver {receiver:?}",
                 path.display()
             ));
             continue;
         }
+        let mut owned = mutations
+            .iter()
+            .filter(|mutation| {
+                Path::new(mutation["file"].as_str().unwrap_or_default()) == path
+                    && mutation["range"]["byteOffset"]["start"]
+                        .as_u64()
+                        .is_some_and(|start| owner.start <= start && start < owner.end)
+                    && mutation["metaVariables"]["single"]
+                        .get("QB")
+                        .and_then(|value| value["text"].as_str())
+                        == Some(receiver)
+            })
+            .collect::<Vec<_>>();
+        owned.sort_by_key(|mutation| {
+            mutation["range"]["byteOffset"]["start"]
+                .as_u64()
+                .unwrap_or_default()
+        });
+        let constructors = owned
+            .iter()
+            .filter(|mutation| {
+                mutation["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("let mut "))
+            })
+            .count();
+        if constructors != 1 {
+            let relative = path
+                .strip_prefix(repo_root())
+                .unwrap_or(&path)
+                .to_string_lossy();
+            let excepted = QUERY_BUILDER_EXCEPTIONS
+                .iter()
+                .any(|(file, expected_owner)| relative == *file && owner.name == *expected_owner);
+            if !excepted {
+                found.push(format!("{}: QueryBuilder {receiver} must have exactly one direct constructor in owner {}; got {constructors}", path.display(), owner.name));
+            }
+            continue;
+        }
+        if owner.text.contains(&format!("let mut alias = {receiver}"))
+            || owner.text.contains(&format!("let alias = {receiver}"))
+            || owner.text.contains(&format!("{receiver} =")) && constructors > 1
+        {
+            found.push(format!(
+                "{}: QueryBuilder {receiver} has ambiguous alias/reassignment",
+                path.display()
+            ));
+            continue;
+        }
+        let fragments = owned
+            .iter()
+            .filter_map(|mutation| mutation["metaVariables"]["single"].get("SQL")?["text"].as_str())
+            .map(|token| rust_string_value(token).ok_or_else(|| token.to_owned()))
+            .collect::<Result<Vec<_>, _>>();
+        let fragments = match fragments {
+            Ok(fragments) => fragments,
+            Err(token) => {
+                found.push(format!(
+                    "{}: QueryBuilder {receiver} has nonliteral fragment {token}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
         let reconstructed = fragments.join(" ");
         if !["insert into", "update ", "delete from"]
             .iter()
@@ -758,13 +875,13 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
         let statements = match parse_sql(&reconstructed) {
             Ok(statements) => statements,
             Err(error) => {
-                let inventoried = DYNAMIC_SQL.iter().any(|(file, expected_owner, guards)| {
-                    relative == *file
-                        && owner.name == *expected_owner
-                        && guards.iter().all(|guard| owner.text.contains(guard))
-                });
+                let inventoried = QUERY_BUILDER_EXCEPTIONS
+                    .iter()
+                    .any(|(file, expected_owner)| {
+                        relative == *file && owner.name == *expected_owner
+                    });
                 if !inventoried {
-                    found.push(format!("{}: mutating QueryBuilder {receiver} failed reconstruction and has no exact owner inventory: {error}; fragments={fragments:?}", path.display()));
+                    found.push(format!("{}: mutating QueryBuilder {receiver} failed reconstruction and has no exact inventory: {error}; fragments={fragments:?}", path.display()));
                 }
                 continue;
             }
@@ -858,6 +975,10 @@ fn scanner_rejects_calibrated_bad_shapes_through_the_real_extractor() {
         ("bad_query_as_with", "query_as_with constructor"),
         ("bad_query_scalar_with", "query_scalar_with constructor"),
         ("bad_raw_sql", "raw_sql constructor"),
+        (
+            "bad_dynamic_second_in_owner",
+            "second dynamic expression in inventoried owner",
+        ),
     ] {
         assert!(
             violations
@@ -867,7 +988,13 @@ fn scanner_rejects_calibrated_bad_shapes_through_the_real_extractor() {
         );
     }
     let builder_violations = querybuilder_violations(std::slice::from_ref(&fixture));
-    for fixture_name in ["bad_querybuilder_direct", "bad_querybuilder_split"] {
+    for fixture_name in [
+        "bad_querybuilder_direct",
+        "bad_querybuilder_split",
+        "bad_querybuilder_two_receivers",
+        "bad_querybuilder_branch",
+        "bad_querybuilder_alias",
+    ] {
         assert!(
             builder_violations
                 .iter()
