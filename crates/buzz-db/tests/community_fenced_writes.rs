@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
 use sqlparser::ast::{
     BinaryOperator, Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, Insert,
     ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableObject, Value,
@@ -25,82 +26,108 @@ const CONDITIONAL_SQL: &[(&str, &str, &str)] = &[(
     "statement",
 )];
 
-const DYNAMIC_SQL: &[(&str, &str, &str)] = &[
-    (
-        "crates/buzz-push-gateway/src/postgres.rs",
-        "apply_migrations_and_grants",
-        "AssertSqlSafe(grants)",
-    ),
-    (
-        "crates/buzz-db/src/channel.rs",
-        "get_accessible_channels",
-        "sqlx::AssertSqlSafe(sql)",
-    ),
-    (
-        "crates/buzz-db/src/channel.rs",
-        "get_users_bulk",
-        "sqlx::AssertSqlSafe(sql)",
-    ),
-    (
-        "crates/buzz-db/src/channel.rs",
-        "update_channel",
-        "sqlx::AssertSqlSafe(sql)",
-    ),
-    (
-        "crates/buzz-db/src/deletion.rs",
-        "inventory_schema",
-        "AssertSqlSafe(sql)",
-    ),
-    (
-        "crates/buzz-db/src/deletion.rs",
-        "purge_postgres",
-        "AssertSqlSafe(sql)",
-    ),
-    (
-        "crates/buzz-db/src/deletion.rs",
-        "verify_postgres_logically_deleted",
-        "AssertSqlSafe(sql)",
-    ),
-    (
-        "crates/buzz-db/src/partition.rs",
-        "ensure_partition",
-        "sqlx::AssertSqlSafe(sql)",
-    ),
-    (
-        "crates/buzz-db/src/replica_fence.rs",
-        "reader_supports_aurora_identity",
-        r#"sqlx::AssertSqlSafe(format!("SELECT {AURORA_IDENTITY_FN}()"))"#,
-    ),
-    (
-        "crates/buzz-db/src/replica_fence.rs",
-        "observe_heartbeat",
-        "sqlx::AssertSqlSafe(sql)",
-    ),
-    (
-        "crates/buzz-db/src/thread.rs",
-        "get_thread_replies_on",
-        "sqlx::AssertSqlSafe(sql)",
-    ),
-    (
-        "crates/buzz-db/src/thread.rs",
-        "get_channel_window_on",
-        "sqlx::AssertSqlSafe(sql)",
-    ),
-    (
-        "crates/buzz-db/src/usage.rs",
-        "active_user_counts",
-        "sqlx::AssertSqlSafe(sql)",
-    ),
-    (
-        "crates/buzz-db/src/usage.rs",
-        "active_channel_counts",
-        "sqlx::AssertSqlSafe(sql)",
-    ),
-    (
-        "crates/buzz-db/src/user.rs",
-        "update_user_profile",
-        "sqlx::AssertSqlSafe(sql)",
-    ),
+#[derive(Clone, Copy)]
+struct DynamicSqlInventory {
+    file: &'static str,
+    owner: &'static str,
+    argument: &'static str,
+    /// SHA-256 of the complete owning function source.
+    /// This binds a dynamic execution to the SQL-producing dataflow, not merely
+    /// to a local identifier such as `sql` at the execution call.
+    owner_fingerprint: &'static str,
+}
+
+const DYNAMIC_SQL: &[DynamicSqlInventory] = &[
+    DynamicSqlInventory {
+        file: "crates/buzz-push-gateway/src/postgres.rs",
+        owner: "apply_migrations_and_grants",
+        argument: "AssertSqlSafe(grants)",
+        owner_fingerprint: "59f2bddd81022c88a9b0367cde36ec53e07c44a09ad643d0db5f3dd83d5244e0",
+    },
+    DynamicSqlInventory {
+        file: "crates/buzz-db/src/channel.rs",
+        owner: "get_accessible_channels",
+        argument: "sqlx::AssertSqlSafe(sql)",
+        owner_fingerprint: "7af8e9f780718222d78e758c31195886532537b7182169b1a72b6f983d8fb5c9",
+    },
+    DynamicSqlInventory {
+        file: "crates/buzz-db/src/channel.rs",
+        owner: "get_users_bulk",
+        argument: "sqlx::AssertSqlSafe(sql)",
+        owner_fingerprint: "ed904badf2c3b9dfeaf6e0c4fe560753732a1b1fcdd6428c8c4f0d27a19c29cb",
+    },
+    DynamicSqlInventory {
+        file: "crates/buzz-db/src/channel.rs",
+        owner: "update_channel",
+        argument: "sqlx::AssertSqlSafe(sql)",
+        owner_fingerprint: "ec7c073f7e618b4d69c79d093b1c8a8320aeb3c8464f550c96a1c0b33162841f",
+    },
+    DynamicSqlInventory {
+        file: "crates/buzz-db/src/deletion.rs",
+        owner: "inventory_schema",
+        argument: "AssertSqlSafe(sql)",
+        owner_fingerprint: "99d744cf8d197e25ee7b620763e7959923517ea7b6f9b5374a0a1c512b5abafb",
+    },
+    DynamicSqlInventory {
+        file: "crates/buzz-db/src/deletion.rs",
+        owner: "purge_postgres",
+        argument: "AssertSqlSafe(sql)",
+        owner_fingerprint: "5d4334785028afef39f9d2f0c42aafce6052a880aeb02d72cd1f102390f5605c",
+    },
+    DynamicSqlInventory {
+        file: "crates/buzz-db/src/deletion.rs",
+        owner: "verify_postgres_logically_deleted",
+        argument: "AssertSqlSafe(sql)",
+        owner_fingerprint: "1faf00caabcd24464fd6d5a83c3006f9e1b4cdc232dfbe9b66c9efbf7b6e7983",
+    },
+    DynamicSqlInventory {
+        file: "crates/buzz-db/src/partition.rs",
+        owner: "ensure_partition",
+        argument: "sqlx::AssertSqlSafe(sql)",
+        owner_fingerprint: "c2802a7c0fec6293a887befe9f78e4becb76b83b1d7315c1e01496bfb5d3b1ff",
+    },
+    DynamicSqlInventory {
+        file: "crates/buzz-db/src/replica_fence.rs",
+        owner: "reader_supports_aurora_identity",
+        argument: r#"sqlx::AssertSqlSafe(format!("SELECT {AURORA_IDENTITY_FN}()"))"#,
+        owner_fingerprint: "3291240355f9b2901a9ec016a4049bccee71dd89fb4b888c8e95573f9519679e",
+    },
+    DynamicSqlInventory {
+        file: "crates/buzz-db/src/replica_fence.rs",
+        owner: "observe_heartbeat",
+        argument: "sqlx::AssertSqlSafe(sql)",
+        owner_fingerprint: "2f7628e054c9e2a195ed92b01994152150d23ea1a4b87b00e30cdaf99b4d829f",
+    },
+    DynamicSqlInventory {
+        file: "crates/buzz-db/src/thread.rs",
+        owner: "get_thread_replies_on",
+        argument: "sqlx::AssertSqlSafe(sql)",
+        owner_fingerprint: "265ee1d19c2b353857518b25185189993e6ee1b729623890c017aeea2dac2721",
+    },
+    DynamicSqlInventory {
+        file: "crates/buzz-db/src/thread.rs",
+        owner: "get_channel_window_on",
+        argument: "sqlx::AssertSqlSafe(sql)",
+        owner_fingerprint: "084c3d9e3cc3621b8602e7d6a653c8af320152a6bac752d95c57e72fb749e4d4",
+    },
+    DynamicSqlInventory {
+        file: "crates/buzz-db/src/usage.rs",
+        owner: "active_user_counts",
+        argument: "sqlx::AssertSqlSafe(sql)",
+        owner_fingerprint: "2fe366035e0eacd5c071e544d81dab8fdcc220e2904b779ec193b95484122571",
+    },
+    DynamicSqlInventory {
+        file: "crates/buzz-db/src/usage.rs",
+        owner: "active_channel_counts",
+        argument: "sqlx::AssertSqlSafe(sql)",
+        owner_fingerprint: "c812cd6eabca88997c6a46933dfcd45a28360716d1aff35086f7ac02cfbdc94a",
+    },
+    DynamicSqlInventory {
+        file: "crates/buzz-db/src/user.rs",
+        owner: "update_user_profile",
+        argument: "sqlx::AssertSqlSafe(sql)",
+        owner_fingerprint: "2f2be400087028ede8d9281ea5c2b073dbd06f08ef628116f6c3160ddfe3990d",
+    },
 ];
 
 const QUERY_BUILDER_EXCEPTIONS: &[(&str, &str)] = &[
@@ -281,7 +308,30 @@ fn conditional_sql_definitions(roots: &[PathBuf]) -> Vec<serde_json::Value> {
 }
 
 fn normalize_token(token: &str) -> String {
-    token.chars().filter(|ch| !ch.is_whitespace()).collect()
+    token
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect()
+}
+
+fn source_fingerprint(source: &str) -> String {
+    let normalized = source
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    hex::encode(Sha256::digest(normalized))
+}
+
+fn dynamic_inventory_matches(
+    entry: &DynamicSqlInventory,
+    relative: &str,
+    owner: &FunctionOwner,
+    sql_token: &str,
+) -> bool {
+    relative == entry.file
+        && owner.name == entry.owner
+        && normalize_token(sql_token) == normalize_token(entry.argument)
+        && source_fingerprint(&owner.text) == entry.owner_fingerprint
 }
 
 fn rust_string_value(token: &str) -> Option<String> {
@@ -554,11 +604,19 @@ fn parse_sql(sql: &str) -> Result<Vec<Statement>, String> {
 }
 
 fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<String> {
+    let owners = function_owners(roots);
+    inspect_matches_with_owners(matches, roots, &owners)
+}
+
+fn inspect_matches_with_owners(
+    matches: &[serde_json::Value],
+    roots: &[PathBuf],
+    owners: &[FunctionOwner],
+) -> Vec<String> {
     let fenced = authority();
     let root = repo_root();
     let mut violations = Vec::new();
     let mut observed_parser_exceptions = BTreeSet::new();
-    let owners = function_owners(roots);
     let const_defs = const_sql_definitions(roots);
     let conditional_defs = conditional_sql_definitions(roots);
     let test_ranges = test_module_ranges(roots);
@@ -608,11 +666,7 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
             let dynamic_matches = owner.map_or(0, |owner| {
                 DYNAMIC_SQL
                     .iter()
-                    .filter(|(file, expected_owner, expression)| {
-                        relative == *file
-                            && owner.name == *expected_owner
-                            && normalize_token(sql_token) == normalize_token(expression)
-                    })
+                    .filter(|entry| dynamic_inventory_matches(entry, &relative, owner, sql_token))
                     .count()
             });
             let named_matches = NAMED_SQL
@@ -688,8 +742,8 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
         }
     }
 
-    for (relative, expected_owner, expression) in DYNAMIC_SQL {
-        let path = root.join(relative);
+    for entry in DYNAMIC_SQL {
+        let path = root.join(entry.file);
         let count = matches
             .iter()
             .filter(|matched| {
@@ -697,21 +751,27 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
                     && matched["metaVariables"]["single"]
                         .get("SQL")
                         .and_then(|sql| sql["text"].as_str())
-                        .is_some_and(|token| normalize_token(token) == normalize_token(expression))
-                    && matched["range"]["byteOffset"]["start"]
-                        .as_u64()
-                        .is_some_and(|offset| {
+                        .is_some_and(|token| {
                             owners.iter().any(|owner| {
-                                owner.path == path
-                                    && owner.name == *expected_owner
-                                    && owner.start <= offset
-                                    && offset < owner.end
+                                matched["range"]["byteOffset"]["start"]
+                                    .as_u64()
+                                    .is_some_and(|offset| {
+                                        owner.path == path
+                                            && owner.start <= offset
+                                            && offset < owner.end
+                                            && dynamic_inventory_matches(
+                                                entry, entry.file, owner, token,
+                                            )
+                                    })
                             })
                         })
             })
             .count();
         if count != 1 {
-            violations.push(format!("{relative}: dynamic SQL inventory must match exactly once: owner={expected_owner:?} expression={expression:?}; got {count}"));
+            violations.push(format!(
+                "{}: dynamic SQL inventory must match exactly once: owner={:?} argument={:?} owner_fingerprint={:?}; got {count}",
+                entry.file, entry.owner, entry.argument, entry.owner_fingerprint
+            ));
         }
     }
     for (relative, symbol, expression) in NAMED_SQL {
@@ -775,10 +835,10 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
         let offset = build["range"]["byteOffset"]["start"]
             .as_u64()
             .expect("builder offset");
-        let Some(owner) = owners
+        let owner = owners
             .iter()
-            .find(|owner| owner.path == path && owner.start <= offset && offset < owner.end)
-        else {
+            .find(|owner| owner.path == path && owner.start <= offset && offset < owner.end);
+        let Some(owner) = owner else {
             continue;
         };
         if !owner.text.contains("QueryBuilder") {
@@ -797,7 +857,7 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
             ));
             continue;
         }
-        let mut owned = mutations
+        let mut all_owned = mutations
             .iter()
             .filter(|mutation| {
                 Path::new(mutation["file"].as_str().unwrap_or_default()) == path
@@ -810,12 +870,12 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
                         == Some(receiver)
             })
             .collect::<Vec<_>>();
-        owned.sort_by_key(|mutation| {
+        all_owned.sort_by_key(|mutation| {
             mutation["range"]["byteOffset"]["start"]
                 .as_u64()
                 .unwrap_or_default()
         });
-        let constructors = owned
+        let constructors = all_owned
             .iter()
             .filter(|mutation| {
                 mutation["text"]
@@ -846,8 +906,29 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
             ));
             continue;
         }
-        let fragments = owned
+        let constructor_offset = all_owned
             .iter()
+            .find(|mutation| {
+                mutation["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("let mut "))
+            })
+            .and_then(|mutation| mutation["range"]["byteOffset"]["start"].as_u64())
+            .expect("exactly one QueryBuilder constructor");
+        if constructor_offset >= offset {
+            found.push(format!(
+                "{}: QueryBuilder {receiver} constructor does not precede build",
+                path.display()
+            ));
+            continue;
+        }
+        let fragments = all_owned
+            .iter()
+            .filter(|mutation| {
+                mutation["range"]["byteOffset"]["start"]
+                    .as_u64()
+                    .is_some_and(|start| constructor_offset <= start && start < offset)
+            })
             .filter_map(|mutation| mutation["metaVariables"]["single"].get("SQL")?["text"].as_str())
             .map(|token| rust_string_value(token).ok_or_else(|| token.to_owned()))
             .collect::<Result<Vec<_>, _>>();
@@ -897,6 +978,70 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
         }));
     }
     found
+}
+
+#[test]
+fn scanner_rejects_dynamic_producer_changes_with_the_same_argument_token() {
+    const REVIEWED_PRODUCER: &str = r#""UPDATE channels SET {}, updated_at = NOW() WHERE community_id = ${param_idx} AND id = ${channel_param_idx} AND deleted_at IS NULL""#;
+    const UNSAFE_PRODUCER: &str = r#""DELETE FROM relay_invites WHERE expires_at < now() /* {} ${param_idx} ${channel_param_idx} */""#;
+
+    let roots = production_roots();
+    let matches = ast_matches(&roots);
+    let mut owners = function_owners(&roots);
+    let entry = DYNAMIC_SQL
+        .iter()
+        .find(|entry| {
+            entry.file == "crates/buzz-db/src/channel.rs" && entry.owner == "update_channel"
+        })
+        .expect("update_channel dynamic inventory");
+    let owner_index = owners
+        .iter()
+        .position(|owner| owner.path == repo_root().join(entry.file) && owner.name == entry.owner)
+        .expect("update_channel owner");
+    let source = owners[owner_index].text.clone();
+    assert!(
+        source.contains(REVIEWED_PRODUCER),
+        "reviewed update_channel SQL producer drifted"
+    );
+    assert!(
+        source.contains(entry.argument),
+        "calibration requires the inventoried argument token"
+    );
+
+    for (description, mutant) in [
+        (
+            "unsafe SQL producer",
+            source.replacen(REVIEWED_PRODUCER, UNSAFE_PRODUCER, 1),
+        ),
+        (
+            "additional dynamic execution in the reviewed owner",
+            source.replacen(
+                entry.argument,
+                &format!(
+                    "{}); sqlx::query(sqlx::AssertSqlSafe(attacker_sql",
+                    entry.argument
+                ),
+                1,
+            ),
+        ),
+    ] {
+        assert!(
+            mutant.contains(entry.argument),
+            "{description} mutant changed the inventoried SQL argument token"
+        );
+        owners[owner_index].text = mutant;
+        let violations = inspect_matches_with_owners(&matches, &roots, &owners);
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("crates/buzz-db/src/channel.rs")
+                    && violation.contains(
+                        "nonliteral SQL expression must match exactly one inventory entry",
+                    )
+                    && violation.contains(entry.argument)
+            }),
+            "{description} mutant escaped: {violations:?}"
+        );
+    }
 }
 
 #[test]
@@ -994,6 +1139,7 @@ fn scanner_rejects_calibrated_bad_shapes_through_the_real_extractor() {
         "bad_querybuilder_two_receivers",
         "bad_querybuilder_branch",
         "bad_querybuilder_alias",
+        "bad_querybuilder_post_build_push",
     ] {
         assert!(
             builder_violations
