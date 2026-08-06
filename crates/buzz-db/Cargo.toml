@@ -26,7 +26,7 @@ metrics     = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 metrics-util = { workspace = true }
-sqlparser = { version = "0.62", default-features = false, features = ["std"] }
+sqlparser = { version = "0.62", default-features = false, features = ["std", "visitor"] }
 walkdir = "2"
 litrs = "1"
 regex-lite = "0.1"

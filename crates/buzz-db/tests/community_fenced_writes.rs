@@ -7,8 +7,9 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{
-    BinaryOperator, Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, Insert,
-    ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableObject, Value,
+    visit_statements, BinaryOperator, Expr, FromTable, FunctionArg, FunctionArgExpr,
+    FunctionArguments, Insert, ObjectName, Query, Select, SelectItem, SetExpr, Statement,
+    TableFactor, TableObject, Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -657,18 +658,41 @@ fn mutation_violation(statement: &Statement, fenced: &BTreeSet<String>) -> Optio
     }
 }
 
-fn querybuilder_mutation_statement(statement: &Statement) -> bool {
+fn statement_is_mutation(statement: &Statement) -> bool {
     matches!(
         statement,
         Statement::Delete(_) | Statement::Update(_) | Statement::Insert(_)
     )
 }
 
-fn parsed_querybuilder_is_read_only(statements: &[Statement]) -> bool {
+fn mutation_violations(
+    statements: &Vec<Statement>,
+    fenced: &BTreeSet<String>,
+) -> (usize, Vec<String>) {
+    let mut mutation_count = 0;
+    let mut violations = Vec::new();
+    let traversal = visit_statements(statements, |statement| {
+        if statement_is_mutation(statement) {
+            mutation_count += 1;
+            if let Some(violation) = mutation_violation(statement, fenced) {
+                violations.push(violation);
+            }
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    assert!(matches!(traversal, std::ops::ControlFlow::Continue(())));
+    (mutation_count, violations)
+}
+
+fn parsed_querybuilder_is_read_only(
+    statements: &Vec<Statement>,
+    fenced: &BTreeSet<String>,
+) -> bool {
     !statements.is_empty()
         && statements
             .iter()
             .all(|statement| matches!(statement, Statement::Query(_)))
+        && mutation_violations(statements, fenced).0 == 0
 }
 
 fn parse_sql(sql: &str) -> Result<Vec<Statement>, String> {
@@ -1037,9 +1061,10 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
         }
         let inventoried = inventory_entry.is_some();
         let parsed = parse_sql(&reconstructed);
+        let fenced = authority();
         let is_read_only = parsed
-            .as_deref()
-            .is_ok_and(parsed_querybuilder_is_read_only);
+            .as_ref()
+            .is_ok_and(|statements| parsed_querybuilder_is_read_only(statements, &fenced));
         // Fingerprinted exceptions cover builders whose dynamic bind helpers
         // prevent a complete literal reconstruction, not parsed mutations.
         if is_read_only || (inventoried && parsed.is_err()) {
@@ -1082,10 +1107,10 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
             continue;
         }
         let statements = match parsed {
-            Ok(statements) if statements.iter().all(querybuilder_mutation_statement) => statements,
+            Ok(statements) if mutation_violations(&statements, &fenced).0 > 0 => statements,
             Ok(statements) => {
                 found.push(format!(
-                    "{}: QueryBuilder {receiver} is neither read-only nor exclusively mutating and has no exact inventory: statements={statements:?}; fragments={fragments:?}",
+                    "{}: QueryBuilder {receiver} is neither recursively read-only nor mutation-bearing and has no exact inventory: statements={statements:?}; fragments={fragments:?}",
                     path.display()
                 ));
                 continue;
@@ -1095,15 +1120,17 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
                 continue;
             }
         };
-        let fenced = authority();
-        found.extend(statements.iter().filter_map(|statement| {
-            mutation_violation(statement, &fenced).map(|violation| {
-                format!(
-                    "{}: mutating QueryBuilder {receiver}: {violation}",
-                    path.display()
-                )
-            })
-        }));
+        found.extend(
+            mutation_violations(&statements, &fenced)
+                .1
+                .into_iter()
+                .map(|violation| {
+                    format!(
+                        "{}: mutating QueryBuilder {receiver}: {violation}",
+                        path.display()
+                    )
+                }),
+        );
     }
     if production_scan {
         for entry in QUERY_BUILDER_EXCEPTIONS {
@@ -1279,6 +1306,7 @@ fn scanner_rejects_calibrated_bad_shapes_through_the_real_extractor() {
         "bad_querybuilder_alias",
         "bad_querybuilder_conditional_push",
         "bad_querybuilder_conditional_whitespace",
+        "bad_querybuilder_unconditional_cte",
         "bad_querybuilder_post_build_push",
     ] {
         assert!(
@@ -1303,8 +1331,21 @@ fn scanner_rejects_calibrated_bad_shapes_through_the_real_extractor() {
                     && violation.contains("control-flow-dependent")
             })
             .count()
-            == 2,
-        "tab-separated UPDATE or newline-separated INSERT QueryBuilder escaped the control-flow gate: {builder_violations:?}"
+            == 5,
+        "tab/newline direct DML or conditional DELETE/UPDATE/INSERT CTE QueryBuilder escaped the control-flow gate: {builder_violations:?}"
+    );
+    assert!(
+        builder_violations
+            .iter()
+            .filter(|violation| {
+                violation.contains("bad_querybuilder_unconditional_cte")
+                    && (violation.contains("fleet DELETE")
+                        || violation.contains("fleet UPDATE")
+                        || violation.contains("omits community_id"))
+            })
+            .count()
+            == 4,
+        "unconditional or nested DELETE/UPDATE/INSERT CTE QueryBuilder escaped recursive tenant validation: {builder_violations:?}"
     );
     assert!(
         !builder_violations
