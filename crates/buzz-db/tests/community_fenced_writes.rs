@@ -130,10 +130,51 @@ const DYNAMIC_SQL: &[DynamicSqlInventory] = &[
     },
 ];
 
-const QUERY_BUILDER_EXCEPTIONS: &[(&str, &str)] = &[
-    ("crates/buzz-db/src/lib.rs", "insert_mentions"),
-    ("crates/buzz-db/src/event.rs", "query_events_on"),
-    ("crates/buzz-db/src/event.rs", "count_events_on"),
+// Exact owners whose QueryBuilder classification cannot be proved from the
+// extracted literal fragments alone. Their complete owner source is pinned so
+// each exception becomes stale on any edit.
+struct QueryBuilderException {
+    file: &'static str,
+    owner: &'static str,
+    owner_fingerprint: &'static str,
+}
+
+const QUERY_BUILDER_EXCEPTIONS: &[QueryBuilderException] = &[
+    QueryBuilderException {
+        file: "crates/buzz-db/src/lib.rs",
+        owner: "insert_mentions",
+        owner_fingerprint: "c888a340801e900d6511de81c5d63c6f87afa030a87847b9df8b23846904b213",
+    },
+    QueryBuilderException {
+        file: "crates/buzz-db/src/event.rs",
+        owner: "query_events_on",
+        owner_fingerprint: "f06a482fa31252f376ca6cec4a83e9e2675f052810e5d8bbfe6784a7dd44dc45",
+    },
+    QueryBuilderException {
+        file: "crates/buzz-db/src/event.rs",
+        owner: "count_events_on",
+        owner_fingerprint: "7f48326ae5789c421653ed85fc612242e9a7b054ec9915cda13b4d294dd107f2",
+    },
+    QueryBuilderException {
+        file: "crates/buzz-db/src/event.rs",
+        owner: "get_last_message_at_bulk",
+        owner_fingerprint: "a3e9ef0f2eea7df90f052380e85fa7f96cd80ac540969d8ab8319fb135d98312",
+    },
+    QueryBuilderException {
+        file: "crates/buzz-db/src/event.rs",
+        owner: "get_events_by_ids_on",
+        owner_fingerprint: "6f18d34658052e2437767c7ff8063cf3e28dfc11a5b8a2c001c329dc1114a056",
+    },
+    QueryBuilderException {
+        file: "crates/buzz-db/src/channel.rs",
+        owner: "get_member_counts_bulk",
+        owner_fingerprint: "877c8e955a81bd28b8477a4967b67e3036ff95be8e7c3e33a4413119b2cc58aa",
+    },
+    QueryBuilderException {
+        file: "crates/buzz-search/src/query.rs",
+        owner: "search",
+        owner_fingerprint: "ca8adf19af50a6c7310bc2e9d1c7ed7be000677815e9a2fe46af4b158409f189",
+    },
 ];
 
 // PostgreSQL syntax intentionally unsupported by sqlparser 0.62. Each entry is
@@ -338,6 +379,16 @@ fn dynamic_inventory_matches(
     relative == entry.file
         && owner.name == entry.owner
         && normalize_token(sql_token) == normalize_token(entry.argument)
+        && source_fingerprint(&owner.text) == entry.owner_fingerprint
+}
+
+fn querybuilder_exception_matches(
+    entry: &QueryBuilderException,
+    relative: &str,
+    owner: &FunctionOwner,
+) -> bool {
+    relative == entry.file
+        && owner.name == entry.owner
         && source_fingerprint(&owner.text) == entry.owner_fingerprint
 }
 
@@ -606,6 +657,20 @@ fn mutation_violation(statement: &Statement, fenced: &BTreeSet<String>) -> Optio
     }
 }
 
+fn querybuilder_mutation_statement(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::Delete(_) | Statement::Update(_) | Statement::Insert(_)
+    )
+}
+
+fn parsed_querybuilder_is_read_only(statements: &[Statement]) -> bool {
+    !statements.is_empty()
+        && statements
+            .iter()
+            .all(|statement| matches!(statement, Statement::Query(_)))
+}
+
 fn parse_sql(sql: &str) -> Result<Vec<Statement>, String> {
     Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(|error| error.to_string())
 }
@@ -833,11 +898,15 @@ fn inspect_matches_with_owners(
 }
 
 fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
+    let production_scan = roots
+        .iter()
+        .any(|root| root.starts_with(repo_root().join("crates")) && root.ends_with("src"));
     let owners = function_owners(roots);
     let mutations = querybuilder_mutations(roots);
     let builds = querybuilder_builds(roots);
     let control_flow = querybuilder_control_flow(roots);
     let mut found = Vec::new();
+    let mut observed_querybuilder_exceptions = BTreeSet::new();
     for build in &builds {
         let path = PathBuf::from(build["file"].as_str().expect("builder file"));
         let offset = build["range"]["byteOffset"]["start"]
@@ -898,8 +967,10 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
                 .to_string_lossy();
             let excepted = QUERY_BUILDER_EXCEPTIONS
                 .iter()
-                .any(|(file, expected_owner)| relative == *file && owner.name == *expected_owner);
-            if !excepted {
+                .find(|entry| querybuilder_exception_matches(entry, &relative, owner));
+            if let Some(entry) = excepted {
+                observed_querybuilder_exceptions.insert((entry.file, entry.owner));
+            } else {
                 found.push(format!("{}: QueryBuilder {receiver} must have exactly one direct constructor in owner {}; got {constructors}", path.display(), owner.name));
             }
             continue;
@@ -950,18 +1021,33 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
                 continue;
             }
         };
-        // QueryBuilder appends string fragments exactly; inserting separators
-        // would let a split `DE` + `LETE` mutation evade classification.
+        // QueryBuilder appends string fragments exactly, so parse the same
+        // byte sequence that will be executed. The AST, not raw keyword
+        // spelling, decides whether conditional state is safe to ignore.
         let reconstructed = fragments.concat();
-        if !["insert into", "update ", "delete from"]
+        let relative = path
+            .strip_prefix(repo_root())
+            .unwrap_or(&path)
+            .to_string_lossy();
+        let inventory_entry = QUERY_BUILDER_EXCEPTIONS
             .iter()
-            .any(|keyword| reconstructed.to_ascii_lowercase().contains(keyword))
-        {
+            .find(|entry| querybuilder_exception_matches(entry, &relative, owner));
+        if let Some(entry) = inventory_entry {
+            observed_querybuilder_exceptions.insert((entry.file, entry.owner));
+        }
+        let inventoried = inventory_entry.is_some();
+        let parsed = parse_sql(&reconstructed);
+        let is_read_only = parsed
+            .as_deref()
+            .is_ok_and(parsed_querybuilder_is_read_only);
+        // Fingerprinted exceptions cover builders whose dynamic bind helpers
+        // prevent a complete literal reconstruction, not parsed mutations.
+        if is_read_only || (inventoried && parsed.is_err()) {
             continue;
         }
-        // Reconstruct first so read-only builders retain ordinary conditional
-        // filters. Mutating builders fail closed when any contributing state or
-        // the build itself is nested under branch/loop/closure control flow.
+        // Parsed reads and fingerprinted, unparseable exact-owner exceptions
+        // are safe to ignore here. Every other shape must pass the conditional-
+        // state gate and AST mutation validation below.
         let owner_control_flow = control_flow.iter().filter(|control| {
             Path::new(control["file"].as_str().unwrap_or_default()) == path
                 && control["range"]["byteOffset"]["start"]
@@ -995,21 +1081,17 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
             ));
             continue;
         }
-        let relative = path
-            .strip_prefix(repo_root())
-            .unwrap_or(&path)
-            .to_string_lossy();
-        let statements = match parse_sql(&reconstructed) {
-            Ok(statements) => statements,
+        let statements = match parsed {
+            Ok(statements) if statements.iter().all(querybuilder_mutation_statement) => statements,
+            Ok(statements) => {
+                found.push(format!(
+                    "{}: QueryBuilder {receiver} is neither read-only nor exclusively mutating and has no exact inventory: statements={statements:?}; fragments={fragments:?}",
+                    path.display()
+                ));
+                continue;
+            }
             Err(error) => {
-                let inventoried = QUERY_BUILDER_EXCEPTIONS
-                    .iter()
-                    .any(|(file, expected_owner)| {
-                        relative == *file && owner.name == *expected_owner
-                    });
-                if !inventoried {
-                    found.push(format!("{}: mutating QueryBuilder {receiver} failed reconstruction and has no exact inventory: {error}; fragments={fragments:?}", path.display()));
-                }
+                found.push(format!("{}: QueryBuilder {receiver} failed reconstruction and has no exact inventory: {error}; fragments={fragments:?}", path.display()));
                 continue;
             }
         };
@@ -1022,6 +1104,16 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
                 )
             })
         }));
+    }
+    if production_scan {
+        for entry in QUERY_BUILDER_EXCEPTIONS {
+            if !observed_querybuilder_exceptions.contains(&(entry.file, entry.owner)) {
+                found.push(format!(
+                    "{}: QueryBuilder inventory entry for {} is stale or unobserved",
+                    entry.file, entry.owner
+                ));
+            }
+        }
     }
     found
 }
@@ -1186,6 +1278,7 @@ fn scanner_rejects_calibrated_bad_shapes_through_the_real_extractor() {
         "bad_querybuilder_branch",
         "bad_querybuilder_alias",
         "bad_querybuilder_conditional_push",
+        "bad_querybuilder_conditional_whitespace",
         "bad_querybuilder_post_build_push",
     ] {
         assert!(
@@ -1200,7 +1293,18 @@ fn scanner_rejects_calibrated_bad_shapes_through_the_real_extractor() {
             violation.contains("bad_querybuilder_conditional_push")
                 && violation.contains("control-flow-dependent")
         }),
-        "split-keyword conditional QueryBuilder tenant predicate escaped the control-flow gate: {builder_violations:?}"
+        "comment-separated conditional DELETE QueryBuilder tenant predicate escaped the control-flow gate: {builder_violations:?}"
+    );
+    assert!(
+        builder_violations
+            .iter()
+            .filter(|violation| {
+                violation.contains("bad_querybuilder_conditional_whitespace")
+                    && violation.contains("control-flow-dependent")
+            })
+            .count()
+            == 2,
+        "tab-separated UPDATE or newline-separated INSERT QueryBuilder escaped the control-flow gate: {builder_violations:?}"
     );
     assert!(
         !builder_violations
