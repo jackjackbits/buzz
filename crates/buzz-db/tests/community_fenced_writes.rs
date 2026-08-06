@@ -950,7 +950,9 @@ fn querybuilder_violations(roots: &[PathBuf]) -> Vec<String> {
                 continue;
             }
         };
-        let reconstructed = fragments.join(" ");
+        // QueryBuilder appends string fragments exactly; inserting separators
+        // would let a split `DE` + `LETE` mutation evade classification.
+        let reconstructed = fragments.concat();
         if !["insert into", "update ", "delete from"]
             .iter()
             .any(|keyword| reconstructed.to_ascii_lowercase().contains(keyword))
@@ -1198,7 +1200,7 @@ fn scanner_rejects_calibrated_bad_shapes_through_the_real_extractor() {
             violation.contains("bad_querybuilder_conditional_push")
                 && violation.contains("control-flow-dependent")
         }),
-        "conditional QueryBuilder tenant predicate escaped the control-flow gate: {builder_violations:?}"
+        "split-keyword conditional QueryBuilder tenant predicate escaped the control-flow gate: {builder_violations:?}"
     );
     assert!(
         !builder_violations
