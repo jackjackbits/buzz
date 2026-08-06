@@ -206,18 +206,66 @@ fn all_sqlx_matches(roots: &[PathBuf]) -> Vec<serde_json::Value> {
 }
 
 fn test_module_ranges(roots: &[PathBuf]) -> BTreeMap<PathBuf, Vec<(u64, u64)>> {
+    let mut cfg_offsets = BTreeMap::<PathBuf, Vec<u64>>::new();
+    for matched in ast_matches_for_rule(roots, "scripts/lints/community_cfg_test_attributes.yml") {
+        let path = PathBuf::from(matched["file"].as_str().expect("cfg(test) file"));
+        let offset = matched["range"]["byteOffset"]["start"]
+            .as_u64()
+            .expect("cfg offset");
+        cfg_offsets.entry(path).or_default().push(offset);
+    }
+
     let mut ranges = BTreeMap::<PathBuf, Vec<(u64, u64)>>::new();
-    for matched in ast_matches_for_rule(roots, "scripts/lints/community_test_modules.yml") {
-        let path = PathBuf::from(matched["file"].as_str().expect("test module file"));
+    for matched in ast_matches_for_rule(roots, "scripts/lints/community_modules.yml") {
+        let path = PathBuf::from(matched["file"].as_str().expect("module file"));
         let start = matched["range"]["byteOffset"]["start"]
             .as_u64()
-            .expect("start offset");
+            .expect("module start");
         let end = matched["range"]["byteOffset"]["end"]
             .as_u64()
-            .expect("end offset");
-        ranges.entry(path).or_default().push((start, end));
+            .expect("module end");
+        let source = fs::read_to_string(&path).expect("read module source");
+        let attributed = cfg_offsets.get(&path).is_some_and(|offsets| {
+            offsets.iter().any(|offset| {
+                *offset < start
+                    && source[*offset as usize..start as usize]
+                        .trim()
+                        .starts_with("#[cfg(test)]")
+            })
+        });
+        if attributed {
+            ranges.entry(path).or_default().push((start, end));
+        }
     }
     ranges
+}
+
+#[derive(Debug)]
+struct FunctionOwner {
+    path: PathBuf,
+    start: u64,
+    end: u64,
+    name: String,
+    text: String,
+}
+
+fn function_owners(roots: &[PathBuf]) -> Vec<FunctionOwner> {
+    ast_matches_for_rule(roots, "scripts/lints/community_function_items.yml")
+        .into_iter()
+        .filter_map(|matched| {
+            let text = matched["text"].as_str()?.to_owned();
+            let signature = regex_lite::Regex::new(r"(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
+                .expect("function signature regex");
+            let name = signature.captures(&text)?.get(1)?.as_str().to_owned();
+            Some(FunctionOwner {
+                path: PathBuf::from(matched["file"].as_str()?),
+                start: matched["range"]["byteOffset"]["start"].as_u64()?,
+                end: matched["range"]["byteOffset"]["end"].as_u64()?,
+                name,
+                text,
+            })
+        })
+        .collect()
 }
 
 fn rust_string_value(token: &str) -> Option<String> {
@@ -484,14 +532,8 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
     let root = repo_root();
     let mut violations = Vec::new();
     let mut observed_parser_exceptions = BTreeSet::new();
-    let test_ranges = if roots
-        .iter()
-        .any(|root| root.to_string_lossy().contains("/tests/fixtures/"))
-    {
-        BTreeMap::new()
-    } else {
-        test_module_ranges(roots)
-    };
+    let owners = function_owners(roots);
+    let test_ranges = test_module_ranges(roots);
     let production_files = roots
         .iter()
         .flat_map(|source| {
@@ -527,23 +569,29 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
         let Some(sql) = rust_string_value(sql_token) else {
             let relative = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
             let source_text = fs::read_to_string(&path).unwrap_or_default();
+            let owner = owners
+                .iter()
+                .find(|owner| owner.path == path && owner.start <= offset && offset < owner.end);
             let inventoried = NAMED_SQL_WRITES.iter().any(|(file, symbol, guard)| {
                 relative == *file
                     && sql_token.contains(symbol)
                     && source_text.contains(symbol)
                     && source_text.contains(guard)
-            }) || DYNAMIC_SQL.iter().any(|(file, owner, guards)| {
-                relative == *file
-                    && sql_token.contains("AssertSqlSafe")
-                    && source_text.contains(owner)
-                    && guards.iter().all(|guard| source_text.contains(guard))
+            }) || owner.is_some_and(|owner| {
+                DYNAMIC_SQL.iter().any(|(file, expected_owner, guards)| {
+                    relative == *file
+                        && owner.name == *expected_owner
+                        && sql_token.contains("AssertSqlSafe")
+                        && guards.iter().all(|guard| owner.text.contains(guard))
+                })
             });
-            let conditional = CONDITIONAL_SQL_WRITES.iter().any(|(file, symbol, guards)| {
-                relative == *file
-                    && sql_token == "statement"
-                    && fs::read_to_string(&path).is_ok_and(|source| {
-                        source.contains(symbol) && guards.iter().all(|guard| source.contains(guard))
-                    })
+            let conditional = owner.is_some_and(|owner| {
+                CONDITIONAL_SQL_WRITES.iter().any(|(file, symbol, guards)| {
+                    relative == *file
+                        && sql_token == "statement"
+                        && owner.text.contains(symbol)
+                        && guards.iter().all(|guard| owner.text.contains(guard))
+                })
             });
             if !inventoried && !conditional {
                 violations.push(format!(
@@ -584,19 +632,35 @@ fn inspect_matches(matches: &[serde_json::Value], roots: &[PathBuf]) -> Vec<Stri
         }
     }
 
-    for (relative, owner, guards) in DYNAMIC_SQL {
-        let text = fs::read_to_string(root.join(relative)).expect("read dynamic SQL owner");
-        if !text.contains(owner) || !guards.iter().all(|guard| text.contains(guard)) {
+    for (relative, expected_owner, guards) in DYNAMIC_SQL {
+        let path = root.join(relative);
+        let matches = owners
+            .iter()
+            .filter(|owner| {
+                owner.path == path
+                    && owner.name == *expected_owner
+                    && guards.iter().all(|guard| owner.text.contains(guard))
+            })
+            .count();
+        if matches != 1 {
             violations.push(format!(
-                "{relative}: dynamic SQL contract changed: {owner:?} / {guards:?}"
+                "{relative}: dynamic SQL contract must match exactly once: {expected_owner:?} / {guards:?}; got {matches}"
             ));
         }
     }
     for (relative, symbol, guards) in CONDITIONAL_SQL_WRITES {
-        let text = fs::read_to_string(root.join(relative)).expect("read conditional SQL writer");
-        if !text.contains(symbol) || !guards.iter().all(|guard| text.contains(guard)) {
+        let path = root.join(relative);
+        let matches = owners
+            .iter()
+            .filter(|owner| {
+                owner.path == path
+                    && owner.text.contains(symbol)
+                    && guards.iter().all(|guard| owner.text.contains(guard))
+            })
+            .count();
+        if matches != 1 {
             violations.push(format!(
-                "{relative}: conditional SQL writer contract changed: {symbol:?} / {guards:?}"
+                "{relative}: conditional SQL contract must match exactly once: {symbol:?} / {guards:?}; got {matches}"
             ));
         }
     }
@@ -691,5 +755,11 @@ fn scanner_rejects_calibrated_bad_shapes_through_the_real_extractor() {
     assert!(
         !violations.iter().any(|v| v.contains("good_gated_delete")),
         "gated control was rejected: {violations:?}"
+    );
+    assert!(
+        !violations
+            .iter()
+            .any(|v| v.contains("good_cfg_test_module")),
+        "actual cfg(test) module was treated as production: {violations:?}"
     );
 }
