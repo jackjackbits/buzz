@@ -501,7 +501,7 @@ mod tests {
         migrations.sort_by_key(|migration| migration.version);
         migrations
             .into_iter()
-            .filter(|migration| migration.version > 28)
+            .filter(|migration| migration.version > 29)
             .flat_map(|migration| {
                 let statements = split_sql_statements(migration.sql.as_str());
                 let attachments = statements
@@ -668,7 +668,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 29);
+        assert_eq!(migrations.len(), 30);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1036,9 +1036,17 @@ mod tests {
         assert!(!channel_id_index.contains("CREATE UNIQUE INDEX"));
         assert!(desired_schema.contains("idx_channels_id_live"));
 
-        // Durable whole-community deletion control plane and universal DB fence.
+        // Main owns 0028 for long reaction payloads.
         assert_eq!(migrations[27].version, 28);
-        let deletion = migrations[27].sql.as_str();
+        let long_reactions = migrations[27].sql.as_str();
+        assert!(
+            long_reactions.contains("ALTER TABLE reactions ALTER COLUMN emoji TYPE VARCHAR(66)")
+        );
+        assert!(desired_schema.contains("emoji               VARCHAR(66) NOT NULL"));
+
+        // Durable whole-community deletion control plane and universal DB fence.
+        assert_eq!(migrations[28].version, 29);
+        let deletion = migrations[28].sql.as_str();
         assert!(deletion.contains("CREATE TABLE community_deletion_requests"));
         assert!(deletion.contains("CREATE TABLE community_deletion_approvals"));
         assert!(deletion.contains("CREATE TABLE community_deletion_checkpoints"));
@@ -1063,10 +1071,10 @@ mod tests {
         assert!(deletion.contains("prevent_community_deletion_request_retargeting"));
         assert!(deletion.contains("prevent_community_deletion_approval_removal"));
 
-        // Bounded deletion retries are an additive migration because 0028 is
-        // already checksum-pinned on deployed candidates.
-        assert_eq!(migrations[28].version, 29);
-        let bounded_retries = migrations[28].sql.as_str();
+        // Bounded deletion retries are additive because the deletion migration
+        // is checksum-pinned once deployed.
+        assert_eq!(migrations[29].version, 30);
+        let bounded_retries = migrations[29].sql.as_str();
         assert!(bounded_retries.contains("ALTER TABLE community_deletion_requests"));
         assert!(bounded_retries.contains("ADD COLUMN retry_stage"));
         assert!(bounded_retries.contains("'approved', 'fenced', 'drained'"));
@@ -1079,7 +1087,7 @@ mod tests {
         let violations = migrations_missing_community_write_fence_attachment();
         assert!(
             violations.is_empty(),
-            "migrations after 0028 must explicitly attach every new community write fence:\n{}",
+            "migrations after 0029 must explicitly attach every new community write fence:\n{}",
             violations.join("\n")
         );
     }
