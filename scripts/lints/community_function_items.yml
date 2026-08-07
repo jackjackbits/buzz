@@ -1,6 +1,0 @@
-id: community-function-item
-message: Rust function item used to bind dynamic SQL to its exact owner
-severity: hint
-language: rust
-rule:
-  kind: function_item

@@ -1,6 +1,0 @@
-id: community-conditional-sql
-message: Conditional SQL local definition
-severity: hint
-language: rust
-rule:
-  pattern: 'let $NAME = if $COND { $A } else { $B };'
