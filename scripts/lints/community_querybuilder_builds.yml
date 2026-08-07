@@ -1,0 +1,9 @@
+id: community-querybuilder-build
+message: QueryBuilder execution call bound to its exact receiver symbol
+severity: hint
+language: rust
+rule:
+  any:
+    - pattern: $QB.build()
+    - pattern: $QB.build_query_as::<$$$T>()
+    - pattern: $QB.build_query_scalar::<$$$T>()

@@ -1,0 +1,7 @@
+id: community-cfg-test-attribute
+message: Actual cfg(test) attribute used to identify test-only syntax
+severity: hint
+language: rust
+rule:
+  kind: attribute_item
+  regex: 'cfg\(test\)'

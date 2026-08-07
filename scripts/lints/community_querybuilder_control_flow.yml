@@ -1,0 +1,13 @@
+id: community-querybuilder-control-flow
+message: Control-flow region used to reject ambiguous QueryBuilder state
+severity: hint
+language: rust
+rule:
+  any:
+    - kind: if_expression
+    - kind: for_expression
+    - kind: while_expression
+    - kind: loop_expression
+    - kind: match_expression
+    - kind: closure_expression
+    - kind: async_block

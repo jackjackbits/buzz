@@ -95,9 +95,14 @@ run_unit_tests() {
   # script, not startup state) and the tenant-scoping lints. The Postgres-backed
   # buzz-db tests are #[ignore]d; nothing here (or in integration mode below,
   # which runs `cargo test -p buzz-db` without --ignored) runs them — they need a
-  # separate isolated-DB gate, so --lib keeps this step infra-free.
+  # separate isolated-DB gate, so --lib keeps this step infra-free. The fenced-
+  # writer scanner is a fixture-backed integration test and must be invoked
+  # explicitly because --lib cannot discover it.
   run_test_step "buzz-db unit tests" \
     cargo test -p buzz-db --lib -- --nocapture
+
+  run_test_step "buzz-db community fenced-writer scanner" \
+    cargo test -p buzz-db --test community_fenced_writes -- --nocapture
 
   # Multi-tenant conformance gate: independent replay checker + golden
   # fixtures (buzz-conformance). Pure in-process trace replay, no infra.

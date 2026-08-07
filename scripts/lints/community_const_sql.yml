@@ -1,0 +1,6 @@
+id: community-const-sql
+message: Named SQL constant definition
+severity: hint
+language: rust
+rule:
+  pattern: 'const $NAME: $TYPE = $VALUE;'

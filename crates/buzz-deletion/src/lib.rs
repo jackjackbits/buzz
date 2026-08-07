@@ -493,6 +493,25 @@ async fn connect_store() -> Result<DeletionStore> {
     Ok(store(&db))
 }
 
+fn resolve_s3_region(buzz_region: Option<String>, aws_region: Option<String>) -> String {
+    buzz_region
+        .and_then(nonempty_s3_region)
+        .or_else(|| aws_region.and_then(nonempty_s3_region))
+        .unwrap_or_else(|| "us-east-1".to_string())
+}
+
+fn nonempty_s3_region(region: String) -> Option<String> {
+    let region = region.trim();
+    (!region.is_empty()).then(|| region.to_string())
+}
+
+fn s3_region_from_env() -> String {
+    resolve_s3_region(
+        std::env::var("BUZZ_S3_REGION").ok(),
+        std::env::var("AWS_REGION").ok(),
+    )
+}
+
 async fn connect_services() -> Result<Services> {
     let store = connect_store().await?;
     let media_config = buzz_media::MediaConfig {
@@ -500,9 +519,7 @@ async fn connect_services() -> Result<Services> {
         s3_access_key: required_env("BUZZ_S3_ACCESS_KEY")?,
         s3_secret_key: required_env("BUZZ_S3_SECRET_KEY")?,
         s3_bucket: required_env("BUZZ_S3_BUCKET")?,
-        s3_region: std::env::var("BUZZ_S3_REGION")
-            .or_else(|_| std::env::var("AWS_REGION"))
-            .map_err(|_| anyhow::anyhow!("BUZZ_S3_REGION or AWS_REGION is required"))?,
+        s3_region: s3_region_from_env(),
         s3_addressing_style: std::env::var("BUZZ_S3_ADDRESSING_STYLE")
             .unwrap_or_else(|_| "path".to_string())
             .parse()
@@ -1706,6 +1723,30 @@ mod tests {
             "configured"
         );
         std::env::remove_var(&variable);
+    }
+
+    #[test]
+    fn deletion_s3_region_matches_relay_precedence_and_default() {
+        assert_eq!(resolve_s3_region(None, None), "us-east-1");
+        assert_eq!(
+            resolve_s3_region(Some("   ".to_string()), None),
+            "us-east-1"
+        );
+        assert_eq!(
+            resolve_s3_region(Some("   ".to_string()), Some(" us-west-2 ".to_string())),
+            "us-west-2"
+        );
+        assert_eq!(
+            resolve_s3_region(None, Some("us-west-2".to_string())),
+            "us-west-2"
+        );
+        assert_eq!(
+            resolve_s3_region(
+                Some("eu-central-1".to_string()),
+                Some("us-west-2".to_string())
+            ),
+            "eu-central-1"
+        );
     }
 
     #[test]

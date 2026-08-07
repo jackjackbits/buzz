@@ -92,7 +92,11 @@ build-release:
     cargo build --workspace --release
 
 # Run repo lint and formatting checks
-check: fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
+check: fmt-check community-fenced-writes-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
+
+# Structurally classify production SQL writes to community-fenced tables.
+community-fenced-writes-check:
+    cargo test -p buzz-db --test community_fenced_writes
 
 # Format all Rust code
 fmt:
@@ -304,7 +308,11 @@ test-unit:
         # and the tenant-scoping lints. The Postgres-backed buzz-db tests are
         # #[ignore]d, so --lib runs only the infra-free set. Without this gate a
         # stray file in migrations/ or a broken lint ships green.
+        # The fenced-writer scanner is an integration test because it needs
+        # fixture directories, so `--lib` cannot discover it. Keep it on this
+        # existing CI/pre-push entrypoint explicitly.
         cargo nextest run -p buzz-db --lib
+        cargo test -p buzz-db --test community_fenced_writes
         # Multi-tenant conformance gate (buzz-conformance): the independent
         # replay checker + golden fixtures. No infra — pure in-process trace
         # replay — so it belongs in the unit job. Run all targets (lib + the
