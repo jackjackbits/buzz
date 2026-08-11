@@ -2100,14 +2100,15 @@ impl DeletionStore {
         }
         sqlx::query(
             "INSERT INTO community_deletion_checkpoints \
-             (request_id, stage, unit_key, status, lease_generation, detail, completed_at) \
-             VALUES ($1, $2, $3, 'failed', $4, $5, now())",
+             (request_id, stage, unit_key, status, lease_generation, detail, error) \
+             VALUES ($1, $2, $3, 'failed', $4, $5, $6)",
         )
         .bind(request.id)
         .bind(request.stage.to_string())
         .bind(unit_key)
         .bind(request.lease_generation.max(1))
         .bind(serde_json::json!({"error": &bounded}))
+        .bind(&bounded)
         .execute(&mut *tx)
         .await?;
         let row = sqlx::query(
@@ -3615,11 +3616,23 @@ mod postgres_tests {
             blocked.blocked_reason.as_deref(),
             Some("BUZZ_S3_ENDPOINT is required")
         );
+        assert_eq!(
+            blocked.last_error.as_deref(),
+            Some("BUZZ_S3_ENDPOINT is required")
+        );
         assert!(blocked.lease_owner.is_none());
         let inspection = store.inspect(request.id).await.expect("inspect failure");
-        assert!(inspection.checkpoints.iter().any(|checkpoint| {
-            checkpoint.unit_key == "pre_claim:service_setup" && checkpoint.status == "failed"
-        }));
+        let checkpoint = inspection
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.unit_key == "pre_claim:service_setup")
+            .expect("setup failure checkpoint");
+        assert_eq!(checkpoint.status, "failed");
+        assert_eq!(
+            checkpoint.error.as_deref(),
+            Some("BUZZ_S3_ENDPOINT is required")
+        );
+        assert!(checkpoint.completed_at.is_none());
     }
 
     #[tokio::test]
