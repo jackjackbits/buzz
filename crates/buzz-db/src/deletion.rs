@@ -2099,9 +2099,15 @@ impl DeletionStore {
             )));
         }
         sqlx::query(
-            "INSERT INTO community_deletion_checkpoints \
-             (request_id, stage, unit_key, status, lease_generation, detail, error) \
-             VALUES ($1, $2, $3, 'failed', $4, $5, $6)",
+            r#"
+            INSERT INTO community_deletion_checkpoints
+                (request_id, stage, unit_key, status, lease_generation, detail, error)
+            VALUES ($1, $2, $3, 'failed', $4, $5, $6)
+            ON CONFLICT (request_id, stage, unit_key) DO UPDATE
+            SET status = 'failed', lease_generation = EXCLUDED.lease_generation,
+                attempts = community_deletion_checkpoints.attempts + 1,
+                detail = EXCLUDED.detail, error = EXCLUDED.error, completed_at = NULL
+            "#,
         )
         .bind(request.id)
         .bind(request.stage.to_string())
@@ -3631,6 +3637,51 @@ mod postgres_tests {
         assert_eq!(
             checkpoint.error.as_deref(),
             Some("BUZZ_S3_ENDPOINT is required")
+        );
+        assert_eq!(checkpoint.attempts, 1);
+        assert!(checkpoint.completed_at.is_none());
+
+        store
+            .unblock(request.id, "operator", "dependency repaired")
+            .await
+            .expect("unblock after first setup failure");
+        let blocked_again = store
+            .block_preclaim_setup(
+                request.id,
+                "pre_claim:service_setup",
+                "BUZZ_REDIS_URL is required",
+            )
+            .await
+            .expect("record repeated setup failure");
+        assert_eq!(
+            blocked_again.blocked_reason.as_deref(),
+            Some("BUZZ_REDIS_URL is required")
+        );
+        assert_eq!(
+            blocked_again.last_error.as_deref(),
+            Some("BUZZ_REDIS_URL is required")
+        );
+        let repeated = store
+            .inspect(request.id)
+            .await
+            .expect("inspect repeated failure");
+        let checkpoint = repeated
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.unit_key == "pre_claim:service_setup")
+            .expect("repeated setup failure checkpoint");
+        assert_eq!(checkpoint.status, "failed");
+        assert_eq!(checkpoint.attempts, 2);
+        assert_eq!(
+            checkpoint.error.as_deref(),
+            Some("BUZZ_REDIS_URL is required")
+        );
+        assert_eq!(
+            checkpoint
+                .detail
+                .get("error")
+                .and_then(|value| value.as_str()),
+            Some("BUZZ_REDIS_URL is required")
         );
         assert!(checkpoint.completed_at.is_none());
     }
