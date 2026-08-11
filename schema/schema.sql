@@ -1129,7 +1129,7 @@ INSERT INTO _operator_global_tables (table_name, reason) VALUES
 -- ── Whole-community deletion control plane (migration 0029) ─────────────────
 CREATE TABLE community_deletion_requests (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    community_id UUID NOT NULL UNIQUE REFERENCES communities(id),
+    community_id UUID NOT NULL REFERENCES communities(id),
     community_host TEXT NOT NULL,
     stage TEXT NOT NULL DEFAULT 'submitted' CHECK (stage IN (
         'submitted', 'inventoried', 'approved', 'fenced', 'drained',
@@ -1175,6 +1175,9 @@ CREATE TABLE community_deletion_requests (
     CHECK ((inventory_frozen_at IS NULL) = (inventory_digest IS NULL)),
     UNIQUE (id, community_id, inventory_digest)
 );
+CREATE UNIQUE INDEX community_deletion_requests_active_community
+    ON community_deletion_requests (community_id)
+    WHERE stage <> 'aborted';
 CREATE INDEX community_deletion_requests_runnable
     ON community_deletion_requests (next_attempt_at, created_at)
     WHERE blocked_at IS NULL

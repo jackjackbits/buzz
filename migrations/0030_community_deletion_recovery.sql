@@ -1,6 +1,7 @@
 -- Terminal recovery for deletion requests that have not begun irreversible
 -- object deletion, plus explicit operator-global provenance ownership.
 ALTER TABLE community_deletion_requests
+    DROP CONSTRAINT community_deletion_requests_community_id_key,
     DROP CONSTRAINT community_deletion_requests_stage_check,
     ADD CONSTRAINT community_deletion_requests_stage_check CHECK (stage IN (
         'submitted', 'inventoried', 'approved', 'fenced', 'drained',
@@ -15,6 +16,13 @@ ALTER TABLE community_deletion_requests
     ADD CHECK ((stage = 'aborted') = (aborted_at IS NOT NULL)),
     ADD CHECK ((aborted_at IS NULL) = (aborted_by IS NULL)),
     ADD CHECK ((aborted_at IS NULL) = (abort_reason IS NULL));
+
+-- Aborted requests remain immutable audit evidence, but must not permanently
+-- consume the community's one active deletion slot. Retention-pending remains
+-- active because its tombstoned community must never be re-armed.
+CREATE UNIQUE INDEX community_deletion_requests_active_community
+    ON community_deletion_requests (community_id)
+    WHERE stage <> 'aborted';
 
 ALTER TABLE product_feedback ALTER COLUMN community_id DROP NOT NULL;
 ALTER TABLE product_feedback DROP CONSTRAINT product_feedback_community_id_fkey;

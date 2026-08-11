@@ -1813,7 +1813,15 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(28));
+        let latest_version = MIGRATOR
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .expect("embedded migrator is non-empty");
+        assert_eq!(
+            applied_versions(&pool).await.last().copied(),
+            Some(latest_version)
+        );
     }
 
     #[tokio::test]

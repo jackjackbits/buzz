@@ -577,7 +577,7 @@ impl DeletionStore {
                 INSERT INTO community_deletion_requests
                     (community_id, community_host, requested_by, reason)
                 SELECT id, host, $2, $3 FROM target
-                ON CONFLICT (community_id) DO NOTHING
+                ON CONFLICT (community_id) WHERE stage <> 'aborted' DO NOTHING
                 RETURNING *
             )
             SELECT * FROM inserted
@@ -1868,12 +1868,31 @@ impl DeletionStore {
             ));
         }
         let mut tx = self.pool.begin().await?;
+        let community_id: CommunityId = sqlx::query_scalar::<_, Uuid>(
+            "SELECT community_id FROM community_deletion_requests WHERE id = $1",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(CommunityId::from_uuid)
+        .ok_or_else(|| DbError::NotFound(format!("community deletion {request_id}")))?;
+        // Every lifecycle transition takes the community lock before any row lock.
+        // Inverting this order lets abort and the executor deadlock each other.
+        sqlx::query("SELECT pg_advisory_xact_lock(community_deletion_lock_key($1))")
+            .bind(community_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
         let row = sqlx::query("SELECT * FROM community_deletion_requests WHERE id = $1 FOR UPDATE")
             .bind(request_id)
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("community deletion {request_id}")))?;
         let request = row_to_request(row)?;
+        if request.community_id != community_id {
+            return Err(DbError::DeletionSafety(format!(
+                "deletion {request_id} changed community while abort waited for the community lock"
+            )));
+        }
         if !matches!(
             request.stage,
             DeletionStage::Approved | DeletionStage::Fenced
@@ -1881,21 +1900,6 @@ impl DeletionStore {
             return Err(DbError::DeletionSafety(format!(
                 "deletion {request_id} at stage {} cannot be aborted",
                 request.stage
-            )));
-        }
-        sqlx::query("SELECT pg_advisory_xact_lock(community_deletion_lock_key($1))")
-            .bind(request.community_id.as_uuid())
-            .execute(&mut *tx)
-            .await?;
-        let current_stage: String = sqlx::query_scalar(
-            "SELECT stage FROM community_deletion_requests WHERE id = $1 FOR UPDATE",
-        )
-        .bind(request_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if current_stage != request.stage.to_string() {
-            return Err(DbError::DeletionSafety(format!(
-                "deletion {request_id} advanced while abort waited for the community lock"
             )));
         }
         let active_writes: i64 = sqlx::query_scalar(
@@ -2009,9 +2013,12 @@ impl DeletionStore {
             ))
         })?;
         let request = row_to_request(request_row)?;
-        if !request.stage.runnable() {
+        if matches!(
+            request.stage,
+            DeletionStage::RetentionPending | DeletionStage::Aborted
+        ) {
             return Err(DbError::DeletionSafety(format!(
-                "blocked deletion {request_id} at stage {} cannot resume",
+                "blocked deletion {request_id} at terminal stage {} cannot resume",
                 request.stage
             )));
         }
@@ -2051,6 +2058,66 @@ impl DeletionStore {
              WHERE id = $1 AND blocked_at IS NOT NULL RETURNING *",
         )
         .bind(request_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row_to_request(row)
+    }
+
+    /// Persist a fail-closed setup failure before an identifiable request is claimed.
+    pub async fn block_preclaim_setup(
+        &self,
+        request_id: Uuid,
+        unit_key: &str,
+        error: &str,
+    ) -> Result<DeletionRequest> {
+        let bounded = bound_text(error, 4096);
+        let mut tx = self.pool.begin().await?;
+        let request =
+            sqlx::query("SELECT * FROM community_deletion_requests WHERE id = $1 FOR UPDATE")
+                .bind(request_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| DbError::NotFound(format!("community deletion {request_id}")))?;
+        let request = row_to_request(request)?;
+        if matches!(
+            request.stage,
+            DeletionStage::RetentionPending | DeletionStage::Aborted
+        ) {
+            return Err(DbError::DeletionSafety(format!(
+                "deletion {request_id} at terminal stage {} cannot record a setup failure",
+                request.stage
+            )));
+        }
+        if request.lease_owner.is_some()
+            && request
+                .lease_until
+                .is_some_and(|lease_until| lease_until >= Utc::now())
+        {
+            return Err(DbError::DeletionSafety(format!(
+                "deletion {request_id} is leased by another executor"
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO community_deletion_checkpoints \
+             (request_id, stage, unit_key, status, lease_generation, detail, completed_at) \
+             VALUES ($1, $2, $3, 'failed', $4, $5, now())",
+        )
+        .bind(request.id)
+        .bind(request.stage.to_string())
+        .bind(unit_key)
+        .bind(request.lease_generation.max(1))
+        .bind(serde_json::json!({"error": &bounded}))
+        .execute(&mut *tx)
+        .await?;
+        let row = sqlx::query(
+            "UPDATE community_deletion_requests \
+             SET blocked_at = now(), blocked_reason = $2, last_error = $2, \
+                 last_error_at = now(), updated_at = now() \
+             WHERE id = $1 RETURNING *",
+        )
+        .bind(request_id)
+        .bind(&bounded)
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -3367,6 +3434,192 @@ mod postgres_tests {
         assert_eq!(advanced.stage, DeletionStage::Fenced);
         assert_eq!(advanced.retry_count, 0);
         assert_eq!(advanced.retry_stage, None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn abort_serializes_before_quiescing_without_deadlock() {
+        let (db, store) = store().await;
+        let (request, _) = inventoried_request(&db, &store).await;
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let claim = store
+            .claim_specific(request.id, "executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim")
+            .expect("won claim");
+        let mut gate = db.pool.begin().await.expect("begin lock gate");
+        sqlx::query("SELECT pg_advisory_xact_lock(community_deletion_lock_key($1))")
+            .bind(request.community_id.as_uuid())
+            .execute(&mut *gate)
+            .await
+            .expect("hold community lock");
+
+        let abort_store = store.clone();
+        let aborting = tokio::spawn(async move {
+            abort_store
+                .abort(request.id, "operator", "race recovery")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !aborting.is_finished(),
+            "abort must wait for the community lock"
+        );
+        let forward_store = store.clone();
+        let lease = claim.lease.clone();
+        let forwarding = tokio::spawn(async move { forward_store.begin_quiescing(&lease).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !forwarding.is_finished(),
+            "forward transition must queue on the same lock"
+        );
+        gate.commit().await.expect("release lock gate");
+
+        let aborted = tokio::time::timeout(Duration::from_secs(5), aborting)
+            .await
+            .expect("abort must not deadlock")
+            .expect("abort task")
+            .expect("abort wins lock queue");
+        assert_eq!(aborted.stage, DeletionStage::Aborted);
+        let forward_error = tokio::time::timeout(Duration::from_secs(5), forwarding)
+            .await
+            .expect("forward transition must not deadlock")
+            .expect("forward task")
+            .expect_err("post-lock lease verification rejects aborted request");
+        assert!(
+            !matches!(
+                &forward_error,
+                DbError::Sqlx(sqlx::Error::Database(error)) if error.code().as_deref() == Some("40P01")
+            ),
+            "serialization must not report a PostgreSQL deadlock"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn abort_serializes_before_fence_without_deadlock() {
+        let (db, store) = store().await;
+        let (request, _) = inventoried_request(&db, &store).await;
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let claim = store
+            .claim_specific(request.id, "executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim")
+            .expect("won claim");
+        store.begin_quiescing(&claim.lease).await.expect("quiesce");
+        let mut gate = db.pool.begin().await.expect("begin lock gate");
+        sqlx::query("SELECT pg_advisory_xact_lock(community_deletion_lock_key($1))")
+            .bind(request.community_id.as_uuid())
+            .execute(&mut *gate)
+            .await
+            .expect("hold community lock");
+
+        let abort_store = store.clone();
+        let aborting = tokio::spawn(async move {
+            abort_store
+                .abort(request.id, "operator", "race recovery")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !aborting.is_finished(),
+            "abort must wait for the community lock"
+        );
+        let forward_store = store.clone();
+        let lease = claim.lease.clone();
+        let forwarding = tokio::spawn(async move { forward_store.fence(&lease).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !forwarding.is_finished(),
+            "fence must queue on the same lock"
+        );
+        gate.commit().await.expect("release lock gate");
+
+        let aborted = tokio::time::timeout(Duration::from_secs(5), aborting)
+            .await
+            .expect("abort must not deadlock")
+            .expect("abort task")
+            .expect("abort wins lock queue");
+        assert_eq!(aborted.stage, DeletionStage::Aborted);
+        let forward_error = tokio::time::timeout(Duration::from_secs(5), forwarding)
+            .await
+            .expect("fence must not deadlock")
+            .expect("fence task")
+            .expect_err("post-lock lease verification rejects aborted request");
+        assert!(
+            !matches!(
+                &forward_error,
+                DbError::Sqlx(sqlx::Error::Database(error)) if error.code().as_deref() == Some("40P01")
+            ),
+            "serialization must not report a PostgreSQL deadlock"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn abort_preserves_audit_and_allows_fresh_request() {
+        let (db, store) = store().await;
+        let (request, _) = inventoried_request(&db, &store).await;
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let aborted = store
+            .abort(request.id, "operator", "cancel deletion")
+            .await
+            .expect("abort");
+        assert_eq!(aborted.stage, DeletionStage::Aborted);
+
+        let replacement = store
+            .submit(
+                &request.community_host,
+                "second-operator",
+                Some("fresh review"),
+            )
+            .await
+            .expect("submit replacement request");
+        assert_ne!(replacement.id, request.id);
+        assert_eq!(replacement.stage, DeletionStage::Submitted);
+        assert!(replacement.inventory_digest.is_none());
+        assert_eq!(
+            store.get(request.id).await.expect("preserved audit").stage,
+            DeletionStage::Aborted
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn preclaim_setup_failure_is_durable_without_a_lease() {
+        let (db, store) = store().await;
+        let (request, _) = inventoried_request(&db, &store).await;
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let blocked = store
+            .block_preclaim_setup(
+                request.id,
+                "pre_claim:service_setup",
+                "BUZZ_S3_ENDPOINT is required",
+            )
+            .await
+            .expect("record setup failure");
+        assert_eq!(blocked.stage, DeletionStage::Approved);
+        assert_eq!(
+            blocked.blocked_reason.as_deref(),
+            Some("BUZZ_S3_ENDPOINT is required")
+        );
+        assert!(blocked.lease_owner.is_none());
+        let inspection = store.inspect(request.id).await.expect("inspect failure");
+        assert!(inspection.checkpoints.iter().any(|checkpoint| {
+            checkpoint.unit_key == "pre_claim:service_setup" && checkpoint.status == "failed"
+        }));
     }
 
     #[tokio::test]

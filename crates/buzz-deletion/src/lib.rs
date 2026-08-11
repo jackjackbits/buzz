@@ -403,6 +403,27 @@ pub async fn run(command: Command) -> Result<i32> {
             print_json(&store.unblock(id, &unblocked_by, &reason).await?)?;
             Ok(0)
         }
+        Command::Run { id, executor_id } => {
+            let store = connect_store().await?;
+            let services = match connect_services_with_store(store.clone()).await {
+                Ok(services) => services,
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    store
+                        .block_preclaim_setup(id, "pre_claim:service_setup", &message)
+                        .await
+                        .context("record pre-claim service setup failure")?;
+                    return Err(error);
+                }
+            };
+            run_loop(
+                services,
+                LoopMode::Run,
+                Some(id),
+                executor_id.unwrap_or_else(default_executor_id),
+            )
+            .await
+        }
         command => run_with_services(command, connect_services().await?).await,
     }
 }
@@ -535,6 +556,10 @@ fn s3_region_from_env() -> String {
 
 async fn connect_services() -> Result<Services> {
     let store = connect_store().await?;
+    connect_services_with_store(store).await
+}
+
+async fn connect_services_with_store(store: DeletionStore) -> Result<Services> {
     let media_config = buzz_media::MediaConfig {
         s3_endpoint: required_env("BUZZ_S3_ENDPOINT")?,
         s3_access_key: required_env("BUZZ_S3_ACCESS_KEY")?,
