@@ -820,7 +820,7 @@ CREATE INDEX idx_event_mentions_community_event
 
 CREATE TABLE product_feedback (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    community_id UUID NOT NULL REFERENCES communities(id),
+    community_id UUID REFERENCES communities(id) ON DELETE SET NULL,
     event_id BYTEA NOT NULL CHECK (length(event_id) = 32),
     submitter_pubkey BYTEA NOT NULL CHECK (length(submitter_pubkey) = 32),
     category TEXT CHECK (category IN ('bug', 'praise', 'needs-work')),
@@ -1134,7 +1134,7 @@ CREATE TABLE community_deletion_requests (
     stage TEXT NOT NULL DEFAULT 'submitted' CHECK (stage IN (
         'submitted', 'inventoried', 'approved', 'fenced', 'drained',
         'bindings_removed', 'postgres_purged', 'cache_purged',
-        'logically_verified', 'retention_pending'
+        'logically_verified', 'retention_pending', 'aborted'
     )),
     requested_by TEXT NOT NULL,
     reason TEXT,
@@ -1162,8 +1162,16 @@ CREATE TABLE community_deletion_requests (
     blocked_reason TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    pre_quiesce_archived_at TIMESTAMPTZ,
+    quiescing_started_at TIMESTAMPTZ,
+    aborted_by TEXT,
+    abort_reason TEXT,
+    aborted_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
     CHECK ((blocked_at IS NULL) = (blocked_reason IS NULL)),
+    CHECK ((stage = 'aborted') = (aborted_at IS NOT NULL)),
+    CHECK ((aborted_at IS NULL) = (aborted_by IS NULL)),
+    CHECK ((aborted_at IS NULL) = (abort_reason IS NULL)),
     CHECK ((inventory_frozen_at IS NULL) = (inventory_digest IS NULL)),
     UNIQUE (id, community_id, inventory_digest)
 );
@@ -1256,6 +1264,92 @@ CREATE TABLE community_deletion_checkpoints (
     CHECK ((status = 'completed') = (completed_at IS NOT NULL)),
     CHECK ((status = 'failed') = (error IS NOT NULL))
 );
+
+-- Frozen destructive key list, chunked out of the request row so a large
+-- tenant (100k-1M objects) never materializes as one multi-hundred-MB JSONB
+-- value. Rows are written once in the fenced stage, stamped `deleted_at` as
+-- the executor confirms each chunk removed, and dropped at logical
+-- verification. The request row keeps only per-prefix count/bytes/digest
+-- summaries; the chunk stream must hash to those frozen digests.
+CREATE TABLE community_deletion_manifest_keys (
+    request_id UUID NOT NULL REFERENCES community_deletion_requests(id) ON DELETE CASCADE,
+    chunk_no BIGINT NOT NULL CHECK (chunk_no >= 0),
+    prefix TEXT NOT NULL,
+    keys JSONB NOT NULL,
+    deleted_at TIMESTAMPTZ,
+    PRIMARY KEY (request_id, chunk_no)
+);
+
+-- Chunk content is immutable once written; the only permitted update is the
+-- one-way deleted_at stamp. New chunks are permitted only while the request is
+-- fenced and its destructive manifest remains unfrozen. Removal is permitted
+-- only while the destructive manifest has not yet frozen (a retried partial
+-- freeze rewrites its chunks) or once the request has passed logical
+-- verification (terminal cleanup).
+CREATE FUNCTION protect_community_deletion_manifest_keys()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    frozen_at TIMESTAMPTZ;
+    request_stage TEXT;
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF NEW.request_id IS DISTINCT FROM OLD.request_id
+            OR NEW.chunk_no IS DISTINCT FROM OLD.chunk_no
+            OR NEW.prefix IS DISTINCT FROM OLD.prefix
+            OR NEW.keys IS DISTINCT FROM OLD.keys
+            OR OLD.deleted_at IS NOT NULL
+        THEN
+            RAISE EXCEPTION 'community deletion manifest key chunks are immutable'
+                USING ERRCODE = 'integrity_constraint_violation';
+        END IF;
+        RETURN NEW;
+    END IF;
+    SELECT destructive_storage_frozen_at, stage
+      INTO frozen_at, request_stage
+      FROM community_deletion_requests
+     WHERE id = CASE WHEN TG_OP = 'INSERT' THEN NEW.request_id ELSE OLD.request_id END
+     FOR UPDATE;
+    IF TG_OP = 'INSERT' THEN
+        IF FOUND AND frozen_at IS NULL AND request_stage = 'fenced' THEN
+            RETURN NEW;
+        END IF;
+        RAISE EXCEPTION 'community deletion manifest key chunks require an unfrozen fenced request'
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    IF NOT FOUND
+        OR frozen_at IS NULL
+        OR request_stage IN ('logically_verified', 'retention_pending')
+    THEN
+        RETURN OLD;
+    END IF;
+    RAISE EXCEPTION 'community deletion manifest key chunks cannot be removed mid-execution'
+        USING ERRCODE = 'integrity_constraint_violation';
+END;
+$$;
+
+CREATE TRIGGER community_deletion_manifest_keys_guard
+BEFORE INSERT OR UPDATE OR DELETE ON community_deletion_manifest_keys
+FOR EACH ROW
+EXECUTE FUNCTION protect_community_deletion_manifest_keys();
+
+-- Fleet-wide object-store taxonomy sweep evidence. This is an independent
+-- observability record: community deletion inventories only the target's owned
+-- prefixes and does not gate submission or execution on sweep state.
+CREATE TABLE storage_taxonomy_sweeps (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    started_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    listed_objects BIGINT NOT NULL CHECK (listed_objects >= 0),
+    unknown_object_count BIGINT NOT NULL CHECK (unknown_object_count >= 0),
+    unknown_key_sample JSONB NOT NULL DEFAULT '[]'::jsonb,
+    object_cap BIGINT NOT NULL CHECK (object_cap > 0),
+    CHECK (completed_at >= started_at)
+);
+CREATE INDEX storage_taxonomy_sweeps_latest
+    ON storage_taxonomy_sweeps (completed_at DESC);
+
 CREATE TABLE community_serving_write_leases (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     community_id UUID NOT NULL REFERENCES communities(id),
@@ -1284,6 +1378,8 @@ INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('community_deletion_requests', 'deployment deletion lifecycle and frozen inventory'),
     ('community_deletion_approvals', 'deployment operator destructive approvals'),
     ('community_deletion_checkpoints', 'deployment deletion executor checkpoints and failures'),
+    ('community_deletion_manifest_keys', 'deployment deletion frozen destructive key chunks'),
+    ('storage_taxonomy_sweeps', 'deployment object-store taxonomy sweep evidence'),
     ('community_serving_write_leases', 'deployment serving side-effect leases drained by deletion'),
     ('community_deletion_executor_heartbeats', 'deployment deletion worker liveness');
 
@@ -1301,7 +1397,9 @@ LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE AS $$
         'community_deletion_approvals',
         'community_deletion_checkpoints',
         'community_serving_write_leases',
-        'community_deletion_executor_heartbeats'
+        'community_deletion_executor_heartbeats',
+        'product_feedback',
+        'rate_limit_violations'
     ]::TEXT[])
 $$;
 
@@ -1552,12 +1650,10 @@ SELECT attach_community_write_fence('join_policy_acceptances');
 SELECT attach_community_write_fence('moderation_actions');
 SELECT attach_community_write_fence('moderation_reports');
 SELECT attach_community_write_fence('parameterized_event_watermarks');
-SELECT attach_community_write_fence('product_feedback');
 SELECT attach_community_write_fence('pubkey_allowlist');
 SELECT attach_community_write_fence('push_leases');
 SELECT attach_community_write_fence('push_match_queue');
 SELECT attach_community_write_fence('push_wake_outbox');
-SELECT attach_community_write_fence('rate_limit_violations');
 SELECT attach_community_write_fence('reactions');
 SELECT attach_community_write_fence('relay_invites');
 SELECT attach_community_write_fence('relay_members');

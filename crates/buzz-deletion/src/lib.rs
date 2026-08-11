@@ -251,6 +251,17 @@ pub enum Command {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Terminally cancel before irreversible object deletion begins.
+    Abort {
+        /// Deletion request UUID.
+        id: Uuid,
+        /// Aborting operator identity.
+        #[arg(long)]
+        aborted_by: String,
+        /// Reason recorded in immutable audit evidence.
+        #[arg(long)]
+        reason: String,
+    },
     /// Resume a blocked request after remediating its recorded failure.
     Unblock {
         /// Deletion request UUID.
@@ -374,6 +385,15 @@ pub async fn run(command: Command) -> Result<i32> {
             print_json(&store.approve(id, &approved_by, note.as_deref()).await?)?;
             Ok(0)
         }
+        Command::Abort {
+            id,
+            aborted_by,
+            reason,
+        } => {
+            let store = connect_store().await?;
+            print_json(&store.abort(id, &aborted_by, &reason).await?)?;
+            Ok(0)
+        }
         Command::Unblock {
             id,
             unblocked_by,
@@ -452,6 +472,7 @@ async fn run_with_services(command: Command, services: Services) -> Result<i32> 
         Command::List { .. }
         | Command::Inspect { .. }
         | Command::Approve { .. }
+        | Command::Abort { .. }
         | Command::Unblock { .. } => {
             anyhow::bail!("database-only command reached full-service dispatcher")
         }
@@ -1197,7 +1218,7 @@ async fn execute_stage(
         DeletionStage::Submitted | DeletionStage::Inventoried => {
             anyhow::bail!("request has not crossed the explicit approval boundary")
         }
-        DeletionStage::RetentionPending => {}
+        DeletionStage::RetentionPending | DeletionStage::Aborted => {}
     }
     Ok(())
 }

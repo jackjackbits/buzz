@@ -4,16 +4,37 @@
 //! multi-tenant rewrite owns a clean consolidated `0001`; legacy single-tenant
 //! cutover/backfill is a separate operator script, not startup migration state.
 
-use sqlx::PgPool;
+use std::future::Future;
 
+use sqlx::{Connection, PgConnection, PgPool};
+
+use crate::deletion::SCHEMA_DESTRUCTION_LOCK_KEY;
 use crate::Result;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 /// Run all pending Buzz database migrations.
+///
+/// The entire run holds the exclusive [`SCHEMA_DESTRUCTION_LOCK_KEY`] session
+/// lock, serializing schema changes against destructive deletion transactions
+/// (which take the shared counterpart while they validate the live catalog
+/// and act on it). Every migration statement executes on the same backend
+/// that owns the lock — see [`with_exclusive_schema_destruction_lock`] for
+/// why that binding, not the explicit unlock, is the safety contract.
+/// Migration execution must never bypass this wrapper — a source lint
+/// (`migration_execution_cannot_bypass_schema_destruction_lock`) enforces
+/// that `MIGRATOR.run` has no other call site.
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
-    reject_legacy_nip_rs_cardinality_ambiguity(pool).await?;
-    MIGRATOR.run(pool).await?;
+    with_exclusive_schema_destruction_lock(pool, |mut conn| async move {
+        let outcome = run_migrations_locked(&mut conn).await;
+        (conn, outcome)
+    })
+    .await
+}
+
+async fn run_migrations_locked(conn: &mut PgConnection) -> Result<()> {
+    reject_legacy_nip_rs_cardinality_ambiguity(conn).await?;
+    MIGRATOR.run(&mut *conn).await?;
     // The replica-fence proof (see `replica_fence`) requires the commit-time
     // `created_at` floor trigger from migration 0021 — correctly shaped — on
     // the `events` parent and every partition. `CREATE TABLE .. PARTITION OF`
@@ -21,25 +42,61 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     // PARTITION` or created by an older code path would silently escape the
     // guard, so migration fails closed if any is missing. (The fence probe
     // re-runs this same check at startup on non-migrating relays.)
-    crate::replica_fence::verify_floor_guard_catalog(pool).await?;
+    crate::replica_fence::verify_floor_guard_catalog(&mut *conn).await?;
     Ok(())
+}
+
+/// Run `op` while holding the exclusive schema/destruction session lock.
+///
+/// `op` receives ownership of the detached connection that owns the advisory
+/// lock and must run every statement on it, handing the same connection back
+/// with its outcome. That same-backend lifetime — not the explicit unlock —
+/// is the safety contract: PostgreSQL releases a session lock only when its
+/// backend finishes, so cancelling this future (dropping the connection while
+/// a migration statement is still executing server-side) cannot expose the
+/// lock to shared destructive holders before that statement's backend
+/// terminates. On completion the lock is explicitly released on the returned
+/// connection (success and error alike) and the connection is closed, never
+/// returning a locked session to the pool.
+pub(crate) async fn with_exclusive_schema_destruction_lock<T, F, Fut>(
+    pool: &PgPool,
+    op: F,
+) -> Result<T>
+where
+    F: FnOnce(PgConnection) -> Fut,
+    Fut: Future<Output = (PgConnection, Result<T>)>,
+{
+    let mut lock_conn = pool.acquire().await?.detach();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(SCHEMA_DESTRUCTION_LOCK_KEY)
+        .execute(&mut lock_conn)
+        .await?;
+    let (mut lock_conn, outcome) = op(lock_conn).await;
+    let unlock = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(SCHEMA_DESTRUCTION_LOCK_KEY)
+        .execute(&mut lock_conn)
+        .await;
+    let _ = lock_conn.close().await;
+    let value = outcome?;
+    unlock?;
+    Ok(value)
 }
 
 /// Migration 0007 is checksum-frozen and predates exact NIP-RS tag-cardinality
 /// enforcement. A populated database still on 0001-0006 must not let 0007
 /// irreversibly purge duplicate-tag history. Fail before sqlx starts its
 /// migration transaction so an operator can inspect and repair those rows.
-async fn reject_legacy_nip_rs_cardinality_ambiguity(pool: &PgPool) -> Result<()> {
+async fn reject_legacy_nip_rs_cardinality_ambiguity(conn: &mut PgConnection) -> Result<()> {
     let migrations_table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations')::text")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
     if migrations_table.is_none() {
         return Ok(());
     }
     let applied: Option<i64> =
         sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
     if applied.is_none_or(|version| version >= 7) {
         return Ok(());
@@ -83,7 +140,7 @@ async fn reject_legacy_nip_rs_cardinality_ambiguity(pool: &PgPool) -> Result<()>
                )\
          )",
     )
-    .fetch_one(pool)
+    .fetch_one(conn)
     .await?;
 
     if ambiguous {
@@ -568,7 +625,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 29);
+        assert_eq!(migrations.len(), 30);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1116,6 +1173,547 @@ mod tests {
             has_channels_community_id_immutability_guard(sql),
             "migrations define channels.community_id but no BEFORE UPDATE trigger/function guard that rejects OLD.community_id <> NEW.community_id was found"
         );
+    }
+
+    #[test]
+    fn migration_execution_cannot_bypass_schema_destruction_lock() {
+        fn rust_sources(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read workspace source dir") {
+                let path = entry.expect("read workspace source entry").path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|name| name == "target") {
+                        continue;
+                    }
+                    rust_sources(&path, files);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        fn count(haystack: &str, needle: &str) -> usize {
+            haystack.matches(needle).count()
+        }
+
+        // Build the needles so this test's own source never matches them.
+        let migrate_macro = ["sqlx", "::migrate!"].concat();
+        let migrator_run = ["MIGRATOR", ".run("].concat();
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let this_file = manifest_dir.join("src/migration.rs");
+        let crates_dir = manifest_dir.parent().expect("workspace crates dir");
+        // The push gateway migrates its own dedicated authority database; it
+        // never holds relay tenant tables, so it is exempt from the relay
+        // schema/destruction lock. The community_id check below keeps that
+        // exemption honest.
+        let push_gateway_exception = crates_dir.join("buzz-push-gateway/src/postgres.rs");
+        let push_gateway_migrations = crates_dir.join("buzz-push-gateway/migrations");
+        for entry in
+            std::fs::read_dir(&push_gateway_migrations).expect("read push gateway migrations")
+        {
+            let path = entry.expect("read push gateway migration entry").path();
+            let sql = std::fs::read_to_string(&path).expect("read push gateway migration");
+            assert!(
+                !sql.to_ascii_lowercase().contains("community_id"),
+                "{} defines community-scoped data; its migrator would bypass the \
+                 schema/destruction lock and must move under buzz-db migrations",
+                path.display()
+            );
+        }
+        let mut files = Vec::new();
+        rust_sources(crates_dir, &mut files);
+        for path in &files {
+            let source = std::fs::read_to_string(path).expect("read rust source");
+            let (macro_hits, run_hits) = (
+                count(&source, &migrate_macro),
+                count(&source, &migrator_run),
+            );
+            if *path == this_file {
+                assert_eq!(
+                    (macro_hits, run_hits),
+                    (1, 1),
+                    "migration.rs must embed the migrator once and run it exactly once, \
+                     inside the locked wrapper"
+                );
+            } else if *path == push_gateway_exception {
+                continue;
+            } else {
+                assert_eq!(
+                    (macro_hits, run_hits),
+                    (0, 0),
+                    "{} embeds or runs a SQLx migrator outside the schema/destruction \
+                     lock contract; route migration execution through \
+                     buzz_db migration::run_migrations",
+                    path.display()
+                );
+            }
+        }
+
+        // Within migration.rs, the single run site must sit inside
+        // `run_migrations_locked`, and the only public entry point must wrap
+        // it in the exclusive session lock.
+        let source = std::fs::read_to_string(&this_file).expect("read migration.rs");
+        let entry = source
+            .find("pub async fn run_migrations(")
+            .expect("public migration entry point");
+        let locked = source
+            .find("async fn run_migrations_locked(")
+            .expect("locked migration body");
+        let wrapper = source
+            .find("async fn with_exclusive_schema_destruction_lock")
+            .expect("exclusive lock wrapper");
+        let run_site = source.find(&migrator_run).expect("migrator run site");
+        assert!(
+            source[entry..locked].contains("with_exclusive_schema_destruction_lock("),
+            "run_migrations must delegate through the exclusive schema/destruction lock"
+        );
+        assert!(
+            run_site > locked && run_site < wrapper,
+            "the migrator run site must live inside run_migrations_locked"
+        );
+        assert!(
+            source[wrapper..].contains("pg_advisory_lock($1)")
+                && source[wrapper..].contains("pg_advisory_unlock($1)"),
+            "the lock wrapper must acquire and explicitly release the session lock"
+        );
+    }
+
+    /// Structural parity between migration 0029's deletion surface and the
+    /// desired-state bootstrap schema (`schema/schema.sql`).
+    ///
+    /// Compares parsed statements, not substrings: every deletion control-
+    /// plane table, function, trigger, and index 0028 creates must exist in
+    /// schema.sql with an identical normalized definition; every operator-
+    /// global registry row 0028 inserts must be inserted by schema.sql; the
+    /// write-fence attachment target sets must be equal; and every column
+    /// 0028 adds to `communities` must exist in the desired-state
+    /// `communities` table. A desired-state bootstrap that passes this test
+    /// cannot silently omit part of the deletion surface the way the
+    /// pre-parity schema.sql omitted `community_deletion_manifest_keys` (and
+    /// its immutability trigger) and `storage_taxonomy_sweeps` — booting
+    /// healthy, then wedging post-fence when the freeze stage first touched
+    /// the missing relation.
+    #[test]
+    fn deletion_surface_parity_between_migration_0029_and_schema_sql() {
+        use std::collections::BTreeMap;
+
+        #[derive(Default)]
+        struct DeletionSurface {
+            tables: BTreeMap<String, String>,
+            functions: BTreeMap<String, String>,
+            triggers: BTreeMap<String, String>,
+            indexes: BTreeSet<String>,
+            registry_rows: BTreeSet<(String, String)>,
+            fence_attachments: BTreeSet<String>,
+            communities_added_columns: BTreeSet<String>,
+        }
+
+        fn quoted_strings(statement: &str) -> Vec<String> {
+            let mut strings = Vec::new();
+            let mut current: Option<String> = None;
+            let mut chars = statement.chars().peekable();
+            while let Some(ch) = chars.next() {
+                match (&mut current, ch) {
+                    (None, '\'') => current = Some(String::new()),
+                    (Some(literal), '\'') => {
+                        if chars.peek() == Some(&'\'') {
+                            literal.push('\'');
+                            chars.next();
+                        } else {
+                            strings.push(current.take().expect("open literal"));
+                        }
+                    }
+                    (Some(literal), other) => literal.push(other),
+                    (None, _) => {}
+                }
+            }
+            strings
+        }
+
+        fn surface(sql: &str) -> DeletionSurface {
+            let mut surface = DeletionSurface::default();
+            for statement in split_sql_statements(sql) {
+                let normalized = normalize_sql(&statement);
+                if normalized.starts_with("create table") {
+                    let table = identifier_after_keyword(&statement, "create table")
+                        .expect("table identifier");
+                    surface.tables.insert(table, normalized.clone());
+                } else if normalized.starts_with("create function")
+                    || normalized.starts_with("create or replace function")
+                {
+                    let function = identifier_after_keyword(&statement, "function")
+                        .expect("function identifier");
+                    surface.functions.insert(function, normalized.clone());
+                } else if normalized.starts_with("create trigger") {
+                    let trigger = identifier_after_keyword(&statement, "create trigger")
+                        .expect("trigger identifier");
+                    surface.triggers.insert(trigger, normalized.clone());
+                } else if normalized.starts_with("create index")
+                    || normalized.starts_with("create unique index")
+                {
+                    surface.indexes.insert(normalized.clone());
+                } else if normalized.starts_with("insert into _operator_global_tables") {
+                    let literals = quoted_strings(&statement);
+                    assert!(
+                        literals.len().is_multiple_of(2),
+                        "operator-global registry insert must be (table_name, reason) rows"
+                    );
+                    for row in literals.chunks(2) {
+                        surface
+                            .registry_rows
+                            .insert((row[0].clone(), row[1].clone()));
+                    }
+                } else if normalized.starts_with("alter table communities") {
+                    for added in normalized.split("add column ").skip(1) {
+                        let column = added
+                            .split_whitespace()
+                            .next()
+                            .expect("added column name")
+                            .to_owned();
+                        surface.communities_added_columns.insert(column);
+                    }
+                }
+                if let Some(position) = normalized.find("attach_community_write_fence('") {
+                    let target = normalized[position + "attach_community_write_fence('".len()..]
+                        .split('\'')
+                        .next()
+                        .expect("fence attachment target")
+                        .to_owned();
+                    surface.fence_attachments.insert(target);
+                }
+            }
+            surface
+        }
+
+        let migration_0029: &str = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 29)
+            .expect("embedded migration 0029")
+            .sql
+            .as_ref();
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root");
+        let schema_sql = std::fs::read_to_string(workspace_root.join("schema/schema.sql"))
+            .expect("read schema/schema.sql");
+
+        let migration = surface(migration_0029);
+        let schema = surface(&schema_sql);
+
+        assert_eq!(
+            migration.tables.len(),
+            7,
+            "0029 deletion control plane must define exactly the known tables: {:?}",
+            migration.tables.keys().collect::<Vec<_>>()
+        );
+        assert!(!migration.fence_attachments.is_empty());
+        assert!(!migration.registry_rows.is_empty());
+
+        for (table, definition) in &migration.tables {
+            let in_schema = schema
+                .tables
+                .get(table)
+                .unwrap_or_else(|| panic!("schema.sql is missing deletion table {table}"));
+            if table != "community_deletion_requests" {
+                assert_eq!(
+                    in_schema, definition,
+                    "schema.sql definition of {table} drifted from migration 0029"
+                );
+            }
+        }
+        for (function, definition) in &migration.functions {
+            let in_schema = schema
+                .functions
+                .get(function)
+                .unwrap_or_else(|| panic!("schema.sql is missing deletion function {function}"));
+            if function != "community_write_fence_excluded_table" {
+                assert_eq!(
+                    in_schema, definition,
+                    "schema.sql definition of {function}() drifted from migration 0029"
+                );
+            }
+        }
+        for (trigger, definition) in &migration.triggers {
+            let in_schema = schema
+                .triggers
+                .get(trigger)
+                .unwrap_or_else(|| panic!("schema.sql is missing deletion trigger {trigger}"));
+            assert_eq!(
+                in_schema, definition,
+                "schema.sql definition of trigger {trigger} drifted from migration 0029"
+            );
+        }
+        for index in &migration.indexes {
+            assert!(
+                schema.indexes.contains(index),
+                "schema.sql is missing (or drifted on) deletion index: {index}"
+            );
+        }
+        for row in &migration.registry_rows {
+            assert!(
+                schema.registry_rows.contains(row),
+                "schema.sql is missing operator-global registry row {row:?}"
+            );
+        }
+        let mut expected_fences = migration.fence_attachments.clone();
+        expected_fences.remove("product_feedback");
+        expected_fences.remove("rate_limit_violations");
+        assert_eq!(
+            expected_fences, schema.fence_attachments,
+            "write-fence attachment targets differ after recovery policy"
+        );
+
+        // 0029's ALTER TABLE additions are expressed inline by the
+        // desired-state `communities` definition; require the columns to
+        // exist there (exact definition equality is impossible across the
+        // ALTER/inline representations — behavior is pinned by the
+        // desired-state bootstrap deletion test).
+        let communities_columns = split_sql_statements(&schema_sql)
+            .into_iter()
+            .find_map(|statement| {
+                let (table, body) = create_table_body(&statement)?;
+                (table == "communities").then_some(body)
+            })
+            .expect("schema.sql defines communities");
+        let column_names: BTreeSet<String> = communities_columns
+            .iter()
+            .filter_map(|definition| column_definition_name(definition))
+            .collect();
+        for column in &migration.communities_added_columns {
+            assert!(
+                column_names.contains(column),
+                "schema.sql communities table is missing 0028 column {column}"
+            );
+        }
+        assert!(!migration.communities_added_columns.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn schema_destruction_lock_excludes_shared_holders_and_releases_on_both_paths() {
+        let pool = connect_test_pool().await;
+        async fn assert_exclusive_lock_free(pool: &PgPool) {
+            let mut probe = pool.acquire().await.expect("acquire lock probe");
+            let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+                .bind(SCHEMA_DESTRUCTION_LOCK_KEY)
+                .fetch_one(&mut *probe)
+                .await
+                .expect("probe try-lock");
+            assert!(free, "schema/destruction session lock must be released");
+            sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(SCHEMA_DESTRUCTION_LOCK_KEY)
+                .execute(&mut *probe)
+                .await
+                .expect("probe unlock");
+        }
+
+        let probe_pool = pool.clone();
+        with_exclusive_schema_destruction_lock(&pool, move |conn| async move {
+            // While a migration run is in flight, destructive transactions
+            // must be unable to take their shared counterpart.
+            let mut probe = probe_pool.acquire().await.expect("acquire shared probe");
+            let shared_available: bool =
+                sqlx::query_scalar("SELECT pg_try_advisory_lock_shared($1)")
+                    .bind(SCHEMA_DESTRUCTION_LOCK_KEY)
+                    .fetch_one(&mut *probe)
+                    .await
+                    .expect("probe shared try-lock");
+            assert!(
+                !shared_available,
+                "exclusive migration lock must exclude shared destructive holders"
+            );
+            (conn, Ok(()))
+        })
+        .await
+        .expect("locked migration op");
+        assert_exclusive_lock_free(&pool).await;
+
+        let failed: Result<()> = with_exclusive_schema_destruction_lock(&pool, |conn| async {
+            (
+                conn,
+                Err(crate::DbError::InvalidData(
+                    "forced migration failure".into(),
+                )),
+            )
+        })
+        .await;
+        assert!(failed.is_err(), "op failure must propagate");
+        assert_exclusive_lock_free(&pool).await;
+    }
+
+    /// Cancellation must not release the exclusion contract while migration
+    /// SQL is still executing server-side.
+    ///
+    /// The op parks an `ALTER TABLE` behind an ACCESS EXCLUSIVE table lock
+    /// held by another session, then the whole locked run is aborted. Because
+    /// the advisory lock lives on the same backend that runs the DDL,
+    /// dropping the client future cannot release it: the backend keeps the
+    /// session lock until it finishes the statement and dies on the closed
+    /// socket. The shared (destructive) counterpart must stay unavailable for
+    /// that entire interval — and the orphaned DDL really does commit after
+    /// cancellation, which is exactly the window the lock has to cover.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn cancelled_migration_cannot_expose_shared_lock_while_ddl_backend_lives() {
+        use std::time::Instant;
+
+        use sqlx::AssertSqlSafe;
+
+        // Dedicated database: the probe table and the orphaned backend must
+        // stay invisible to concurrent tests in the shared database.
+        let base_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let admin = PgPool::connect(&base_url)
+            .await
+            .expect("connect admin database");
+        let probe_db = format!("buzz_lock_cancel_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {probe_db}")))
+            .execute(&admin)
+            .await
+            .expect("create probe database");
+        let (base_prefix, _) = base_url.rsplit_once('/').expect("database url has a path");
+        let pool = PgPool::connect(&format!("{base_prefix}/{probe_db}"))
+            .await
+            .expect("connect probe database");
+        sqlx::query("CREATE TABLE schema_lock_cancel_probe (id int)")
+            .execute(&pool)
+            .await
+            .expect("create probe table");
+
+        // Park the migration DDL server-side: the op's ALTER TABLE waits on
+        // this ACCESS EXCLUSIVE lock, pinning the backend mid-statement.
+        let mut blocker = pool.begin().await.expect("open blocker transaction");
+        sqlx::query("LOCK TABLE schema_lock_cancel_probe IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .expect("hold probe table lock");
+
+        let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<i32>();
+        let task_pool = pool.clone();
+        let locked_run = tokio::spawn(async move {
+            with_exclusive_schema_destruction_lock(&task_pool, move |mut conn| async move {
+                let outcome: Result<()> = async {
+                    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                        .fetch_one(&mut conn)
+                        .await?;
+                    let _ = pid_tx.send(pid);
+                    sqlx::query(
+                        "ALTER TABLE schema_lock_cancel_probe \
+                         ADD COLUMN committed_after_cancel int",
+                    )
+                    .execute(&mut conn)
+                    .await?;
+                    Ok(())
+                }
+                .await;
+                (conn, outcome)
+            })
+            .await
+        });
+        let ddl_pid = pid_rx.await.expect("locked op reports its backend pid");
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                 WHERE pid = $1 AND wait_event_type = 'Lock')",
+            )
+            .bind(ddl_pid)
+            .fetch_one(&pool)
+            .await
+            .expect("poll DDL wait state");
+            if waiting {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "migration DDL never parked on the table lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        locked_run.abort();
+        let joined = locked_run.await;
+        assert!(
+            joined.is_err_and(|err| err.is_cancelled()),
+            "locked migration run must abort mid-statement"
+        );
+
+        // The client future is gone, but the DDL backend is alive: the shared
+        // destructive lock must remain unavailable for that whole interval.
+        for _ in 0..20 {
+            let backend_alive: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+                    .bind(ddl_pid)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("poll DDL backend liveness");
+            assert!(
+                backend_alive,
+                "parked DDL backend must outlive client cancellation"
+            );
+            let shared_free: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock_shared($1)")
+                .bind(SCHEMA_DESTRUCTION_LOCK_KEY)
+                .fetch_one(&pool)
+                .await
+                .expect("probe shared lock");
+            assert!(
+                !shared_free,
+                "cancellation must not expose the shared lock while migration DDL is executing"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Release the table lock: the orphaned backend finishes the ALTER,
+        // commits, then exits on the dead socket — only then may shared
+        // destructive holders enter.
+        blocker.rollback().await.expect("release probe table lock");
+        let mut probe = pool.acquire().await.expect("acquire shared-lock probe");
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let shared_free: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock_shared($1)")
+                .bind(SCHEMA_DESTRUCTION_LOCK_KEY)
+                .fetch_one(&mut *probe)
+                .await
+                .expect("probe shared lock after backend exit");
+            if shared_free {
+                sqlx::query("SELECT pg_advisory_unlock_shared($1)")
+                    .bind(SCHEMA_DESTRUCTION_LOCK_KEY)
+                    .execute(&mut *probe)
+                    .await
+                    .expect("release shared probe lock");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shared lock must become available once the DDL backend exits"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        drop(probe);
+
+        // The cancelled statement committed after the client vanished —
+        // exactly the interval the same-backend lock covered.
+        let committed: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_name = 'schema_lock_cancel_probe' \
+               AND column_name = 'committed_after_cancel')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect orphaned DDL outcome");
+        assert!(
+            committed,
+            "orphaned migration DDL commits after cancellation; the lock must cover it"
+        );
+
+        pool.close().await;
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP DATABASE {probe_db} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop probe database");
     }
 
     async fn connect_test_pool() -> PgPool {
